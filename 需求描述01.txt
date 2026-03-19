@@ -1,0 +1,775 @@
+我想用claude agent sdk基于claude code为agent底层开发一个解决软件工程issue的agent。
+一、创新点和workflow
+# Insight
+### Repair 失败的核心原因是 *Evidence Closure Failure*
+## Failure Analysis
+分析现有 SWE-Bench repair 的失败轨迹，原因包括有 wrong solution、incorrect file、tool-use、long-context、stuck-in-loop 等。大量失败的原因并不是agent不会生成patch，而是缺乏判断“当前信息是否足以支持 patch commitment”的能力。
+
+### 第一种情况：Not-submitted
+主因：Long-context、stuck-in-loop等
+分析：
+- agent 在修复前持续收集信息
+- 不知道哪些信息已经足够、哪些方面还缺，无法判断当前信息是否已经足以支持patch
+- 因此一直读文件、一直循环、始终不能patch
+
+### 第二种情况：Submitted 但失败
+主因：Wrong solution、Incorrect file等
+分析：
+- 非单纯的patch synthesis error
+- 依据的信息不足以支撑正确修复
+- 或者这些信息被错误地归因到了错误的修复位置
+- 但是agent误认为自己的task evidence已经closure，提前进行了patch
+
+
+## 一个成功Repair需要4类证据闭环
+这两类失败共同指向一个问题：repository-level repair 的成败不仅取决于 patch synthesis，更多情况下取决于 agent 是否知道自己何时已经掌握了足以支持修复提交的信息。为了精确定义这一点，我们将成功修复所需的信息刻画为四类必备 repair evidence。
+### 1) Symptom Evidence
+回答的是：
+> 现在坏在哪里，修好以后应该表现成什么样。
+> 
+它描述 observable failure 和 repair target。
+包括：
+- issue statement 中的错误现象描述
+- failing tests 
+- failing assertions
+- exception type
+- stack trace
+- reproducer output
+-  egression expectations
+
+它的作用是定义：
+- 什么叫“未修复”
+- 什么叫“修复成功”
+- 哪些行为不能被破坏
+
+### 2) Localization Evidence
+回答的是：
+> 应该改哪里。
+> 
+它把 symptom 连到候选编辑位置。
+包括：
+- suspect files
+- suspect functions / classes / symbols
+- suspect code regions / hunks
+- stack trace 对应代码位置
+- call chain / call graph 邻域
+- dataflow-relevant definitions/uses
+- 与 issue entities 对齐的代码位置
+它的作用是把“问题现象”落到“可编辑位置”。
+
+### 3) Constraint Evidence
+回答的是：
+> 什么修改才算正确，什么不能改坏。
+> 
+它定义修复必须满足的语义边界和行为约束。
+包括：
+- requirement statements
+- API contracts
+- docstrings / comments
+- type hints / type definitions
+- assertions / invariants
+- schema / config constraints
+- backward compatibility expectations
+- 仓库中类似 API / similar implementation 的既有模式
+它的作用是防止：
+- patch 只修表面症状
+- patch 改坏已有行为
+- patch 虽过部分测试但违反真实 requirement
+
+### 4. Structural Evidence
+回答的是：
+> 哪些位置必须一起改，修改之间是什么依赖关系。
+> 
+它描述修复的结构传播和协同关系。
+包括：
+- caller-callee consistency edges
+- must-co-edit relations
+- schema ↔ parser ↔ serializer dependencies
+- import / interface / wrapper / adapter propagation
+- multi-file / multi-hunk coupling relations
+它的作用是避免：
+- 只改一个局部点
+- 漏掉必须联动修改的位置
+- 得到 partial fix 或 brittle fix
+
+## 一个合格的证据闭环必须同时满足 3 个条件
+### 1) Sufficiency
+证据是否足够支持一次修复提交。
+
+### 2) Consistency
+不同证据之间是否相互一致，而不是互相冲突。
+### 3) Correct attribution
+证据是否真的指向了正确的修复位置和根因，而不是只和 bug 表面现象相关
+当且仅当四类必备 evidence 都已达到可提交修复的充分度，彼此之间没有未解决的关键冲突，并且这些 evidence 被一致地归因到同一组根因解释和候选修复位置上时，我们认为形成了合格的证据闭环。回过头来看，这两类repair失败，前者是因为始终无法判断evidence是否足够，以及仍需要搜集何种信息而陷入搜索爆炸，后者是在evidence尚未形成充足和闭环的条件下提前进行了commit。
+
+
+
+# Workflow
+### 设计一套Evidence-closure-aware repair harness来引导agent系统性地搜集repair evidence，并形成闭环检查。
+## Phase 1: Artifact Parsing
+初步分析输入，拆解出Evidence所需的部分内容
+输入：
+- problem statement
+- requirements
+- new_interfaces
+- expected_and current_behavior
+- repo
+
+## Phase 2: Artifact-to-Evidence Extraction
+深入repo进行retrieval，构建出完整的evidence
+分别构建：
+- Symptom Card
+- Localization Card
+- Constraint Card
+- Structural Card
+
+### Step 1: 从 Problem Statement 提取 Symptom Frame
+输入
+- problem statement
+目标
+抽出一个结构化的 symptom frame
+包括：
+- `observed_failure`：当前错误现象
+- `trigger_condition`：在什么条件下出现
+- `expected_behavior`：预期行为
+- `mentioned_entities`：模块、类、函数、route、config key、feature 名称
+- `hinted_scope`：看起来涉及的 subsystem / component
+原因
+problem statement 在 SWE-Bench Pro 里已经经过 human augmentation，按设计应该足以独立求解。
+所以它不是“弱提示”，而是第一性 artifact。
+产出
+这一步主要产生：
+- 初始 Symptom Evidence
+- 初始 Localization anchors
+- 初始 Constraint clues
+
+### Step 2: 从 Requirements 提取 Constraint Frame
+输入
+- requirements
+目标
+把 requirement 转成一组显式 correctness constraints。
+包括：
+- `must_do`
+- `must_not_break`
+- `allowed_behavior`
+- `forbidden_behavior`
+- `compatibility_expectations`
+- `edge_case_obligations`
+例如：
+- route 名必须是什么
+- API 应返回什么
+- 某输入是否允许为 `None`
+- 是否要保持 backward compatibility
+- corner case 应如何处理
+原因
+SWE-Bench Pro 明说 requirements 是为了消除歧义，并且 grounded on validation tests。
+这意味着 requirements 在你的理论里应被视为 高可信 Constraint Evidence，而不是普通自然语言提示。
+产出
+这一步主要产生：
+- 核心 Constraint Evidence
+- 同时补充 Symptom 中的 expected behavior
+
+### Step 3: 从 Interface 提取 Repair Boundary
+输入
+- interface spec
+目标
+抽出显式接口边界：
+- 类名 / 函数名 / route 名
+- 预期暴露的 entry points
+- 不能改错的符号名
+原因
+SWE-Bench Pro 专门加入 interface，就是为了避免“修对逻辑但命名不对”的假阴性。
+所以 interface 在你的框架里不是附属信息，而是：
+> Constraint Evidence + Localization Evidence 的桥梁
+> 
+它告诉你：
+- patch 至少要落在这条接口实现链附近
+- 同时不能违反显式符号约束
+产出
+- 更精确的 Localization Evidence
+- 更强的 Constraint Evidence
+
+
+### Step 4: 从 Repo 提取 Localization + Structural Evidence
+repo 是最核心的实现空间。
+但注意：不是“读尽量多文件”，而是围绕前面三类 artifact 给出的锚点去做定向抽取。
+
+### 4.1 Localization 抽取
+基于：
+- problem statement 提到的实体
+- new_interfaces 指定的符号、接口
+- stack trace / assertion 路径
+去 repo 里找：
+- candidate files
+- candidate symbols
+- candidate edit regions
+- 调用链邻域
+- dataflow-relevant code
+
+### 4.2 Structural 抽取
+基于 candidate locations 再抽：
+- caller-callee links
+- import / wrapper / adapter chains
+- same-interface multiple implementations
+- must-co-edit candidates
+原则
+repo extraction 的目标不是“补全背景知识”，而是回答两个问题：
+1. patch 应该落到哪里
+2. 改一个点会不会要求别处同步改动
+
+
+### Step 5: 把四类 evidence 组织成四张 card
+方法里显式维护四张证据卡：
+Symptom Card
+包含：
+- observed failure
+- trigger
+- expected behavior
+
+
+Localization Card
+包含：
+- candidate files
+- candidate symbols
+- candidate edit regions
+- mapping from issue/interface to code
+
+
+Constraint Card
+包含：
+- requirements-derived constraints
+- interface constraints
+- API/type/assertion/doc constraints
+
+
+Structural Card
+包含：
+- dependency edges
+- caller-callee relations
+- must-co-edit groups
+- propagation risks
+- affected regression scope
+
+
+## Phase 3: Closure Checking
+进行闭环检查，如果不通过，不允许 patch。
+依次检查：
+- sufficiency
+- consistency
+- correct attribution
+
+### 1) Sufficiency：证据是否足够支持一次修复提交
+这里不是数 evidence 条数，而是看四张 card 是否都达到了可操作阈值。
+A. Symptom sufficiency
+要求：
+- 问题现象被明确刻画
+- 触发条件或 failure condition 明确
+- 修复目标明确
+- 保护目标明确
+
+如果 agent 说不清“修好后哪些行为必须成立”，则不够。
+---
+
+B. Localization sufficiency
+要求：
+- 至少有一组高置信 candidate edit locations
+- 位置精度至少到 file + symbol，最好到 region
+- 这些位置和 symptom / interface 有明确映射关系
+
+如果只有“这个模块可能有问题”，不够。
+---
+
+C. Constraint sufficiency
+要求：
+- 已提炼出 requirement/interface/API 的核心约束
+- 已知道哪些行为必须保留
+- 已知道 patch 不能违反哪些命名、签名、路由、兼容性边界
+
+如果只知道改哪里，不知道“什么算改对”，不够。
+---
+
+D. Structural sufficiency
+要求：
+- 已分析 candidate edit locations 的依赖结构
+- 已知道 patch 是否可能影响其他模块或路径
+- 已识别 must-co-edit groups，或已证明没有明显协同修改需求
+如果完全没分析传播和联动，不够。
+
+
+### 2) Consistency：不同 evidence 是否一致
+这一步检查四张 card 之间有没有关键冲突。
+A. Symptom ↔ Localization
+- 问题症状所对应的测试/接口，是否真的映射到 candidate locations
+- 如果 symptom 是输入边界问题，location 却落在一个纯展示层文件，这是冲突
+---
+
+B. Localization ↔ Constraint
+- candidate location 所承担的修复责任，是否与 requirement/interface/API 约束一致
+- 例如 interface 明确说明应保持函数签名，patch 却打算绕开原接口重做，这是冲突
+---
+
+C. Constraint ↔ Structural
+- requirement 要求兼容，但 structural analysis 显示该 patch 会传播到多个依赖模块且无同步方案，这是冲突
+---
+
+D. Symptom ↔ Structural
+- 当前结构解释是否能解释所有 fail2pass 症状
+- 如果只能解释一个 failing behavior，却忽略另一个共享路径 failure，这是不一致
+---
+
+一致性的核心标准
+只有当四张 card 支持的是同一个 repair story，才能算一致。
+否则即使信息很多，也只是碎片拼盘，不是闭环。
+
+
+### 3) Correct attribution：证据是否指向正确根因和修复位置
+这是最关键的一关。
+因为很多失败不是证据少，而是证据闭错了地方。
+正确归因要检查 3 个层次
+
+A. Symptom 是否被归因到 root cause，而不是 surface symptom
+例如：
+- 测试失败在 wrapper
+- 但 root cause 在内部实现或上游 caller
+    如果 agent 直接改 wrapper，可能是误归因。
+---
+
+B. Localization 是否落在真正承担修复责任的位置
+例如：
+- interface 给出函数名，但真正应该改的是底层 helper
+- 或 issue 提到 API，但实际是调用方 misuse
+---
+
+C. Structural evidence 是否支持这个 location attribution
+例如：
+- candidate file 只是被动经过路径
+- 真正负责行为约束的模块在另一处
+- 或者多个 co-edit edges 都指向另一个 repair center
+
+## Phase 4: Patch Planning
+只有闭环通过后，才生成（由Evidence引导）：
+- candidate edit locations
+- must-co-edit groups
+- repair intent per location
+- validation plan
+
+## Phase 5: Patch Generation
+
+
+## Phase 6: Validation / Replan
+
+
+二、评估流程
+## SWE-Bench Pro
+
+Code and data for the following works:
+* <a href="https://static.scale.com/uploads/654197dc94d34f66c0f5184e/SWEAP_Eval_Scale%20(9).pdf">SWE-bench Pro: Can AI Agents Solve Long-Horizon Software Engineering Tasks?</a>
+
+* HuggingFace: <a href="https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro">https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro</a>
+
+* Public Leaderboard: <a href="https://scale.com/leaderboard/swe_bench_pro_public">https://scale.com/leaderboard/swe_bench_pro_public</a>
+
+* Commercial (Private) Leaderboard: <a href="https://scale.com/leaderboard/swe_bench_pro_commercial">https://scale.com/leaderboard/swe_bench_pro_commercial</a>
+
+## Overview
+SWE-Bench Pro is a challenging benchmark evaluating LLMs/Agents on long-horizon software engineering tasks.
+Given a *codebase* and an *issue*, a language model is tasked with generating a *patch* that resolves the described problem.
+
+The dataset is inspired from SWE-Bench: https://github.com/SWE-bench/SWE-bench
+
+To access SWE-bench Pro, copy and run the following code:
+```python
+from datasets import load_dataset
+swebench = load_dataset('ScaleAI/SWE-bench_Pro', split='test')
+```
+
+## Installation
+
+### 1. Install Python Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Install Docker
+
+SWE-bench Pro uses Docker for reproducible evaluations.
+
+Follow the instructions in the [Docker setup guide](https://docs.docker.com/engine/install/) to install Docker on your machine.
+If you're setting up on Linux, we recommend seeing the [post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/) as well.
+
+### 3. Configure Modal (Recommended) (or use local docker [Beta])
+
+```bash
+modal setup  # Follow the prompts to generate your token
+```
+
+After running, verify your credentials in `~/.modal.toml`:
+```
+token_id = <token id>
+token_secret = <token secret>
+active = true
+```
+
+Beta: Local Docker. No additional setup needed. Use the `--use_local_docker` flag when running evaluations.
+
+## Docker Images
+
+We provide prebuilt Docker images for each instance on Docker Hub:
+
+**Repository:** https://hub.docker.com/r/jefzda/sweap-images
+
+### Finding the Correct Image
+
+Each instance in the HuggingFace dataset has a `dockerhub_tag` column containing the Docker tag for that instance. You can access it directly:
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset('ScaleAI/SWE-bench_Pro', split='test')
+
+# Get the Docker image for a specific instance
+for row in dataset:
+    instance_id = row['instance_id']
+    docker_tag = row['dockerhub_tag']
+    full_image = f"jefzda/sweap-images:{docker_tag}"
+    print(f"{instance_id} -> {full_image}")
+```
+
+**Important:** Bash runs by default in our images. When running these images, you should not manually invoke bash. See https://github.com/scaleapi/SWE-bench_Pro-os/issues/6
+
+## Usage
+
+### 1. Generate Patches
+Generate patch predictions using your harness of choice. 
+
+For generating patches using SWE-agent, see the [SWE-agent git submodule](./SWE-agent/) (note: you will have to use this as a git submodule. See [official git documentation](https://git-scm.com/book/en/v2/Git-Tools-Submodules) for details). The submodule contains detailed instructions to
+- Set up SWE-agent for patch generation
+- Run SWE-agent on SWE-Bench Pro instances
+- Configure model parameters and turn limits
+
+The output will be `.pred` files containing model-generated patches for each instance.
+
+### 2. Gather Patches
+After generating patches, use the `gather_patches.py` helper script to collect all patches into a single JSON file for evaluation:
+
+```bash
+python helper_code/gather_patches.py \
+    --directory <path_to_pred_files> \
+    --prefix <model_name> \
+    --output <output_file>.json
+```
+
+**Parameters:**
+- `--directory`: Directory containing instance folders with `.pred` files (e.g., from SWE-agent output or downloaded trajectories)
+- `--prefix`: Prefix identifier for your model/run (e.g., "gpt4", "claude-sonnet", "sample1")
+- `--output`: Output JSON file path
+
+**Example:**
+```bash
+python helper_code/gather_patches.py \
+    --directory swe_bench_pro_results/sample1 \
+    --prefix sample1 \
+    --output sample1_patches.json
+```
+
+This will create a JSON file in the format expected by the evaluation script:
+```json
+[
+  {
+    "instance_id": "instance_...",
+    "patch": "diff --git ...",
+    "prefix": "sample1"
+  }
+]
+```
+
+### 3. Evaluate Patches
+
+Evaluate patch predictions on SWE-Bench Pro:
+
+```bash
+python swe_bench_pro_eval.py \
+    --raw_sample_path=swe_bench_pro_full.csv \
+    --patch_path=<your_patches>.json \
+    --output_dir=<output_directory> \
+    --scripts_dir=run_scripts \
+    --num_workers=100 \
+    --dockerhub_username=jefzda
+```
+
+You can test with the gold patches, which are in the HuggingFace dataset. There is a helper script in `helper_code` which can extract the gold patches into the required JSON format.
+
+## Reproducing Leaderboard Results
+
+To reproduce leaderboard results end-to-end, follow the following steps:
+
+1. Complete setup in the `SWE-agent` submodule. We recommend to use the Docker image to run the scaffold, via `just`.
+2. Run the scaffold. We have included an example for Claude Sonnet 4.5 (claude.yaml) but feel free to use any model. It also supports `vllm` for local models. Note that we recommend using the DockerHub images rather than building the Docker images from scratch. You can also execute it locally without Modal.
+3. Compile predictions with helper_code/gather_patches.py.
+4. Run the evaluation script `swe_bench_pro_eval.py` to run the evaluation script.
+
+三、claude code sdk（如果你知识库里没有完整的文档）
+文档：https://platform.claude.com/docs/zh-CN/agent-sdk/quickstart
+
+教学：https://github.com/ErlichLiu/claude-agent-sdk-master?tab=readme-ov-file
+
+基于文件系统工作,每个工作目录对应一个 **Workspace ;** 每个对话有独立的 **Session ID**，所有消息存储为 JSONL 文件；且相比传统llm api，可以自动管理上下文，只需传 sessionId而不用手动拼接
+
+自动实现 tool loop，如下：
+
+```python
+// Agent SDK: Claude handles tools autonomously 自动处理工具
+for await (const message of query({ prompt: "Fix the bug in auth.py" })) {
+  console.log(message);
+}
+```
+
+### **Built-in tools 内置工具**
+
+| Tool | What it does |
+| --- | --- |
+| **Read** | Read any file in the working directory |
+| **Write** | Create new files |
+| **Edit** | Make precise edits to existing files |
+| **Bash** | Run terminal commands, scripts, git operations |
+| **Glob** | Find files by pattern (`**/*.ts`, `src/**/*.py`) |
+| **Grep** | Search file contents with regex |
+| **WebSearch** | Search the web for current information搜索网络以获取最新信息 |
+| **WebFetch** | Fetch and parse web page content |
+| [**AskUserQuestion**](https://platform.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions) | Ask the user clarifying questions with multiple choice options使用多选项让用户回答澄清问题 |
+
+下面例子创建了一个可以debug的代理：
+
+```python
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage
+
+async def main():
+    # 智能体循环：在 Claude 工作时流式传输消息
+    async for message in query(
+        prompt="Review utils.py for bugs that would cause crashes. Fix any issues you find.",
+        options=ClaudeAgentOptions(
+            allowed_tools=["Read", "Edit", "Glob"],  # Claude 可以使用的工具
+            permission_mode="acceptEdits"            # 自动批准文件编辑
+        )
+    ):
+        # 打印人类可读的输出
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if hasattr(block, "text"):
+                    print(block.text)              # Claude 的推理
+                elif hasattr(block, "name"):
+                    print(f"Tool: {block.name}")   # 正在调用的工具
+        elif isinstance(message, ResultMessage):
+            print(f"Done: {message.subtype}")      # 最终结果
+
+asyncio.run(main())
+
+```
+
+**自定义工具：**https://platform.claude.com/docs/zh-CN/agent-sdk/custom-tools
+
+使用 `createSdkMcpServer` 和 `tool` 辅助函数来定义，比如：
+
+```python
+
+from claude_agent_sdk import tool, create_sdk_mcp_server, ClaudeSDKClient, ClaudeAgentOptions
+from typing import Any
+import aiohttp
+
+# 使用 @tool 装饰器定义自定义工具
+@tool("get_weather", "使用坐标获取某个位置的当前温度", {"latitude": float, "longitude": float})
+async def get_weather(args: dict[str, Any]) -> dict[str, Any]:
+    # 调用天气 API
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"https://api.open-meteo.com/v1/forecast?latitude={args['latitude']}&longitude={args['longitude']}&current=temperature_2m&temperature_unit=fahrenheit"
+        ) as response:
+            data = await response.json()
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": f"温度：{data['current']['temperature_2m']}°F"
+        }]
+    }
+
+# 使用自定义工具创建 SDK MCP 服务器
+custom_server = create_sdk_mcp_server(
+    name="my-custom-tools",
+    version="1.0.0",
+    tools=[get_weather]  # 传递装饰过的函数
+)
+```
+
+### 权限检查
+
+当 Claude 请求使用工具时，SDK 按以下顺序检查权限：
+
+1. **hook**
+    
+    首先运行hook，hook可以允许、拒绝或继续到下一步
+    
+2. **deny rules**
+    
+    按以下顺序检查 [settings.json](https://code.claude.com/docs/en/settings#permission-settings) 中定义的规则：首先检查 `deny` 规则（无论其他规则如何都会阻止），然后检查 `allow` 规则（匹配则允许），最后检查 `ask` 规则（提示审批）
+    
+3. **permission mode**
+    
+    `bypassPermissions`、`acceptEdits`、`default`、`plan`
+    
+4. **canUseTool callback**
+    
+    如果以上都未设置，则调用 [`canUseTool` 回调](https://platform.claude.com/docs/zh-CN/agent-sdk/user-input)来做出决定（在这里可以设置更细粒度的拦截机制或者直接当日志使用）
+    
+    比如设置成一律批准：
+    
+    ```python
+    async def can_use_tool(tool_name, input_data, context):
+    		print(f"Claude wants to use {tool_name}")
+    		approved = await ask_user("Allow this action?")
+    		if approved:
+    		    return PermissionResultAllow(updated_input=input_data)
+    		return PermissionResultDeny(message="User declined")
+    ```
+    
+
+当claude想要提出澄清问题时（对orchestrator），会调用 `AskUserQuestion` 工具。
+
+1. 触发 `canUseTool` 回调，其中 `toolName` 设置为 `AskUserQuestion`
+2. 解析`questions` 数组中 Claude 的问题
+
+```python
+{
+	"questions": [
+		{
+			"question": "How should I format the output?",
+			"header": "Format",
+			"options": [
+			{ "label": "Summary", "description": "Brief overview" },
+			{ "label": "Detailed", "description": "Full explanation" }
+			],
+			"multiSelect": false
+		},
+		{
+			"question": "Which sections should I include?",
+			"header": "Sections",
+			"options": [
+			{ "label": "Introduction", "description": "Opening context" },
+			{ "label": "Conclusion", "description": "Final summary" }
+			],
+			"multiSelect": true
+		}
+	]
+}
+```
+
+（也不是全是claude的预定义选项，支持orchestrator自己说答案）
+
+1. 收集回答，返回给claude
+
+### **Hooks**
+
+在agent的关键事件处运行自定义代码
+
+python可用事件有：
+
+| **事件名** | **触发条件** | **示例用例** |
+| --- | --- | --- |
+| `PreToolUse` | 工具调用请求（可以阻止或修改） | 阻止危险的 shell 命令 |
+| `PostToolUse` | 工具执行结果 | 将所有文件更改记录到审计跟踪 |
+| `UserPromptSubmit` | 用户提示提交 | 向提示中注入额外上下文 |
+| `Stop` | 代理执行停止 | 退出前保存会话状态 |
+| `SubagentStop` | 子代理完成 | 聚合并行任务的结果 |
+| `PreCompact` | 对话压缩请求 | 在摘要之前归档完整记录 |
+
+hook按照它们在数组中出现的顺序执行。保持每个hook专注于单一职责，并链接多个hook以实现复杂逻辑
+
+如果任何hook返回 `deny`，操作将被阻止——其他hooks返回 `allow` 不会覆盖它。
+
+### **Subagents子代理**
+
+可通过三种方式创建：
+
+- 编程方式：在 `query()` 选项中使用 `agents` 参数。示例（创建了两个子代理：一个具有只读访问权限的代码审查器和一个可以执行命令的测试运行器）如下：
+
+```python
+import asyncio
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+
+async def main():
+    async for message in query(
+        prompt="Review the authentication module for security issues",
+        options=ClaudeAgentOptions(
+            # Task 工具必须包含在 allowedTools 中，因为 Claude 通过 Task 工具调用子代理。
+            allowed_tools=["Read", "Grep", "Glob", "Task"],
+            agents={
+                "code-reviewer": AgentDefinition(
+                    # description tells Claude when to use this subagent
+                    description="Expert code review specialist. Use for quality, security, and maintainability reviews.",
+                    # prompt defines the subagent's behavior and expertise
+                    prompt="""You are a code review specialist with expertise in security, performance, and best practices.
+
+When reviewing code:
+- Identify security vulnerabilities
+- Check for performance issues
+- Verify adherence to coding standards
+- Suggest specific improvements
+
+Be thorough but concise in your feedback.""",
+                    # tools restricts what the subagent can do (read-only here)
+                    tools=["Read", "Grep", "Glob"],
+                    # model overrides the default model for this subagent
+                    model="sonnet"
+                ),
+                "test-runner": AgentDefinition(
+                    description="Runs and analyzes test suites. Use for test execution and coverage analysis.",
+                    prompt="""You are a test execution specialist. Run tests and provide clear analysis of results.
+
+Focus on:
+- Running test commands
+- Analyzing test output
+- Identifying failing tests
+- Suggesting fixes for failures""",
+                    # Bash access lets this subagent run test commands
+                    tools=["Bash", "Read", "Grep"]
+                )
+            }
+        )
+    ):
+        if hasattr(message, "result"):
+            print(message.result)
+
+asyncio.run(main())
+```
+
+- 基于文件系统：在 `.claude/agents/` 目录中将代理定义为 .md 文档（参见[将子代理定义为文件](https://code.claude.com/docs/en/sub-agents)）
+- 内置通用型：Claude 可以随时通过 Task 工具调用内置的 `general-purpose` 子代理，无需进行任何定义
+
+Claude 会根据任务和每个subagent的 `description` 自动决定何时调用该subagent；若要指定，在提示词中按名称提及
+
+subagent可以被恢复以从中断处继续
+
+### **MCP**
+
+通过mcp协议连接外部系统，比如：数据库、浏览器、API等等
+
+MCP服务器目录：https://github.com/modelcontextprotocol/servers
+
+### **Sessions会话**
+
+在多次交互中保持上下文。Claude 记得读取的文件、完成的分析以及对话历史。
+
+稍后可以继续会话，或者fork它们以探索不同的方法。对比如下表；
+
+| 行为 | `forkSession: false`（默认） | `forkSession: true` |
+| --- | --- | --- |
+| 会话 ID | 与原始相同 | 生成新的会话 ID |
+| 历史记录 | 追加到原始会话 | 从恢复点创建新分支 |
+| 原始会话 | 被修改 | 保持不变 |
+| 使用场景 | 继续线性对话 | 分支以探索替代方案 |
+
+### **Claude Code features 功能**
+
+基于文件系统的 Claude 配置。在选项中设置`setting_sources=["project"]`

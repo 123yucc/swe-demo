@@ -1,0 +1,147 @@
+与 Claude Agent SDK 兼容”的 Phase 1/2 改进方案
+
+基于《需求描述01.txt》的创新点与 workflow、结合当前实现进度（基本全是正则+硬编码、无 LLM 调用）和claude_sdk_docs/下所有内容
+
+**总目标**
+- 引入 Claude Agent SDK/LLM 参与，围绕“证据闭环”三标准（Sufficiency / Consistency / Correct attribution）生成与检查四类 Evidence Cards。
+- 去除硬编码与固定置信度，改为数据驱动（检索/AST/上下文质量）+ LLM 评估。
+- Repo 检索聚焦于已知锚点（problem statement、requirements、interface/new_interfaces），避免盲扫。
+
+---
+
+## Phase 1（Artifact Parsing）改进方案
+**当前问题**：全靠正则；未调用 LLM；未利用 new_interfaces / expected_and current_behavior；置信度固定值。
+**目标**：用 LLM 抽取高质量 Symptom/Constraint/Localization/Interface 锚点，并形成初始四卡草稿（v1），带 sufficiency 评估。
+
+1) **输入覆盖**
+- 读入：problem_statement.md, requirements.md, interface.md/new_interfaces.md, expected_and current_behavior.md（当前未使用要补上）。
+- 若缺文件，生成告警并在 sufficiency_notes 中标注不足。
+
+2) **LLM 结构化抽取**
+- Symptom Frame：observed_failure（含错误消息/异常类型/stack 线索）、trigger_condition（含复现步骤）、expected_behavior（从 problem_statement + expected_and current_behavior 对齐）、mentioned_entities、hinted_scope。
+- Constraint Frame：must_do / must_not_break / allowed_behavior / forbidden_behavior / compatibility_expectations / edge_case_obligations（结合 requirements + interface/new_interfaces）。
+- Interface Boundary：入口路由/函数/类/符号名、禁止改错的符号、签名/路由约束。
+- 将 rule-based 结果与 LLM 结果合并，冲突时优先 LLM，并记录决策来源。
+
+3) **初步 Localization anchors**
+- 基于 mentioned_entities、接口符号、route/函数/类名，形成初步 anchors（file/symbol patterns，暂不定位行号），置信度按来源：interface/new_interfaces > problem_statement > heuristic。
+- 去除固定 0.7/0.9 置信度，改为“来源权重 + LLM 置信评分”。
+
+4) **初始 Sufficiency 评估（v1）**
+- LLM 生成 card-level sufficiency_status + notes（Symptom/Localization/Constraint/Structural）。Phase 1 只要求“初步充分/待补充”级别，不做硬编码文本。
+- 记录缺失项：例如“缺少 stack trace”、“缺少接口响应示例”、“缺少 code 对齐”。
+
+5) **输出**
+- 生成 symptom/localization/constraint/structural_card.json v1 + card_versions/v1。
+- 在 summary 中列出：使用的 artifacts、缺失的 artifacts、已抽取的 anchors 与约束要点。
+
+---
+Phase 1 改进方案（Artifact Parsing，SDK 对齐）
+
+输入覆盖与缺失标注：读取 problem_statement.md、requirements.md、interface.md/new_interfaces.md、expected_and current_behavior.md。缺失文件写入 sufficiency_notes（Symptom/Constraint/Localization/Structural 均标注缺口）。
+LLM 结构化抽取（流式会话 + allowedTools: Read/Glob/Grep）
+Symptom Frame：observed_failure（错误/异常/stack）、trigger_condition（复现步骤）、expected_behavior（对齐 problem_statement + expected_vs_current）、mentioned_entities、hinted_scope。
+Constraint Frame：must_do/must_not_break/allowed/forbidden/compatibility_expectations/edge_case_obligations（requirements + interface/new_interfaces）。
+Interface Boundary：入口路由/函数/类/符号名、禁改符号、签名/路由约束。
+合并规则：rule-based 与 LLM 结果合并，冲突优先 LLM，并记录 evidence_source。
+初步 Localization anchors：基于 mentioned_entities/接口符号/route/类名生成 anchors（file/symbol pattern），置信度 = 来源权重 + LLM 评分（不再固定 0.7/0.9）。
+初始 Sufficiency 评估 (v1)：LLM 对四卡生成 sufficiency_status（初步充分/待补充）与 sufficiency_notes，列缺口如“缺少 stack trace / 缺少接口响应示例 / 缺少代码对齐”。
+输出：写入 symptom/localization/constraint/structural_card.json v1（含 evidence_source、动态置信度、真实时间戳、updated_by=phase1_parser），并在 summary 列出使用/缺失的 artifacts 与抽取要点。保留 evidence/card_versions/v1。
+SDK 配置要点：
+system_prompt 用 claude_code 预设 + 追加“证据闭环”提示。
+setting_sources 加载 CLAUDE.md / skills / hooks（如安全钩子限制 Bash）。
+allowedTools: Read, Glob, Grep（Phase1 避免写操作）；permission_mode 默认。
+采用流式输入模式，便于多轮抽取与缺口追问。
+----------------
+
+## Phase 2（Artifact-to-Evidence Extraction）改进方案
+**当前问题**：全硬编码（错误模式、接口映射、类型约束、依赖关系、时间戳/版本号）；无真实 repo 检索；置信度固定。
+**目标**：围绕锚点做定向检索（文本 + AST），再用 LLM 归纳并更新四卡 v2，提供可操作的 sufficiency/consistency/attribution 检查结果。
+
+1) **SymptomExtractor 改进**
+- 从 artifacts & repo 日志/错误文本（若有）中动态抽取错误模式，而非硬编码字符串。
+- 若有 tests/logs，解析 stack trace / assert 片段（可用正则+AST 定位文件行号），交给 LLM 总结触发条件与错误簇。
+- LLM 重新评估 sufficiency：是否有“可复现触发 + 期望行为 + 错误模式”，缺啥写明。
+
+2) **LocalizationExtractor 改进**
+- 定向检索：
+  - 文本 grep：对 anchors（route/函数/类/符号名、配置 key）在 repo 里搜文件路径和行号。
+  - AST/解析：函数/类定义行号、装饰器（如 @app.route）、调用点引用（引用计数+上下文行）。
+- 构造 candidate_locations：file + symbol + region_start/end + evidence_source + computed_confidence（基于匹配类型：定义=高，引用=中，模糊包含=低；再由 LLM 归一化）。
+- interface_to_code_mappings：由检索结果自动生成（route -> 文件/函数；类名 -> 定义路径；签名比对）。
+- test_to_code_mappings（若无测试可为空但在 notes 说明）。
+- 由 LLM 评估 localization sufficiency：至少一条高置信候选 + 与 symptom/interface 的映射是否成立。
+
+3) **ConstraintExtractor 改进**
+- 解析 requirements/interface/new_interfaces，并结合代码：
+  - 提取 API/route/函数签名（与代码真实签名对比，标记差异）。
+  - 抽取类型/Docstring/assert/Schema（如 Pydantic/JSON schema/config）作为约束来源。
+  - Edge cases / backward compatibility：LLM 从 requirements + 代码注释提炼。
+- type_constraints：从函数参数注解、pydantic/dataclass、schema 文件中抽；不要硬编码。
+- sufficiency：若未找到接口实现或缺少响应格式/状态码/类型约束，标注为 partial/insufficient 并列出缺口。
+
+4) **StructuralExtractor 改进**
+- 基于 candidate_locations 做依赖分析：
+  - Caller-callee：AST call graph（同文件直接调用 + 简单跨文件 import 分析）。
+  - Import/adapter/wrapper 链：扫描 import 和包装函数。
+  - Co-edit 识别：同一路由的 handler + helper；同一数据结构的读写点；同一错误码/响应格式的多处使用。
+- 由 LLM 汇总 dependency_edges、co_edit_groups、propagation_risks，并给出 sufficiency。
+- 去掉硬编码的“enroll_batch -> FaceDetector”等。
+
+5) **Confidence & Metadata**
+- 置信度算法：来源类型（定义 > 调用 > 字符串包含）、匹配精确度（完整符号匹配 > 子串）、LLM 评分（让 LLM 结合上下文打 0-1 分）。
+- 版本号/时间戳改为真实当前时间；updated_by 标注具体 extractor 名称。
+
+6) **Closure Checks（Phase 2 输出）**
+- 在四卡中加入 Phase 2 的 sufficiency_notes，明确缺口。
+- 可在结果中附一份 consistency/attribution 粗检表（LLM 判断症状→定位→约束→结构是否指向同一 repair story）。
+
+---
+Phase 2 改进方案（Artifact-to-Evidence Extraction，SDK 对齐）
+
+SymptomExtractor：
+解析 artifacts、logs/tests（若有）动态抽取错误模式，使用正则+AST 定位 stack/assert 行号，再交给 LLM 汇总触发条件/错误簇。
+Sufficiency：检查“可复现触发 + 期望行为 + 错误模式”是否齐全，缺啥写 sufficiency_notes。
+LocalizationExtractor（定向检索）：
+文本 grep：对 Phase1 anchors（route/函数/类/符号/配置 key）在 repo 搜文件与行号。
+AST/解析：定义行号、装饰器（如 @app.route）、调用点引用（引用计数+上下文）。
+生成 candidate_locations: file + symbol + region_start/end + evidence_source + computed_confidence（定义>调用>模糊，LLM 归一化）。
+自动生成 interface_to_code_mappings（路由→文件/函数/签名对比），test_to_code_mappings（可为空，需 notes 说明）。
+Sufficiency：至少一条高置信候选且与 symptom/interface 一致，否则标 partial/insufficient。
+ConstraintExtractor：
+对 requirements/interface/new_interfaces 与代码签名/装饰器/Schema（pydantic/JSON schema/docstring/assert）比对，提取 type_constraints、compatibility_expectations、edge_case_obligations。
+标注签名差异、缺少状态码/响应格式即记 sufficiency_notes。
+StructuralExtractor：
+基于 candidate_locations 做依赖：caller-callee（AST call graph 同文件 + 简易跨文件 import）、import/adapter/wrapper 链。
+Co-edit 识别：同一路由 handler+helper、同一数据结构读写、同一错误码/响应格式多处使用。
+LLM 汇总 dependency_edges、co_edit_groups、propagation_risks，并出 sufficiency_status。
+Confidence & Metadata：
+置信度 = 匹配类型权重（定义/调用/模糊）× 精确度（全名/子串） + LLM 评分，归一化 0-1。
+时间戳为当前真实时间；updated_by 标具体 extractor 名；移除硬编码模式/映射/类型/依赖。
+Closure Checks（Phase 2 输出）：
+四卡加入 Phase2 sufficiency_notes，列缺口。
+附一致性/归因粗检表：症状→定位→约束→结构是否指向同一 repair story。
+SDK 配置要点：
+allowedTools: Read, Glob, Grep, Bash(安全白名单，如 rg, python - <<'PY' 解析); 可选 AST 脚本内联。
+hooks: PreToolUse 校验命令模式；PostToolUse 记录来源；可启用 file_checkpointing 以便回溯。
+可选 plugins/skills：封装常用 AST/grep/解析脚本为技能，options.plugins 加载。
+仍用流式输入，必要时 /compact 控制上下文。
+
+
+---------------------
+与现实现状的差异（需改造点）
+
+去掉硬编码返回值/置信度/时间戳，改为：工具检索 → LLM 归纳 → 真实时间戳+来源字段。
+Phase 1 增加 expected_and current_behavior/new_interfaces 的解析；Phase 2 用实际 repo 检索替换手写映射/模式/类型表。
+在 orchestrator 中：
+配置 ClaudeAgentOptions.allowed_tools 按阶段切换；
+注册子代理 AgentDefinition（description+prompt+工具集）；
+可选：为保存卡片添加自定义工具（如 save_card(card_type, data)）以统一落盘格式。
+
+----------------------
+落地顺序与交付
+
+先改 Phase1：接入 LLM 抽取、artifact 全覆盖、动态置信度与 sufficiency v1，生成四卡 v1。
+再改 Phase2：实现定向检索+AST、自动 mappings/依赖、LLM 归纳评分，生成四卡 v2 + closure 粗检。
+保持现有 JSON 结构，新增 evidence_source、matching_detail、confidence、真实时间戳；写入 evidence/card_versions/。
+每步输出缺口说明，便于 Phase3 闭环。
