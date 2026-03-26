@@ -1,87 +1,110 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文档是仓库文档的精简地图。
+目标：帮助 agent 以最小上下文开销快速定位正确文档。
 
-## Project Overview
+## 阅读顺序
 
-Evidence-Closure-Aware Software Engineering Repair Agent - A Python project that uses the Claude Agent SDK to automatically fix software issues by systematically gathering and validating four types of evidence before generating patches:
-- **Symptom Evidence**: What's broken and what the expected behavior should be
-- **Localization Evidence**: Where the fix should be applied
-- **Constraint Evidence**: What makes a fix correct and what must not be broken
-- **Structural Evidence**: Dependencies and co-edit requirements
+1. `docs/00-index.md`
+2. `docs/plan`
+3. `docs/05-requirements-analysis.md`
+4. `docs/10-architecture.md`
+5. `docs/20-interfaces.md`
+6. `docs/schemas/00-index.md`
+7. `docs/30-naming-rules.md`
+8. `docs/workers/00-index.md`
 
-## Running the Project
+## 各文档职责
 
-```bash
-# Run Phase 1 (Artifact Parsing) only
-python main.py <instance_id> --phase1-only
+- `docs/00-index.md`
+	- 顶层目录与导航入口。
+	- 提供架构、接口、命名规则与 worker 规范的跳转点。
+	- 指导 agent 在新任务中优先阅读哪些文档。
 
-# Run full repair workflow (requires --problem)
-python main.py <instance_id> --problem "problem description"
+- `docs/05-requirements-analysis.md`
+	- 需求背景、目标、范围与 agentic 设计原则。
+	- 功能与非功能需求基线。
+	- 阶段验收标准、风险与需求到实现映射。
 
-# Example
-python main.py face_recognition_issue_001 --phase1-only
-```
+- `docs/10-architecture.md`
+	- 系统结构：6 阶段流程与 worker 职责。
+	- 依赖方向与所有权边界。
+	- 精简但可执行的架构不变量。
 
-## Installing Dependencies
+- `docs/20-interfaces.md`
+	- artifacts、evidence cards 与流水线输出的规范接口。
+	- card JSON 的字段级必需约束。
+	- 各阶段输入/输出路径约定。
 
-```bash
-pip install -r requirements.txt
-```
+- `docs/30-naming-rules.md`
+	- 文件与目录命名语法。
+	- worker 与 phase 的命名规范。
+	- JSON key、符号命名与版本规则。
 
-## Architecture
+- `docs/schemas/00-index.md`
+	- 由运行时模型生成的严格 JSON Schema 索引。
+	- card schema 与共享组件 schema 的规范链接。
+	- 重新生成路径与真源规则。
 
-The project follows a 6-phase workflow:
+- `docs/workers/00-index.md`
+	- worker 目录总览。
+	- 每个 worker 的一句话目标说明。
+	- 指向各 worker 规范的稳定链接。
 
-1. **Phase 1 (Artifact Parsing)**: Parses input artifacts (`problem_statement.md`, `requirements.md`, `interface.md`) and generates initial evidence cards
-2. **Phase 2 (Evidence Extraction)**: Deep codebase analysis to enrich evidence cards
-3. **Phase 3 (Closure Checking)**: Validates evidence sufficiency before proceeding
-4. **Phase 4 (Patch Planning)**: Creates detailed patch plans
-5. **Phase 5 (Patch Generation)**: Implements the patches
-6. **Phase 6 (Validation/Replan)**: Validates and replans if needed
+- `docs/workers/artifact-parser/10-spec.md`
+	- Phase 1 解析器契约。
+	- 输入、输出与完成标准。
 
-## Key Files
+- `docs/workers/symptom-extractor/10-spec.md`
+	- 症状证据增强契约。
+	- 触发条件/错误提取与充分性检查目标。
 
-- `main.py` - CLI entry point with argument parsing
-- `src/orchestrator.py` - Main workflow controller and agent definitions
-- `src/evidence_cards.py` - Pydantic models for the four evidence card types
-- `src/artifact_parsers.py` - Parsers for problem statements, requirements, and interfaces
-- `src/evidence_extractors.py` - Phase 2 extractors for deep codebase analysis
-- `src/agents/artifact_parser_agent.py` - Phase 1 agent implementation
+- `docs/workers/localization-extractor/10-spec.md`
+	- 候选编辑位置契约。
+	- 映射与置信度生成职责。
 
-## Workspace Structure
+- `docs/workers/constraint-extractor/10-spec.md`
+	- 约束提取契约。
+	- 兼容性与类型边界义务。
 
-Each SWE-Bench instance has an isolated workspace under `workdir/{instance_id}/`:
-```
-workdir/{instance_id}/
-├── repo/              # Cloned target repository
-├── artifacts/         # Input: problem_statement.md, requirements.md, new_interfaces.md, expected_and current_behavior.md
-├── evidence/          # Output: evidence cards (JSON)
-└── evidence/card_versions/  # Version history of cards
-```
+- `docs/workers/structural-extractor/10-spec.md`
+	- 结构依赖分析契约。
+	- 联动编辑与影响范围预期。
 
-## Dependencies
+- `docs/workers/closure-checker/10-spec.md`
+	- 证据闭环判定契约。
+	- patch 规划前置门槛标准。
 
-- `claude-agent-sdk>=0.1.0` - Claude Agent SDK for agent orchestration
-- `pydantic>=2.0.0` - Data validation and models
-- `aiohttp>=3.9.0` - Async HTTP support
-- `datasets>=2.18.0` - SWE-Bench data loading
-- `pytest>=8.0.0` - Testing framework
-- `orjson>=3.9.0` - Fast JSON handling
+- `docs/workers/patch-planner/10-spec.md`
+	- 规划生成契约。
+	- 编辑顺序、风险控制与验证清单。
 
-## Agent Definitions
+- `docs/workers/patch-executor/10-spec.md`
+	- patch 实施契约。
+	- 变更范围控制与变更后验证产物。
 
-The system defines specialized sub-agents (configured in `src/orchestrator.py`):
-- `artifact-parser` - Parses input artifacts and generates initial evidence cards
-- `symptom-extractor` - Analyzes symptoms from problem statements
-- `localization-extractor` - Finds candidate edit locations in the repository
-- `constraint-extractor` - Extracts constraints from requirements and interfaces
-- `structural-extractor` - Analyzes code dependencies and structural relationships
-- `closure-checker` - Evaluates evidence sufficiency before patch planning
-- `patch-planner` - Creates detailed patch plans based on evidence
-- `patch-executor` - Implements patches according to the plan
+- `docs/plan/plan.md`
+	- Long/Short Memory 管理设计
+	- 现在要实现。
 
+- `docs/plan/plan_2.md`
+	- LLM增强与Navigator协同
+	- 现在要实现。
 
-注意,你在bash环境运行的测试脚本，所以删除临时文件时不要用del等windows命令
-用中文回答用户
+- `docs/plan/plan_3.md`
+	- 动态调度与Todo编排改造
+	- 现在要实现。
+
+## 采用该布局的原因
+
+- 文档短小，交叉链接明确。
+- 文件名使用数字前缀，便于确定性检索。
+- 接口与命名规则集中管理，降低架构漂移。
+- 运行时模型与 JSON Schema 绑定，减少文档与代码漂移。
+
+## 运行注意事项
+
+- 脚本中优先使用 bash 兼容命令。
+- 在 bash 测试流程中避免使用仅 Windows 支持的删除命令。
+- 始终用中文回复用户。
 
