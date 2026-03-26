@@ -1,14 +1,44 @@
 """Phase 1: Artifact Parsing - LLM驱动版本。
 
-使用Claude Agent SDK的Agent子代理和结构化输出来解析artifacts。
-去除硬编码模式，改为使用LLM进行结构化提取。
+使用 Claude CLI 解析输入 artifacts 并生成初始证据卡片。
 """
 
 import json
+import re
+import shutil
 import asyncio
+import os
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
+
+
+def _get_claude_executable_path() -> Optional[str]:
+    """获取 Claude Code CLI 路径。"""
+    env_path = os.environ.get("CLAUDE_CODE_EXECUTABLE")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    common_paths = [
+        Path(local_appdata) / "Programs" / "Claude" / "claude.exe",
+        Path.home() / "AppData" / "Local" / "Programs" / "Claude" / "claude.exe",
+    ]
+    for p in common_paths:
+        if p.exists():
+            return str(p)
+
+    return None
+
+
+def _get_project_cwd() -> str:
+    """获取项目根目录。"""
+    current = Path(__file__).parent.parent
+    return str(current.resolve())
 
 try:
     from claude_agent_sdk import (
@@ -122,7 +152,7 @@ class LLMArtifactParser:
     def __init__(self, workspace_dir: str, instance_id: str):
         self.workspace_dir = Path(workspace_dir)
         self.instance_id = instance_id
-        
+
         # 检查workspace_dir是否已经包含了instance_id
         if self.workspace_dir.name == instance_id:
             # workspace_dir已经是实例目录，直接使用
@@ -130,7 +160,7 @@ class LLMArtifactParser:
         else:
             # workspace_dir是基目录，需要添加instance_id
             self.instance_dir = self.workspace_dir / instance_id
-            
+
         self.artifacts_dir = self.instance_dir / "artifacts"
         self.evidence_dir = self.instance_dir / "evidence"
         self.versions_dir = self.evidence_dir / "card_versions"
@@ -145,17 +175,24 @@ class LLMArtifactParser:
     def _get_available_artifacts(self) -> Dict[str, str]:
         """获取所有可用的artifacts。"""
         artifacts = {}
-        expected_files = [
-            "problem_statement.md",
-            "requirements.md",
-            "new_interfaces.md",
-            "expected_and current_behavior.md"  # 修正文件名中的空格
-        ]
 
-        for filename in expected_files:
-            content = self._load_artifact(filename)
-            if content:
-                artifacts[filename] = content
+        # 使用规范化 key，兼容历史命名差异
+        candidate_map = {
+            "problem_statement.md": ["problem_statement.md"],
+            "requirements.md": ["requirements.md"],
+            "new_interfaces.md": ["new_interfaces.md", "interface.md"],
+            "expected_and_current_behavior.md": [
+                "expected_and_current_behavior.md",
+                "expected_and current_behavior.md",
+            ],
+        }
+
+        for canonical_name, candidates in candidate_map.items():
+            for filename in candidates:
+                content = self._load_artifact(filename)
+                if content:
+                    artifacts[canonical_name] = content
+                    break
 
         return artifacts
 
@@ -163,136 +200,246 @@ class LLMArtifactParser:
         """使用LLM解析所有artifacts。
 
         返回结构化的提取结果，包含所有证据卡的内容。
+        使用直接 subprocess 调用 Claude CLI 绕过 SDK 消息解析问题。
         """
-        if not CLAUDE_SDK_AVAILABLE:
-            raise RuntimeError("Claude Agent SDK not available")
-
         artifacts = self._get_available_artifacts()
-
-        # 构建prompt
-        prompt_parts = [
-            "You are an Artifact Parser for Phase 1 of an evidence-based repair system.",
-            "",
-            "Parse the following artifacts and extract structured evidence:",
-            ""
-        ]
 
         if not artifacts:
-            return await self._fallback_parse()
+            raise FileNotFoundError(
+                f"No artifacts found in {self.artifacts_dir}. "
+                "Phase 1 requires artifact markdown files."
+            )
+
+        # 构建 JSON schema 格式的输出要求
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "symptom": {
+                    "type": "object",
+                    "properties": {
+                        "observed_failure": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "trigger_condition": {"type": "string"},
+                                "exception_type": {"type": "string"},
+                                "stack_trace_summary": {"type": "string"},
+                                "error_message": {"type": "string"}
+                            }
+                        },
+                        "expected_behavior": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "grounded_in": {"type": "string"}
+                            }
+                        },
+                        "mentioned_entities": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "type": {"type": "string"},
+                                    "file_path": {"type": "string"},
+                                    "line_number": {"type": "number"}
+                                }
+                            }
+                        },
+                        "hinted_scope": {"type": "string"}
+                    }
+                },
+                "constraints": {
+                    "type": "object",
+                    "properties": {
+                        "must_do": {"type": "array", "items": {"type": "string"}},
+                        "must_not_break": {"type": "array", "items": {"type": "string"}},
+                        "allowed_behavior": {"type": "array", "items": {"type": "string"}},
+                        "forbidden_behavior": {"type": "array", "items": {"type": "string"}},
+                        "compatibility_expectations": {"type": "array", "items": {"type": "string"}},
+                        "edge_case_obligations": {"type": "array", "items": {"type": "string"}},
+                        "api_signatures": {"type": "object"},
+                        "type_constraints": {"type": "object"}
+                    }
+                },
+                "localization": {
+                    "type": "object",
+                    "properties": {
+                        "initial_anchors": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "type": {"type": "string"},
+                                    "file_pattern": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "structural": {
+                    "type": "object",
+                    "properties": {
+                        "api_entry_points": {"type": "array", "items": {"type": "string"}},
+                        "public_interfaces": {"type": "array", "items": {"type": "string"}}
+                    }
+                },
+                "artifacts_used": {"type": "array", "items": {"type": "string"}},
+                "artifacts_missing": {"type": "array", "items": {"type": "string"}},
+                "sufficiency_notes": {"type": "string"}
+            }
+        }
+
+        # 构建简洁的 prompt，直接包含 artifacts 内容
+        prompt_lines = [
+            "Extract structured information from these artifacts and output as JSON.",
+            "",
+            "ARTIFACTS TO PARSE:",
+            "=" * 50
+        ]
 
         for name, content in artifacts.items():
-            prompt_parts.append(f"--- {name} ---")
-            prompt_parts.append(content)
-            prompt_parts.append("")
+            prompt_lines.append("")
+            prompt_lines.append(f"### {name} ###")
+            prompt_lines.append(content)
 
-        prompt_parts.append("Extract the following structured information:")
-        prompt_parts.append("")
-        prompt_parts.append("1. Symptom Frame:")
-        prompt_parts.append("   - observed_failure: description, trigger_condition, exception_type, stack_trace_summary, error_message")
-        prompt_parts.append("   - expected_behavior: description, grounded_in")
-        prompt_parts.append("   - mentioned_entities: list of {name, type, file_path?, line_number?}")
-        prompt_parts.append("   - hinted_scope: scope hint from problem statement")
-        prompt_parts.append("")
-        prompt_parts.append("2. Constraint Frame:")
-        prompt_parts.append("   - must_do, must_not_break, allowed_behavior, forbidden_behavior")
-        prompt_parts.append("   - compatibility_expectations, edge_case_obligations")
-        prompt_parts.append("   - api_signatures, type_constraints")
-        prompt_parts.append("")
-        prompt_parts.append("3. Localization:")
-        prompt_parts.append("   - initial_anchors: entities/routes mentioned that hint at code locations")
-        prompt_parts.append("")
-        prompt_parts.append("4. Structural:")
-        prompt_parts.append("   - api_entry_points, public_interfaces from interface specs")
-        prompt_parts.append("")
-        prompt_parts.append("5. Metadata:")
-        prompt_parts.append("   - artifacts_used: which files were processed")
-        prompt_parts.append("   - artifacts_missing: which expected files were not found")
-        prompt_parts.append("   - sufficiency_notes: what's missing for complete analysis")
+        prompt_lines.extend([
+            "",
+            "=" * 50,
+            "",
+            "OUTPUT FORMAT (JSON Schema):",
+            json.dumps(output_schema, indent=2),
+            "",
+            "RESPONSE INSTRUCTIONS:",
+            "- Output ONLY a single valid JSON object matching the schema above",
+            "- Do NOT include markdown code fences",
+            "- Do NOT include any explanatory text",
+            "- Start your response with { and end with }",
+            "",
+            "JSON RESPONSE:"
+        ])
 
-        prompt = "\n".join(prompt_parts)
+        prompt = "\n".join(prompt_lines)
 
-        # 使用ClaudeSDKClient而不是query()函数，可能避免signature字段问题
+        # 使用直接 subprocess 调用 Claude CLI
+        claude_executable = _get_claude_executable_path()
+        if not claude_executable:
+            raise RuntimeError("Claude executable not found. Please install Claude Code CLI.")
+
+        project_cwd = _get_project_cwd()
+
         try:
-            async with ClaudeSDKClient(
-                options=ClaudeAgentOptions(
-                    allowed_tools=["Read", "Glob"],  # 允许读取文件
-                    output_format={"type": "json_schema", "schema": PHASE1_OUTPUT_SCHEMA}
+            # 将 prompt 写入临时文件并通过 stdin 传递
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+                f.write(prompt)
+                prompt_file = f.name
+
+            try:
+                # 使用 --dangerously-skip-permissions 和 --print 标志
+                # 使用 stdin 从文件读取 prompt
+                cmd = [
+                    claude_executable,
+                    "--dangerously-skip-permissions",
+                    "--print",
+                    "--input-format", "text"
+                ]
+
+                # 设置环境变量
+                env = os.environ.copy()
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                # 读取 prompt 文件内容
+                with open(prompt_file, 'r', encoding='utf-8') as pf:
+                    prompt_content = pf.read()
+
+                # 创建 subprocess，通过 stdin 传递 prompt
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=project_cwd,
+                    env=env
                 )
-            ) as client:
-                # 发送查询
-                await client.query(prompt)
-                
-                # 接收响应
-                async for message in client.receive_response():
-                    if isinstance(message, ResultMessage):
-                        if message.structured_output:
-                            return message.structured_output
-                    elif isinstance(message, AssistantMessage):
-                        # 检查AssistantMessage中是否有structured_output
-                        if hasattr(message, 'structured_output') and message.structured_output:
-                            return message.structured_output
-                            
+
+                stdout, stderr = await process.communicate(input=prompt_content.encode('utf-8'))
+
+                if process.returncode != 0:
+                    # 尝试解码错误消息
+                    error_msg = "Unknown error"
+                    if stderr:
+                        for enc in ['utf-8', 'gbk', 'cp1252', 'latin1']:
+                            try:
+                                error_msg = stderr.decode(enc, errors='replace')
+                                # 替换乱码字符
+                                error_msg = error_msg.replace('\ufffd', '?')
+                                # 移除不可打印字符
+                                error_msg = ''.join(c if c.isprintable() or c in '\n\r\t' else '?' for c in error_msg)
+                                break
+                            except:
+                                continue
+                    raise RuntimeError(f"Claude CLI failed with code {process.returncode}: {error_msg}")
+
+            finally:
+                # 清理临时文件
+                try:
+                    os.unlink(prompt_file)
+                except:
+                    pass
+
+            # 尝试多种编码
+            response = None
+            for encoding in ['utf-8', 'utf-16', 'gbk', 'cp1252']:
+                try:
+                    response = stdout.decode(encoding)
+                    # 检查是否有乱码
+                    if '\ufffd' not in response[:100]:
+                        break
+                except:
+                    continue
+
+            if response is None:
+                response = stdout.decode('utf-8', errors='replace')
+
+            # 清理响应中的乱码字符用于错误显示
+            clean_response = response.replace('\ufffd', '?')
+
+            # 尝试从响应中提取 JSON
+            parsed = self._extract_json_from_response(response)
+            if parsed:
+                return parsed
+
+            raise RuntimeError(f"Failed to parse JSON from response. First 500 chars: {clean_response[:500]}...")
+
         except Exception as e:
-            # 捕获SDK内部的消息解析错误
-            error_msg = str(e)
-            if "signature" in error_msg.lower():
-                # 这是已知的SDK问题
-                print(f"[WARNING] SDK消息解析错误(ClaudeSDKClient): {error_msg}")
-                print("[INFO] 回退到基础提取...")
-                return await self._fallback_parse()
-            else:
-                raise
+            raise RuntimeError(f"LLM parsing failed: {e}") from e
 
-        raise RuntimeError("Failed to get structured output from LLM")
+    def _extract_json_from_response(self, response: str) -> Optional[Dict[str, Any]]:
+        """从响应文本中提取 JSON 对象。"""
+        # 尝试直接解析
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
 
-    async def _fallback_parse(self) -> Dict[str, Any]:
-        """当SDK发生错误时的备用解析方法。"""
-        artifacts = self._get_available_artifacts()
-        
-        # 生成基意的提取结果
-        return {
-            "symptom": {
-                "observed_failure": {
-                    "description": "Unknown failure (fallback mode)",
-                    "trigger_condition": None,
-                    "exception_type": None,
-                    "stack_trace_summary": None,
-                    "error_message": None
-                },
-                "expected_behavior": {
-                    "description": "Fix the issue",
-                    "grounded_in": "problem_statement"
-                },
-                "mentioned_entities": [],
-                "hinted_scope": None
-            },
-            "constraints": {
-                "must_do": [],
-                "must_not_break": [],
-                "allowed_behavior": [],
-                "forbidden_behavior": [],
-                "compatibility_expectations": [],
-                "edge_case_obligations": [],
-                "api_signatures": {},
-                "type_constraints": {}
-            },
-            "localization": {
-                "initial_anchors": []
-            },
-            "structural": {
-                "api_entry_points": [],
-                "public_interfaces": []
-            },
-            "artifacts_used": list(artifacts.keys()),
-            "artifacts_missing": [
-                "problem_statement.md",
-                "requirements.md",
-                "interface.md",
-                "new_interfaces.md",
-                "expected_and_current_behavior.md"
-            ] if not artifacts else [],
-            "sufficiency_notes": "Fallback parse due to SDK error. Limited extraction available."
-        }
+        # 尝试找到 JSON 块
+        json_patterns = [
+            r'```json\s*([\s\S]*?)\s*```',
+            r'```\s*([\s\S]*?)\s*```',
+            r'\{[\s\S]*\}',
+        ]
+
+        for pattern in json_patterns:
+            matches = re.findall(pattern, response)
+            for match in matches:
+                try:
+                    return json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+
+        return None
 
     def _compute_confidence(self, source_type: str, match_quality: str) -> float:
         """计算动态置信度。
@@ -574,8 +721,7 @@ async def run_phase1_parsing(workspace_dir: str, instance_id: str) -> Dict[str, 
     parser = LLMArtifactParser(workspace_dir, instance_id)
 
     if not CLAUDE_SDK_AVAILABLE:
-        # Fallback: 使用基于规则的基础提取
-        return await _fallback_phase1(workspace_dir, instance_id)
+        raise RuntimeError("Claude Agent SDK not available. Phase 1 requires LLM output.")
 
     # 使用LLM解析
     parsed_data = await parser.parse_with_llm()
@@ -601,75 +747,4 @@ async def run_phase1_parsing(workspace_dir: str, instance_id: str) -> Dict[str, 
     return {
         "cards": cards,
         "summary": summary
-    }
-
-
-async def _fallback_phase1(workspace_dir: str, instance_id: str) -> Dict[str, Any]:
-    """当SDK不可用时使用的fallback解析。"""
-    from .artifact_parsers import parse_all_artifacts
-
-    instance_dir = Path(workspace_dir) / instance_id
-    evidence_dir = instance_dir / "evidence"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-
-    # 使用传统解析
-    results = parse_all_artifacts(str(instance_dir))
-
-    # 转换为新格式 (简化版本)
-    now = datetime.utcnow().isoformat()
-    updated_by = "phase1_parser_fallback"
-
-    # 构建基础cards
-    symptom_card = SymptomCard(
-        version=1,
-        updated_at=now,
-        updated_by=updated_by,
-        observed_failure=ObservedFailure(
-            description="Parsed from problem statement (fallback mode)"
-        ),
-        expected_behavior=ExpectedBehavior(
-            description="Fix the described issue",
-            grounded_in="problem_statement"
-        ),
-        sufficiency_status=SufficiencyStatus.UNKNOWN,
-        sufficiency_notes="Fallback mode: Limited extraction without LLM"
-    )
-
-    localization_card = LocalizationCard(
-        version=1,
-        updated_at=now,
-        updated_by=updated_by,
-        sufficiency_status=SufficiencyStatus.UNKNOWN
-    )
-
-    constraint_card = ConstraintCard(
-        version=1,
-        updated_at=now,
-        updated_by=updated_by,
-        sufficiency_status=SufficiencyStatus.UNKNOWN
-    )
-
-    structural_card = StructuralCard(
-        version=1,
-        updated_at=now,
-        updated_by=updated_by,
-        sufficiency_status=SufficiencyStatus.UNKNOWN
-    )
-
-    cards = {
-        "symptom": symptom_card,
-        "localization": localization_card,
-        "constraint": constraint_card,
-        "structural": structural_card
-    }
-
-    # 保存
-    for card_type, card in cards.items():
-        card_path = evidence_dir / f"{card_type}_card.json"
-        with open(card_path, 'w', encoding='utf-8') as f:
-            f.write(card.model_dump_json(indent=2))
-
-    return {
-        "cards": cards,
-        "summary": {"phase": "Phase 1", "mode": "fallback", "note": "SDK not available"}
     }

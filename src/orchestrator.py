@@ -1,16 +1,42 @@
 """Orchestrator Agent - 主控制器。
 
-负责协调各个 phase 的工作，管理子代理调用和会话状态。
-参考 claude_sdk_docs/ 实现：
-- 使用Agent子代理进行专门化任务
-- 使用hooks进行证据收集和审计
-- 使用structured outputs进行类型安全的结果提取
+负责协调各阶段工作，管理子代理调用和会话状态。
 """
 
 import json
+import os
+import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+
+
+def _get_claude_executable_path() -> Optional[str]:
+    """获取 Claude Code CLI 路径。"""
+    env_path = os.environ.get("CLAUDE_CODE_EXECUTABLE")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    common_paths = [
+        Path(local_appdata) / "Programs" / "Claude" / "claude.exe",
+        Path.home() / "AppData" / "Local" / "Programs" / "Claude" / "claude.exe",
+    ]
+    for p in common_paths:
+        if p.exists():
+            return str(p)
+
+    return None
+
+
+def _get_project_cwd() -> str:
+    """获取项目根目录。"""
+    current = Path(__file__).parent.parent
+    return str(current.resolve())
 
 try:
     from claude_agent_sdk import ClaudeAgentOptions, AgentDefinition
@@ -24,6 +50,9 @@ except ImportError:
             self.allowed_tools = kwargs.get('allowed_tools', [])
             self.permission_mode = kwargs.get('permission_mode', 'default')
             self.output_format = kwargs.get('output_format', None)
+            self.cli_path = kwargs.get('cli_path')
+            self.cwd = kwargs.get('cwd')
+            self.setting_sources = kwargs.get('setting_sources', [])
 
     class AgentDefinition:
         def __init__(self, **kwargs):
@@ -490,21 +519,29 @@ Please begin by invoking the artifact-parser agent with the Task tool."""
         Args:
             phase: "phase1", "phase2", or "full" - 控制允许的工具集
         """
+        # 获取订阅认证配置
+        claude_executable = _get_claude_executable_path()
+        project_cwd = _get_project_cwd()
+
         # 根据阶段配置工具
         if phase == "phase1":
             allowed_tools = ["Read", "Glob", "Write"]
-            permission_mode = "default"  # Phase1 read-only mostly
+            permission_mode = "bypassPermissions"  # Phase1 read-only mostly
         elif phase == "phase2":
             allowed_tools = ["Read", "Grep", "Glob", "Bash"]
-            permission_mode = "acceptEdits"
+            permission_mode = "bypassPermissions"
         else:
             allowed_tools = ["Task", "Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent"]
-            permission_mode = "acceptEdits"
+            permission_mode = "bypassPermissions"
 
         return ClaudeAgentOptions(
             agents=self.get_agent_definitions(),
             allowed_tools=allowed_tools,
-            permission_mode=permission_mode
+            permission_mode=permission_mode,
+            # 订阅认证配置 - 使用正确的参数名
+            cli_path=claude_executable,
+            cwd=project_cwd,
+            setting_sources=["project"],
         )
 
     def get_hooks_config(self) -> Optional[Dict[str, Any]]:
@@ -552,7 +589,11 @@ Workspace: {workspace_dir}
 """
 
     results = []
-    async for message in query(prompt=full_prompt, options=options):
+    async for message in query(
+        prompt=full_prompt,
+        options=options,
+        cwd=_get_project_cwd(),
+    ):
         results.append(message)
         # 记录重要事件
         if hasattr(message, 'result'):

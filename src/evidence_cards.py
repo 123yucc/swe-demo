@@ -1,15 +1,10 @@
 """Evidence Card 数据模型定义。
 
-定义四类核心 evidence 的数据结构，对应理论框架中的：
+定义四类核心 evidence 的数据结构：
 1. Symptom Evidence: 问题现象和修复目标
 2. Localization Evidence: 候选修复位置
 3. Constraint Evidence: 修复约束和边界
 4. Structural Evidence: 依赖关系和协同修改需求
-
-v2版本改进：
-- 去除硬编码置信度，改为动态计算
-- 添加evidence_source和matching_detail用于溯源
-- 添加computed_confidence用于基于来源权重的计算
 """
 
 from datetime import datetime
