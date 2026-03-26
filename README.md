@@ -20,8 +20,8 @@ workdir/
     ├── artifacts/                        # Phase 1 输入
     │   ├── problem_statement.md
     │   ├── requirements.md
-    │   ├── interface.md
-    │   └── 
+    │   ├── new_interfaces.md
+    │   └── expected_and current_behavior.md
     ├── evidence/                         # Phase 2 产出
     │   ├── symptom_card.json
     │   ├── localization_card.json
