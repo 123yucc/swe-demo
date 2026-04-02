@@ -71,6 +71,7 @@ class SymptomCard(BaseModel):
     # 核心内容 - LLM结构化提取
     observed_failure: ObservedFailure = Field(..., description="观察到的失败现象")
     expected_behavior: ExpectedBehavior = Field(..., description="预期行为")
+    trigger_condition: Optional[str] = Field(None, description="出现失败的触发条件")
 
     # 初步定位线索
     mentioned_entities: List[EntityReference] = Field(default_factory=list, description="提到的代码实体")
@@ -111,6 +112,7 @@ class LocalizationCard(BaseModel):
     # 映射关系 - 自动生成
     test_to_code_mappings: Dict[str, str] = Field(default_factory=dict, description="测试到代码的映射")
     interface_to_code_mappings: Dict[str, str] = Field(default_factory=dict, description="接口到代码的映射 (route->文件/函数)")
+    mapping_rationale: str = Field(default="", description="从 issue/interface 到代码候选的推理映射说明")
 
     # 充分性评估
     sufficiency_status: SufficiencyStatus = Field(default=SufficiencyStatus.UNKNOWN)
@@ -193,6 +195,7 @@ class StructuralCard(BaseModel):
 
     # 传播风险
     propagation_risks: List[str] = Field(default_factory=list, description="传播风险描述")
+    affected_regression_scope: List[str] = Field(default_factory=list, description="受影响的回归测试范围与模块")
 
     # 充分性
     sufficiency_status: SufficiencyStatus = Field(default=SufficiencyStatus.UNKNOWN)

@@ -30,8 +30,7 @@ from .contracts.workflow import (
     WorkerSpec,
     WorkflowState,
 )
-from .orchestration import LLMOrchestrator, LLMOrchestrationResult
-from .pipelines import run_repair_workflow
+from .run_repair_workflow import run_repair_workflow
 from .workers.registry import create_default_registry, create_default_worker_specs
 
 __all__ = [
@@ -51,8 +50,6 @@ __all__ = [
     "EvidenceGap",
     "DecisionLog",
     "run_repair_workflow",
-    "LLMOrchestrator",
-    "LLMOrchestrationResult",
     "WorkflowState",
     "WorkerSpec",
     "TaskSpec",

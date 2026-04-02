@@ -9,7 +9,6 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, cast
 
-from ..contracts.worker_protocol import OrchestrationDecision
 from ..contracts.workflow import WorkerExecutionMode
 from ..workers.registry import create_default_worker_specs
 
@@ -74,6 +73,26 @@ def create_claude_options(phase: str = "full") -> Any:
     )
 
 
+def create_evidence_extraction_options(*, cwd: str, agents: Dict[str, Any], output_schema: Optional[Dict[str, Any]] = None) -> Any:
+    """Create Claude SDK options for phase1/phase2 evidence extraction."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    options: Dict[str, Any] = {
+        "cwd": cwd,
+        "agents": agents,
+        "allowed_tools": ["Read", "Grep", "Glob", "Agent"],
+        "permission_mode": "bypassPermissions",
+        "cli_path": _get_claude_executable_path(),
+        "setting_sources": ["project"],
+    }
+    if output_schema is not None:
+        options["output_format"] = {"type": "json_schema", "schema": output_schema}
+
+    return ClaudeAgentOptions(
+        **options,
+    )
+
+
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
     fenced = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text)
     if fenced:
@@ -91,53 +110,3 @@ def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
         except json.JSONDecodeError:
             return None
     return None
-
-
-async def propose_orchestration_decision(context: Dict[str, Any]) -> OrchestrationDecision:
-    """Ask LLM orchestrator for one-step decision; fallback to heuristic when unavailable."""
-    loop_state = str(context.get("loop_state", "under_specified"))
-    ready_workers = [str(worker) for worker in context.get("ready_workers", [])]
-    completed_workers = set(str(worker) for worker in context.get("completed_workers", []))
-
-    try:
-        if os.environ.get("ORCHESTRATOR_USE_LLM", "0") == "1":
-            from claude_agent_sdk import query
-
-            prompt = (
-                "Return only JSON for one-step orchestration decision with keys: "
-                "next_phase, selected_workers, todo_actions, state_transition_reason, confidence.\n"
-                f"Context: {json.dumps(context, ensure_ascii=False)}"
-            )
-            options = create_claude_options(phase="full")
-
-            latest = ""
-            async for message in query(prompt=prompt, options=options):
-                latest = str(getattr(message, "result", message))
-
-            parsed = _extract_first_json(latest)
-            if parsed is not None:
-                return OrchestrationDecision.model_validate(parsed)
-    except Exception:
-        pass
-
-    # Heuristic fallback
-    next_phase = loop_state
-    if loop_state == "init":
-        next_phase = "under_specified"
-    elif loop_state == "under_specified":
-        next_phase = "evidence_refining"
-    elif loop_state == "evidence_refining" and "closure-checker" in ready_workers:
-        next_phase = "closed"
-    elif loop_state == "closed":
-        if "validator" in completed_workers:
-            next_phase = "patch_success"
-        else:
-            next_phase = "closed"
-
-    return OrchestrationDecision(
-        next_phase=next_phase,
-        selected_workers=ready_workers[:1],
-        todo_actions=[],
-        state_transition_reason="fallback_decision",
-        confidence=0.2,
-    )
