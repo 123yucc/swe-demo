@@ -6,7 +6,7 @@
 ## 阅读顺序
 
 1. `docs/00-index.md`
-2. `docs/plan`
+2. `docs/plan/plan.md`
 3. `docs/05-requirements-analysis.md`
 4. `docs/10-architecture.md`
 5. `docs/20-interfaces.md`
@@ -84,15 +84,7 @@
 	- 变更范围控制与变更后验证产物。
 
 - `docs/plan/plan.md`
-	- Long/Short Memory 管理设计
-	- 现在要实现。
-
-- `docs/plan/plan_2.md`
-	- LLM增强与Navigator协同
-	- 现在要实现。
-
-- `docs/plan/plan_3.md`
-	- 动态调度与Todo编排改造
+	- Phase1/Phase2 实现、runtime 接入、无用实现清理计划
 	- 现在要实现。
 
 ## 采用该布局的原因
@@ -101,6 +93,12 @@
 - 文件名使用数字前缀，便于确定性检索。
 - 接口与命名规则集中管理，降低架构漂移。
 - 运行时模型与 JSON Schema 绑定，减少文档与代码漂移。
+
+## 当前实现说明
+
+- 当前仅保留 orchestration 单栈执行路径。
+- 入口命令使用 `python main.py <instance_id> --dynamic`。
+- 执行策略为硬失败，不做“可运行优先”降级。
 
 ## 运行注意事项
 

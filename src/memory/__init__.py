@@ -10,14 +10,15 @@
 """
 
 from .longterm import LongTermMemory, MemoryItem, WeightProfile, AntiPattern
+from .working_memory import WorkingMemory
 from .shortterm import ShortTermMemory, SessionState, EvidenceGap, DecisionLog
 from .manager import MemoryManager
 
 __all__ = [
     # Long-term memory
     "LongTermMemory", "MemoryItem", "WeightProfile", "AntiPattern",
-    # Short-term memory
-    "ShortTermMemory", "SessionState", "EvidenceGap", "DecisionLog",
+    # Working/Short-term memory
+    "WorkingMemory", "ShortTermMemory", "SessionState", "EvidenceGap", "DecisionLog",
     # Manager
     "MemoryManager",
 ]

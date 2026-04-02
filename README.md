@@ -4,60 +4,56 @@
 
 ## 理论核心
 
-修复失败的主要原因不是 agent 不会生成 patch，而是缺乏判断"当前信息是否足以支持 patch commitment"的能力。本系统通过四类必备 evidence 的闭环检查来解决这个问题：
+修复失败的主要原因不是 agent 不会生成 patch，而是缺乏判断当前信息是否足以支持 patch commitment 的能力。本系统通过四类必备 evidence 的闭环检查来解决这个问题：
 
-1. **症状证据（Symptom Evidence）**：现在坏在哪里，修好后应表现为什么样
-2. **定位证据（Localization Evidence）**：应该改哪里
-3. **约束证据（Constraint Evidence）**：什么修改才算正确，什么不能改坏
-4. **结构证据（Structural Evidence）**：哪些位置必须一起改，修改之间是什么依赖关系
+1. 症状证据（Symptom Evidence）：现在坏在哪里，修好后应表现为什么样。
+2. 定位证据（Localization Evidence）：应该改哪里。
+3. 约束证据（Constraint Evidence）：什么修改才算正确，什么不能改坏。
+4. 结构证据（Structural Evidence）：哪些位置必须一起改，修改之间是什么依赖关系。
 
-## 项目结构
+## 当前架构
 
-```
-workdir/
-└── {instance_id}/                        # 每个 SWE-Bench instance 独立隔离
-    ├── repo/                             # clone 下来的目标仓库
-    ├── artifacts/                        # Phase 1 输入
-    │   ├── problem_statement.md
-    │   ├── requirements.md
-    │   ├── interface.md
-    │   └── 
-    ├── evidence/                         # Phase 2 产出
-    │   ├── symptom_card.json
-    │   ├── localization_card.json
-    │   ├── constraint_card.json
-    │   ├── structural_card.json
-    │   └── card_versions/
-    ├── closure/                          # Phase 3 产出
-    ├── plan/                             # Phase 4 产出
-    └── patch/                            # Phase 5 产出
-```
+当前为单栈 orchestration 架构：
 
-## 目前可用命令
+1. 入口：main.py。
+2. CLI：src/app/cli.py。
+3. Pipeline：src/pipelines/run_repair_workflow.py。
+4. 编排核心：src/orchestration/。
+5. Worker 注册：src/workers/registry.py。
 
-  运行 Phase 1（生成初始证据卡）:
-  python main.py face_recognition_issue_001 --phase1-only
-  python main.py research_agent_issue_002 --phase1-only
+执行策略为硬失败：执行器缺失、导入失败、运行异常都会直接失败，不做降级成功。
 
-  运行 Phase 2（增强证据卡，添加精确位置和依赖分析）:
-  python main.py face_recognition_issue_001 --phase2-only
-  python main.py research_agent_issue_002 --phase2-only
+## 目录结构
 
-  运行完整动态调度工作流（推荐）:
-  python main.py face_recognition_issue_001 --dynamic
-  python main.py research_agent_issue_002 --dynamic
+workdir/{instance_id}/
 
-  其他有用参数:
-  - --resume - 从上次中断处恢复
-  - --fail-fast - 失败时立即停止
-  - --from-phase phase2 - 从指定阶段开始
+1. repo/：目标仓库
+2. artifacts/：Phase 1 输入
+3. evidence/：Phase 1/2 证据卡与版本快照
+4. closure/：Phase 3 产物
+5. plan/：Phase 4 产物
+6. patch/：Phase 5/6 产物
+7. logs/：编排事件日志
 
+## 可用命令
 
-## 开发阶段
+仅支持 dynamic 入口：
 
-- [×] Phase 1：Artifact Parsing（产物解析）
-- [×] Phase 2：Artifact-to-Evidence Extraction（证据提取）
-- [ ] Phase 3：Closure Checking（闭环判定）
-- [ ] Phase 4：Patch Planning（修复规划）
-- [ ] Phase 5：Patch Generation（补丁生成）
-- [ ] Phase 6：Validation/Replan（验证与重规划）
+1. python main.py face_recognition_issue_001 --dynamic
+2. python main.py research_agent_issue_002 --dynamic
+
+说明：
+
+1. --phase1-only 与 --phase2-only 已移除。
+2. --resume、--fail-fast、--from-phase 当前在 CLI 层会被忽略。
+
+## 阶段状态
+
+1. Phase 1：已实现（最小可运行版）
+2. Phase 2：已实现（最小可运行版）
+3. Phase 3：已实现（最小可运行版）
+4. Phase 4：已实现（最小可运行版）
+5. Phase 5：已实现（最小可运行版）
+6. Phase 6：已实现（最小可运行版）
+
+后续将继续增强 Phase1/Phase2 的抽取质量与闭环策略精度。

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from .longterm import LongTermMemory, MemoryItem, WeightProfile, AntiPattern
-from .shortterm import ShortTermMemory, SessionState, EvidenceGap, DecisionLog, PhaseStatus, GapPriority
+from .working_memory import WorkingMemory, SessionState, EvidenceGap, DecisionLog, PhaseStatus, GapPriority
 
 
 class MemoryManager:
@@ -46,7 +46,7 @@ class MemoryManager:
 
         # 短期记忆（按实例）
         self._instance_id = instance_id
-        self._shortterm: Optional[ShortTermMemory] = None
+        self._shortterm: Optional[WorkingMemory] = None
 
     @property
     def instance_id(self) -> Optional[str]:
@@ -59,13 +59,18 @@ class MemoryManager:
             self._shortterm = None  # 重置以加载新实例
 
     @property
-    def shortterm(self) -> ShortTermMemory:
-        """获取短期记忆实例。"""
+    def shortterm(self) -> WorkingMemory:
+        """获取 working memory 实例（兼容旧 shortterm 名称）。"""
         if not self._instance_id:
             raise ValueError("instance_id 必须设置才能访问短期记忆")
         if not self._shortterm:
-            self._shortterm = ShortTermMemory(self.workspace_dir, self._instance_id)
+            self._shortterm = WorkingMemory(self.workspace_dir, self._instance_id)
         return self._shortterm
+
+    @property
+    def working_memory(self) -> WorkingMemory:
+        """Working memory alias for new terminology."""
+        return self.shortterm
 
     # === 生命周期钩子 ===
 

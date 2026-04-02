@@ -1,65 +1,238 @@
-## Plan: 项目级 Long/Short Memory 管理设计
+# Phase1/Phase2 实现与收敛执行计划
 
-目标是在不改动现有证据卡真源机制的前提下，设计一套可落地的 longterm/shortterm memory 管理方案：longterm 用于跨 issue 学习与复用，shortterm 用于单 issue 会话导航与恢复；并以“最终 patch commit 后清理短期记忆”为生命周期边界。
+## 1. 目标与范围
 
-**Steps**
-1. Phase A - 约束固化（输入对齐）
-   - 基于文档与代码现状确认不可破坏边界：evidence 卡片单一真源、版本快照链、sufficiency 门禁、阶段单向依赖。
-   - 明确本次范围：仅设计方案，不涉及代码改造与脚本实现。
-2. Phase B - 记忆分层模型设计（核心）
-   - 定义 longterm 与 shortterm 的职责边界：
-     - longterm：跨 issue 复用知识（修复模式库、工具/检索策略、置信度权重学习、失败案例反模式）。
-     - shortterm：当前 issue 运行态（阶段进度、证据缺口、决策审计、工作缓存）。
-   - 定义读写原则：longterm 低频高价值写入；shortterm 高频可丢弃写入。
-3. Phase C - 存储布局与命名规范（可执行结构）
-   - 设计 longterm 目录：workdir/.memory/longterm/，按主题分文件（patterns、retrieval、weights、antipatterns）。
-   - 设计 shortterm 目录：workdir/{instance_id}/.memory/shortterm/，按会话状态分文件（phase_state、evidence_gap、decision_audit、runtime_cache）。
-   - 统一命名与版本语义：snake_case 文件名、schema_version 字段、created_at/updated_at UTC。
-4. Phase D - 数据模型与索引策略（字段级）
-   - 为 longterm 设计最小实体：
-     - memory_item（id、topic、signal、action、outcome、confidence、evidence_refs、last_used_at、decay_score）
-     - weight_profile（source_type、match_type、weight、sample_size、win_rate）
-     - anti_pattern（trigger、bad_action、impact、avoidance）
-   - 为 shortterm 设计最小实体：
-     - session_state（instance_id、phase、status、checkpoint）
-     - evidence_gap（card_type、gap_type、required_signal、priority）
-     - decision_log（decision、rationale、inputs、result）
-   - 增加轻量索引字段：tags、issue_type、module_scope，支持快速检索。
-5. Phase E - 生命周期与治理策略
-   - shortterm 生命周期：issue 完成并最终 patch commit 后触发清理，仅保留必要审计摘要（可选）。
-   - longterm 生命周期：保留并定期衰减（基于 last_used_at 与 outcome 成功率）。
-   - 冲突与一致性：通过 revision/version 做幂等更新，避免并发覆盖。
-6. Phase F - 与现有流程的接入蓝图（仅设计，不实现）
-   - 读入点（建议）：Phase 1 前加载 longterm 检索策略与修复模式候选。
-   - 写入点（建议）：Phase 2 结束后写入结构化“有效证据组合”；Phase 3 决策后写入“闭环结论”；Phase 5/6 结果回写 outcome。
-   - 不改动点：evidence/*.json 与 card_versions/ 作为事实真源维持不变，memory 只做旁路增强。
-7. Phase G - 验收标准与风险清单
-   - 验收：可解释（每条记忆可追溯）、可检索（按 issue/module/topic 查找）、可清理（shortterm 自动清除）、可演进（schema_version）。
-   - 风险：知识污染、过拟合权重、日志膨胀、错误复用；对应约束：准入阈值、置信度下限、容量上限、定期回收。
+本计划用于完成三件事：
 
-**Relevant files**
-- d:/demo/docs/10-architecture.md — 6 阶段职责与依赖边界（记忆接入不越界）。
-- d:/demo/docs/20-interfaces.md — evidence 输出接口与卡片约束（memory 不替代真源）。
-- d:/demo/docs/30-naming-rules.md — 命名规则（memory 文件命名对齐）。
-- d:/demo/src/evidence_cards.py — sufficiency 与 evidence source 数据结构参考。
-- d:/demo/src/evidence_extractors_phase2.py — 置信度权重学习的当前计算逻辑参考。
-- d:/demo/src/orchestrator.py — 运行阶段事件与未来读写钩子参考。
-- d:/demo/workdir/research_agent_issue_002/evidence/localization_card.json — 当前高密度证据样例，验证索引与冷热分层必要性。
+1. 落地可运行的 Phase1 与 Phase2 执行实现。
+2. 将 Phase1/Phase2 严格接入 orchestration runtime，保证失败即失败，不做降级成功。
+3. 清理当前仓库中的历史无用实现、失效映射和兼容残留，收敛为单栈实现。
 
-**Verification**
-1. 结构验证：检查 longterm/shortterm 数据模型是否都能映射到现有 phase 输入输出，不引入反向依赖。
-2. 可追溯验证：任一 longterm 条目可回溯到 issue 与 evidence_refs（不允许无来源记忆）。
-3. 生命周期验证：定义并演练“最终 patch commit 后短期清理”的触发条件与保留白名单。
-4. 命名/字段验证：对照命名规则与 schema_version，确保新增 memory 文件可被稳定解析。
-5. 风险验证：模拟错误模式写入，确认准入阈值与衰减策略可抑制污染。
+本计划只覆盖后端执行链路，不包含前端可视化。
 
-**Decisions**
-- 已确认仅输出设计方案，不做代码实现。
-- longterm memory 覆盖：修复模式库、工具与检索策略、置信度权重学习、失败案例与反模式。
-- shortterm memory 生命周期：每个 issue 在最终 patch commit 后清理。
-- 本次明确不包含：数据库选型、向量检索引擎落地、迁移脚本开发、CI 集成。
 
-**Further Considerations**
-1. shortterm 清理后是否保留极简审计摘要（建议保留，便于复盘；可选全清理）。
-2. longterm 准入阈值建议：至少 2 次正向 outcome 才提升为可复用模式。
-3. 权重学习建议先半自动：先记录建议权重，不自动覆盖默认权重，降低回归风险。
+## 2. 现状问题
+
+1. orchestration 已成为主执行栈，但 runtime 仍指向历史模块路径，导致导入失败。
+2. WorkerSpec 声明与可执行函数未完全对齐，存在“有规格无实现”。
+3. 历史残留（旧导出、旧文档描述、旧测试断言）会干扰维护。
+
+
+## 3. 实施原则
+
+1. 单一执行栈：只保留 orchestration，不回退 orchestrator。
+2. 失败可审计：执行器缺失、导入失败、运行异常均返回失败。
+3. 协议先行：先固定 contracts，再实现 worker 执行器。
+4. 低耦合：worker 只做单阶段能力，状态迁移由 orchestrator 决策。
+
+
+## 4. Phase1 详细实现
+
+### 4.1 目标
+
+输入 artifacts，生成四类 v1 证据卡与 phase1 summary。
+
+### 4.2 新增或恢复文件
+
+1. src/workers/phase1_artifact_parser.py
+2. src/workers/io_artifacts.py（可选，若需要拆出文件读写）
+
+### 4.3 关键函数设计
+
+1. run_phase1_parsing(workspace_dir, instance_id) -> dict
+2. parse_artifacts(artifacts_dir) -> dict
+3. build_v1_cards(parsed_payload) -> dict
+4. write_phase1_outputs(instance_dir, cards, summary) -> None
+
+### 4.4 输入输出约定
+
+输入目录：
+
+1. workdir/<instance_id>/artifacts/problem_statement.md（必需）
+2. workdir/<instance_id>/artifacts/requirements.md（可选）
+3. workdir/<instance_id>/artifacts/interface.md 或 new_interfaces.md（可选）
+4. workdir/<instance_id>/artifacts/expected_and_current_behavior.md（可选）
+
+输出目录：
+
+1. workdir/<instance_id>/evidence/symptom_card.json
+2. workdir/<instance_id>/evidence/localization_card.json
+3. workdir/<instance_id>/evidence/constraint_card.json
+4. workdir/<instance_id>/evidence/structural_card.json
+5. workdir/<instance_id>/evidence/card_versions/v1/*
+6. workdir/<instance_id>/evidence/phase1_summary.json
+
+### 4.5 业务逻辑拆分
+
+1. Artifact 存在性检查与缺失清单生成。
+2. 对 problem_statement 的故障语义抽取（失败描述、触发条件、错误摘要）。
+3. 对 requirements/interface 的约束与接口语义抽取。
+4. 生成 v1 sufficiency 结论（sufficient/partial/insufficient）。
+5. 所有输出写盘并进行最小字段完整性校验。
+
+### 4.6 失败条件
+
+1. artifacts 根目录缺失。
+2. problem_statement 缺失。
+3. 输出卡片写入失败。
+4. 结构化结果缺少必需字段。
+
+
+## 5. Phase2 详细实现
+
+### 5.1 目标
+
+基于 v1 卡片与 repo 内容，完成四类增强抽取并写入 v2。
+
+### 5.2 新增或恢复文件
+
+1. src/workers/phase2_symptom_extractor.py
+2. src/workers/phase2_localization_extractor.py
+3. src/workers/phase2_constraint_extractor.py
+4. src/workers/phase2_structural_extractor.py
+5. src/workers/phase2_enhancer.py（聚合增强，可选）
+
+### 5.3 各 worker 输入输出
+
+Symptom Extractor：
+
+1. 输入：symptom_card v1、artifacts、日志/测试（若存在）。
+2. 输出：symptom_card v2、sufficiency notes。
+
+Localization Extractor：
+
+1. 输入：symptom_card、repo 文件树。
+2. 输出：localization_card v2（候选位置、置信度、映射）。
+
+Constraint Extractor：
+
+1. 输入：constraint_card v1、requirements、interface、代码类型信息。
+2. 输出：constraint_card v2（类型约束、兼容性约束）。
+
+Structural Extractor：
+
+1. 输入：localization_card v2、repo AST/引用关系。
+2. 输出：structural_card v2（依赖边、联动编辑组、传播风险）。
+
+LLM Enhancer：
+
+1. 输入：四类 v2 草稿。
+2. 输出：一致性增强后的四卡最终版本。
+
+### 5.4 输出约定
+
+1. evidence/<card>_card.json 更新为 v2。
+2. evidence/card_versions/v2/<card>_card_v2.json 持久化。
+3. phase2 summary 文件写入 evidence/phase2_summary.json。
+
+### 5.5 失败条件
+
+1. phase1 输出不存在。
+2. repo 目录不存在或无法读取。
+3. 关键抽取步骤异常（AST 解析、定位映射、约束构建）。
+4. v2 输出 schema 校验失败。
+
+
+## 6. Runtime 接入计划
+
+### 6.1 Worker Runtime 映射收敛
+
+文件：src/orchestration/worker_runtime.py
+
+1. artifact-parser -> src.workers.phase1_artifact_parser:run_phase1_parsing
+2. symptom-extractor -> src.workers.phase2_symptom_extractor:extract_symptom_evidence
+3. localization-extractor -> src.workers.phase2_localization_extractor:extract_localization_evidence
+4. constraint-extractor -> src.workers.phase2_constraint_extractor:extract_constraint_evidence
+5. structural-extractor -> src.workers.phase2_structural_extractor:extract_structural_evidence
+6. llm-enhancer -> src.workers.phase2_enhancer:enhance_all_cards
+
+约束：
+
+1. 映射缺失直接失败。
+2. 导入失败直接失败。
+3. 执行异常直接失败。
+
+### 6.2 WorkerSpec 对齐
+
+文件：src/workers/registry.py
+
+1. executor 字段与 runtime 映射函数名保持一一对应。
+2. phase 与 depends_on 与状态机路径一致。
+3. 统一 allowed_tools 与 prompt_template 的最小可用定义。
+
+### 6.3 Orchestrator 循环接入点
+
+文件：src/orchestration/orchestrator.py
+
+1. ready_workers 由 depends_on + completed 决定。
+2. 每次执行后更新 worker_status 与 worker_results。
+3. 仅当满足状态机条件时允许 phase 迁移。
+4. validator 完成且无失败后才能进入 patch_success。
+
+### 6.4 CLI 接入
+
+文件：src/app/cli.py
+
+1. dynamic 入口统一调用 pipelines.run_repair_workflow。
+2. 输出统一展示 success/final_state/failed_workers。
+
+
+## 7. 无用实现清理计划
+
+### 7.1 代码清理
+
+1. 删除失效模块路径引用（例如已不存在的 artifact_parsers_llm 等旧路径）。
+2. 删除未被 runtime 使用的历史兼容导出。
+3. 删除仅为旧 orchestrator 服务的测试分支。
+
+### 7.2 文档清理
+
+1. docs 中所有 scheduler/orchestrator 旧描述统一改为 orchestration。
+2. 架构图与目录图同步到单栈版本。
+
+### 7.3 脚本清理
+
+1. scripts/verify_modules.py 移除对旧 orchestrator 的断言。
+2. 增加 phase1/phase2 最小冒烟验证函数。
+
+
+## 8. 分阶段落地顺序
+
+### 阶段 A：实现恢复
+
+1. 补齐 phase1 执行器。
+2. 补齐 phase2 四个提取器与增强器。
+3. 本地单测每个执行器可独立运行。
+
+### 阶段 B：runtime 接入
+
+1. 修改 worker_runtime 映射到新执行器。
+2. 调整 registry 的 executor 与 phase 依赖。
+3. 跑一次全链路 dynamic 冒烟。
+
+### 阶段 C：清理收敛
+
+1. 删除失效导入与兼容残留。
+2. 修正文档与验证脚本。
+3. 再次跑全量错误检查与命令回归。
+
+
+## 9. 验收标准
+
+1. python main.py <instance_id> --dynamic 可以进入 phase1、phase2 并产出证据文件。
+2. 任一执行器缺失或异常时，流程必须失败且 failed_workers 可见。
+3. evidence 目录下可看到 v1 与 v2 版本文件。
+4. src 中不再存在对已删除实现的导入引用。
+5. docs 中不再出现与单栈事实冲突的旧描述。
+
+
+## 10. 风险与缓解
+
+1. 风险：Phase2 抽取复杂度高，短期难一次到位。
+	缓解：先交付最小可运行版，再逐步增强 AST 与置信度策略。
+
+2. 风险：严格失败策略导致早期回归频繁中断。
+	缓解：增加每个 worker 的独立冒烟，提前暴露映射错误。
+
+3. 风险：文档与实现再次漂移。
+	缓解：每次改 runtime 映射时同步更新 plan 与 architecture 文档。
