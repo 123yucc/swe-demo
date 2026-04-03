@@ -10,6 +10,7 @@ results after the agent loop finishes.
 """
 
 from pathlib import Path
+import re
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -108,6 +109,16 @@ _EVIDENCE_SCHEMA = {
                         "Existing similar API implementations as reference baselines."
                     ),
                 },
+                "missing_elements_to_implement": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Elements required by specifications but entirely absent "
+                        "from the current codebase (interfaces, classes, methods). "
+                        "Explicitly listed to prevent downstream agents from "
+                        "hallucinating they already exist."
+                    ),
+                },
             },
         },
         "localization": {
@@ -199,9 +210,11 @@ async def submit_extracted_evidence(args: dict[str, Any]) -> dict[str, Any]:
 _UPDATE_LOCALIZATION_SCHEMA = {
     "type": "object",
     "description": (
-        "Persist confirmed defect locations found by Deep Search back to the "
-        "evidence_cards.json file.  Call this as soon as you extract findings "
-        "from a Deep Search report — do NOT wait until final closure."
+        "Persist confirmed defect locations AND structural/constraint findings "
+        "from Deep Search back to evidence_cards.json.  Call this as soon as "
+        "you extract findings from a Deep Search report — do NOT wait until "
+        "final closure.  You MUST include ALL fields that Deep Search reported, "
+        "not just exact_code_regions."
     ),
     "properties": {
         "exact_code_regions": {
@@ -225,7 +238,8 @@ _UPDATE_LOCALIZATION_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Caller-Callee chains discovered by Deep Search."
+                "Caller-Callee chains discovered by Deep Search, formatted as "
+                "'A -> B -> C' strings."
             ),
         },
         "dataflow_relevant_uses": {
@@ -233,6 +247,31 @@ _UPDATE_LOCALIZATION_SCHEMA = {
             "items": {"type": "string"},
             "description": (
                 "Def-Use relationships discovered by Deep Search."
+            ),
+        },
+        "must_co_edit_relations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Co-edit dependencies discovered by Deep Search: 'If A changes "
+                "→ B must also change'."
+            ),
+        },
+        "dependency_propagation": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Cross-cutting dependency paths discovered by Deep Search "
+                "(interface/package/config relationships)."
+            ),
+        },
+        "missing_elements_to_implement": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "TO-BE elements confirmed absent from the codebase by Deep "
+                "Search. These are interfaces/classes/methods required by "
+                "specifications but not yet implemented."
             ),
         },
     },
@@ -251,13 +290,22 @@ _UPDATE_LOCALIZATION_SCHEMA = {
     _UPDATE_LOCALIZATION_SCHEMA,
 )
 async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
-    """Write confirmed localization data back to the evidence JSON file."""
+    """Write confirmed localization, structural, and constraint data back to
+    the evidence JSON file."""
     global _submitted_evidence, _evidence_json_path
 
+    # Localization fields
     exact_code_regions: list[str] = args.get("exact_code_regions", [])
     suspect_entities: list[str] = args.get("suspect_entities", [])
     call_chain_context: list[str] = args.get("call_chain_context", [])
     dataflow_relevant_uses: list[str] = args.get("dataflow_relevant_uses", [])
+
+    # Structural fields
+    must_co_edit_relations: list[str] = args.get("must_co_edit_relations", [])
+    dependency_propagation: list[str] = args.get("dependency_propagation", [])
+
+    # Constraint field
+    missing_elements: list[str] = args.get("missing_elements_to_implement", [])
 
     if _submitted_evidence is None:
         return {
@@ -269,20 +317,104 @@ async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
             ]
         }
 
+    def _normalize_exact_code_region(region: str) -> str:
+        """Normalize path:line strings to repo-root-relative style."""
+        normalized = region.strip().replace("\\", "/")
+        normalized = re.sub(r"^(?:\./)?repo/", "", normalized)
+        return normalized
+
+    def _extract_symbol_candidates(text: str) -> set[str]:
+        """Extract method/class-like names from a free-form evidence entry."""
+        candidates: set[str] = set()
+        value = text.strip()
+        if not value:
+            return candidates
+
+        for match in re.findall(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\b", value):
+            candidates.add(match.lower())
+
+        for match in re.findall(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b", value):
+            candidates.add(match.lower())
+
+        for match in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(?", value):
+            low = match.lower()
+            candidates.add(low)
+            if "." in low:
+                candidates.add(low.rsplit(".", 1)[-1])
+
+        return candidates
+
     # Merge — union of existing + new values, preserving order.
     def _merge(existing: list[str], new: list[str]) -> list[str]:
         seen = set(existing)
-        return existing + [v for v in new if v not in seen]
+        merged = list(existing)
+        for v in new:
+            if v not in seen:
+                merged.append(v)
+                seen.add(v)
+        return merged
 
+    normalized_exact_code_regions = [
+        _normalize_exact_code_region(v) for v in exact_code_regions
+    ]
+
+    # Update LocalizationCard
     loc = _submitted_evidence.localization
     _submitted_evidence.localization = LocalizationCard(
         suspect_entities=_merge(loc.suspect_entities, suspect_entities),
-        exact_code_regions=_merge(loc.exact_code_regions, exact_code_regions),
+        exact_code_regions=_merge(
+            loc.exact_code_regions, normalized_exact_code_regions
+        ),
         call_chain_context=_merge(loc.call_chain_context, call_chain_context),
         dataflow_relevant_uses=_merge(
             loc.dataflow_relevant_uses, dataflow_relevant_uses
         ),
     )
+
+    # Update StructuralCard
+    if must_co_edit_relations or dependency_propagation:
+        struc = _submitted_evidence.structural
+        _submitted_evidence.structural = StructuralCard(
+            must_co_edit_relations=_merge(
+                struc.must_co_edit_relations, must_co_edit_relations
+            ),
+            dependency_propagation=_merge(
+                struc.dependency_propagation, dependency_propagation
+            ),
+        )
+
+    # Update ConstraintCard (missing_elements_to_implement only)
+    if missing_elements:
+        con = _submitted_evidence.constraint
+        con.missing_elements_to_implement = _merge(
+            con.missing_elements_to_implement, missing_elements
+        )
+
+    # Contradiction guard: a method/class that already appears in suspects
+    # should not remain in missing_elements_to_implement.
+    con = _submitted_evidence.constraint
+    loc = _submitted_evidence.localization
+    suspect_symbols: set[str] = set()
+    for entity in loc.suspect_entities:
+        suspect_symbols.update(_extract_symbol_candidates(entity))
+
+    filtered_missing: list[str] = []
+    removed_missing: list[str] = []
+    for item in con.missing_elements_to_implement:
+        item_symbols = _extract_symbol_candidates(item)
+        if item_symbols and any(symbol in suspect_symbols for symbol in item_symbols):
+            removed_missing.append(item)
+            continue
+        filtered_missing.append(item)
+
+    if removed_missing:
+        con.missing_elements_to_implement = filtered_missing
+        for item in removed_missing:
+            print(
+                "[WARNING contradiction resolved] removed from "
+                f"missing_elements_to_implement because it appears in "
+                f"suspect_entities: {item}"
+            )
 
     if _evidence_json_path is not None:
         _evidence_json_path.write_text(
@@ -297,10 +429,13 @@ async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
             {
                 "type": "text",
                 "text": (
-                    f"Localization updated: exact_code_regions={exact_code_regions}, "
+                    f"Evidence updated: exact_code_regions={exact_code_regions}, "
                     f"entities={suspect_entities}, "
                     f"call_chains={call_chain_context}, "
-                    f"dataflow={dataflow_relevant_uses}.{saved_msg}"
+                    f"dataflow={dataflow_relevant_uses}, "
+                    f"co_edits={must_co_edit_relations}, "
+                    f"dep_propagation={dependency_propagation}, "
+                    f"missing_elements={missing_elements}.{saved_msg}"
                 ),
             }
         ]
@@ -314,9 +449,3 @@ ingestion_server = create_sdk_mcp_server(
     tools=[submit_extracted_evidence],
 )
 
-# Evidence-update server — passed to the Orchestrator's ClaudeAgentOptions.
-evidence_server = create_sdk_mcp_server(
-    name="evidence",
-    version="1.0.0",
-    tools=[update_localization],
-)

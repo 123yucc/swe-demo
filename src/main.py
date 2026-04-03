@@ -37,10 +37,9 @@ def main() -> None:
     print(f"  Repo:      {repo_dir}")
     print()
 
-    report = run_orchestrator(issue_id, artifacts_dir, repo_dir)
-    print("=== FINAL CLOSURE REPORT ===")
-    sys.stdout.buffer.write(report.encode("utf-8", errors="replace"))
-    sys.stdout.buffer.write(b"\n")
+    evidence_path = run_orchestrator(issue_id, artifacts_dir, repo_dir)
+    print(f"=== EVIDENCE COLLECTION COMPLETE ===")
+    print(f"Evidence JSON: {evidence_path}")
 
 
 if __name__ == "__main__":

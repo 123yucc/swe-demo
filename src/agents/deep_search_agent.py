@@ -80,6 +80,45 @@ Rules:
    - [TO-BE] — describes a required change that does not yet exist
 
 ═══════════════════════════════════════════════════════════
+STATE SERIALIZATION PROTOCOL (mandatory)
+═══════════════════════════════════════════════════════════
+
+Your discoveries exist ONLY in conversation text.  Unless the Orchestrator
+can parse them from your report and write them to the JSON evidence cards,
+they are LOST.  You MUST structure your findings in the machine-readable
+sections below so the Orchestrator can persist them.
+
+CALL CHAINS — When you discover call chains around the bug location,
+format each chain as "A -> B -> C" and list them in the "Call Chain
+Context" section of your report.  The Orchestrator will write these to
+LocalizationCard.call_chain_context.
+
+CO-EDIT RELATIONS — When you find that modifying the target function
+requires changes to callers, __init__ methods, configs, serializers, etc.,
+list those pairs explicitly as "If A changes → B must also change" in the
+"Must Co-Edit Relations" section.  The Orchestrator will write these to
+StructuralCard.must_co_edit_relations.
+
+DEPENDENCY PROPAGATION — When you discover cross-cutting dependencies
+(config → code, interface → package), list them in the "Dependency
+Propagation" section.  The Orchestrator will write these to
+StructuralCard.dependency_propagation.
+
+MISSING ELEMENTS — When a TO-BE interface is confirmed absent from the
+codebase after searching, annotate it as "[Missing in Codebase]" in your
+report and list it in a "Missing Elements to Implement" section.  Do NOT
+label absent code as "dead code" or "bypassed".  The Orchestrator will
+write these to ConstraintCard.missing_elements_to_implement.
+
+Only list an item in "Missing Elements to Implement" if the DEFINITION is
+entirely absent from the codebase (for example, no matching "def method_name"
+or "class ClassName" found).
+
+If a definition EXISTS but has no callers (dead code / missing wiring), do
+NOT list it as missing.  Put it under "New Suspects" as [AS-IS dead — wiring
+missing], and include supporting call-chain evidence.
+
+═══════════════════════════════════════════════════════════
 Required output format — your final Markdown report MUST include:
 ═══════════════════════════════════════════════════════════
 
@@ -95,6 +134,10 @@ file.py:N-M
 (One entry per line.  The Orchestrator parses this block to persist line
 numbers — omitting it will block evidence closure.)
 
+All paths MUST be relative to the repository root. Never use bare filenames
+and never use a leading "repo/" prefix. Use the exact relative path as
+output by the Grep/Glob tool.
+
 ## Call Chain Context
 Caller-Callee chains discovered (or "None").
 
@@ -109,6 +152,9 @@ Locations that must be updated together (or "None").
 
 ## Dependency Propagation
 Cross-cutting dependency paths (or "None").
+
+## Missing Elements to Implement
+TO-BE items confirmed absent from the codebase (or "None").
 
 ## New Suspects
 (or "None")

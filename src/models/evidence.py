@@ -89,6 +89,14 @@ class ConstraintCard(BaseModel):
             "as reference baselines for how the fix should be structured."
         ),
     )
+    missing_elements_to_implement: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Elements required by specifications but entirely absent from the "
+            "current codebase (interfaces, classes, methods). Explicitly listed "
+            "to prevent downstream agents from hallucinating they already exist."
+        ),
+    )
 
 
 class StructuralCard(BaseModel):

@@ -11,18 +11,22 @@ State flow:
 """
 
 import asyncio
-import re
 from pathlib import Path
 
-from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, query
+from claude_agent_sdk import (
+    AgentDefinition,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    create_sdk_mcp_server,
+)
 
 from src.agents.parser_agent import load_artifacts, _run_parser_async
 from src.agents.deep_search_agent import DEEP_SEARCH_SYSTEM_PROMPT
 from src.config import sdk_env
 from src.tools.ingestion_tools import (
-    evidence_server,
     get_submitted_evidence,
     set_evidence_json_path,
+    update_localization,
 )
 
 ORCHESTRATOR_SYSTEM_PROMPT = """\
@@ -47,8 +51,11 @@ After every Deep Search return, re-assess the current EvidenceCards state:
 2. CHECK LOCALIZATION GAPS
    - Does suspect_entities have at least one concrete file AND function?
    - Are exact_code_regions still empty?  → dispatch Deep Search.
-   - Is call_chain_context empty?  If we have a suspect function, dispatch
-     a Deep Search TODO: "Find callers of <function> to build call chain."
+   - Is call_chain_context still empty?  This is a MANDATORY field if we
+     have a suspect function.  Dispatch a Deep Search TODO:
+     "Find callers of <function> to build call chain."
+     Do NOT proceed to closure with an empty call_chain_context when
+     suspect_entities contains at least one function.
    - Is dataflow_relevant_uses empty?  If suspect function modifies a data
      structure, dispatch: "Trace Def-Use of <variable>."
 
@@ -59,7 +66,10 @@ After every Deep Search return, re-assess the current EvidenceCards state:
 
 4. CHECK STRUCTURAL GAPS
    - Are must_co_edit_relations empty despite localization having suspects?
+     This is a MANDATORY field when suspect_entities is non-empty.
      → dispatch: "Find callers / dependents of <entity> for co-edit analysis."
+     Do NOT proceed to closure with empty must_co_edit_relations when we
+     have confirmed defect locations.
    - Is dependency_propagation empty?
      → dispatch: "Trace interface / config dependencies of <module>."
 
@@ -67,6 +77,12 @@ After every Deep Search return, re-assess the current EvidenceCards state:
    When ALL key fields in ALL four cards contain real data, AND you cannot
    formulate any more concrete, executable Deep Search tasks based on
    current card information, mark all Todos as done and proceed to closure.
+
+   MANDATORY non-empty fields before closure (in addition to HARD RULES):
+   - localization.suspect_entities (at least one file + one function)
+   - localization.exact_code_regions (at least one entry)
+   - localization.call_chain_context (at least one chain if a function is suspect)
+   - structural.must_co_edit_relations (at least one entry if suspects exist)
 
    BOUNDARY RULE: Your job is to fill the cards with facts.  Do NOT try to
    judge "which information is harmful or irrelevant to the bug" — that is
@@ -77,32 +93,44 @@ After every Deep Search return, re-assess the current EvidenceCards state:
 PERSISTING FINDINGS — MANDATORY after every Deep Search return
 ═══════════════════════════════════════════════════════════
 
-Immediately after reading each Deep Search report:
-a. Parse the "EXACT_LINES" block from the report.
-b. Call `mcp__evidence__update_localization` with exact_code_regions (plus
-   any confirmed suspect_entities, call_chain_context, dataflow data).
-c. Do this BEFORE re-assessing closure — persisting is mandatory.
+Immediately after reading each Deep Search report, you MUST parse ALL
+structured sections and persist them via `mcp__evidence__update_localization`.
+The tool now accepts ALL of these fields — use every one that applies:
+
+a. Parse "EXACT_LINES" block → exact_code_regions
+b. Parse "Call Chain Context" section → call_chain_context
+   (each chain as an "A -> B -> C" string)
+c. Parse "Dataflow Relevant Uses" section → dataflow_relevant_uses
+d. Parse "Must Co-Edit Relations" section → must_co_edit_relations
+e. Parse "Dependency Propagation" section → dependency_propagation
+f. Parse "Missing Elements to Implement" section → missing_elements_to_implement
+g. Extract confirmed suspect entities → suspect_entities
+
+Call `mcp__evidence__update_localization` with ALL applicable fields in a
+single call.  Do this BEFORE re-assessing closure — persisting is mandatory.
+
+CRITICAL: If Deep Search reported call chains but you only pass
+exact_code_regions to update_localization, the call chain data is LOST.
+The JSON is the sole Source of Truth for downstream agents.  Any finding
+that is not written to JSON does not exist.
 
 ═══════════════════════════════════════════════════════════
-CLOSURE — when ready, produce a final Markdown summary containing:
+CLOSURE — JSON is the sole output, no Markdown report
 ═══════════════════════════════════════════════════════════
 
-- Confirmed defect location (file, function, line range)
-- Root cause description
-- Constraints that must be respected by the fix
-- Call chain context around the defect
-- Co-edit locations that must be updated together
-- Suggested fix approach (strictly limited to what the requirements specify)
-- A machine-readable fenced block in EXACTLY this format (required):
+You are a pure evidence collector.  You do NOT produce any natural-language
+analysis, summary, closure report, fix suggestion, or Markdown document.
 
-  ## EXACT_LINES (machine-readable)
-  ```
-  path/to/file.py:LINE
-  path/to/file.py:LINE-LINE
-  ```
+When you determine that all mandatory fields are populated and no more
+Deep Search tasks can be formulated, do the following:
 
-  Every confirmed defect line must appear in that block.  Omitting it will
-  cause the pipeline to treat the exact_code_regions field as empty.
+1. Make one FINAL call to `mcp__evidence__update_localization` to ensure
+   every piece of evidence you have is persisted to JSON.
+2. Output ONLY a short declarative statement:
+   "EVIDENCE_COLLECTION_COMPLETE — all cards populated."
+3. Stop.  Do not write any prose, root-cause analysis, call-chain diagrams,
+   or fix suggestions.  Those responsibilities belong to downstream agents
+   that will read the JSON as their sole Source of Truth.
 
 ═══════════════════════════════════════════════════════════
 HARD CLOSURE RULES — violating any of these blocks closure:
@@ -118,30 +146,26 @@ RULE 2 — Localization must have at least one concrete file AND one
 
 RULE 3 — Do NOT declare closure based on TO-BE items in the constraint card.
   Items prefixed "TO-BE: " are things that need to be ADDED; they are not
-  evidence that the defect is located.
+  evidence that the defect is located.  TO-BE items that are confirmed
+  absent from the codebase must be written to
+  constraint.missing_elements_to_implement via update_localization.
 
-RULE 4 — The suggested fix must address ONLY what the requirements specify.
-  Do NOT add adaptive logic, dynamic computation, or other enhancements
-  that are not explicitly demanded by the constraint card.
+RULE 4 — FACT-ALIGNMENT in JSON fields: every entry written to the JSON
+  evidence cards MUST be grounded in what Deep Search actually found, not
+  inferred from requirements or conversation memory.
 
-RULE 5 — FACT-ALIGNMENT: When writing the final closure report, every
-  factual claim about the codebase MUST be grounded in what Deep Search
-  actually found, not inferred from requirements.
-
-  Specifically:
   a) If a function or method is tagged "TO-BE:" in the constraint card,
-     it does NOT exist in the codebase yet.  You MUST describe the root
-     cause as "the mechanism is absent / not yet implemented", NEVER as
-     "already implemented but bypassed" or "dead code".
+     it does NOT exist in the codebase yet.  Write it to
+     missing_elements_to_implement, NEVER to suspect_entities or
+     exact_code_regions.
+      A method that exists as a definition but lacks callers is dead code.
+      It belongs in suspect_entities, not missing_elements_to_implement.
+      Do NOT write it to both fields.
   b) Do NOT infer that a function exists because a requirement mentions it.
      Existence requires explicit evidence from Deep Search (a Read or Grep
      result showing the definition).
-  c) Do NOT re-interpret a plain constant as a vestige of an abandoned
-     dynamic-adjustment mechanism.  A constant is a constant unless Deep
-     Search found accompanying dynamic logic.
-  d) If your root-cause narrative contradicts a "TO-BE:" tag in the
-     constraint card, stop, re-read the evidence, and correct the narrative
-     before emitting the report.
+  c) Do NOT write speculative entries to any JSON field.  Every entry must
+     trace back to a concrete Deep Search finding.
 
 ═══════════════════════════════════════════════════════════
 Other rules:
@@ -178,7 +202,7 @@ async def _run_orchestrator_async(
         repo_dir:      Root of the repository to search.
 
     Returns:
-        Final closure report (Markdown string).
+        Path to the final evidence_cards.json file (as a string).
     """
     artifacts_dir = Path(artifacts_dir)
     repo_dir = Path(repo_dir)
@@ -199,7 +223,7 @@ async def _run_orchestrator_async(
     # regardless of what cwd the MCP server process uses.
     set_evidence_json_path(evidence_path.resolve())
 
-    initial_prompt = (
+    initial_prompt_text = (
         f"Issue ID: {issue_id}\n"
         f"Repository root: {repo_dir}\n\n"
         f"Initial EvidenceCards (parsed from artifacts):\n"
@@ -213,91 +237,53 @@ async def _run_orchestrator_async(
         agents={
             "deep-search": _DEEP_SEARCH_AGENT_DEF,
         },
-        mcp_servers={"evidence": evidence_server},
+        mcp_servers={
+            "evidence": create_sdk_mcp_server(
+                name="evidence",
+                version="1.0.0",
+                tools=[update_localization],
+            ),
+        },
         cwd=str(repo_dir),
         permission_mode="acceptEdits",
         env=sdk_env(),
     )
 
-    final_result = ""
-    async for message in query(prompt=initial_prompt, options=options):
-        if hasattr(message, "result"):
-            final_result = message.result
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(initial_prompt_text)
+        async for message in client.receive_response():
+            pass  # Evidence is persisted to JSON via update_localization MCP calls
 
-    # --- Programmatic exact_code_regions fallback ---
-    # If the LLM didn't call update_localization (or called it with empty regions),
-    # parse the structured EXACT_LINES block from the closure report and write it
-    # back to the JSON ourselves.  This is a hard guarantee, not a best-effort prompt.
+    # --- Post-loop validation: warn about empty mandatory fields ---
     current_evidence = get_submitted_evidence()
-    if current_evidence is not None and not current_evidence.localization.exact_code_regions:
-        extracted = _parse_exact_lines_from_report(final_result)
-        if extracted:
-            from src.models.evidence import LocalizationCard
-            loc = current_evidence.localization
-            current_evidence.localization = LocalizationCard(
-                suspect_entities=loc.suspect_entities,
-                exact_code_regions=extracted,
-                call_chain_context=loc.call_chain_context,
-                dataflow_relevant_uses=loc.dataflow_relevant_uses,
-            )
-            evidence_path.resolve().write_text(
-                current_evidence.model_dump_json(indent=2), encoding="utf-8"
-            )
-            print(
-                f"[orchestrator] exact_code_regions back-filled from report "
-                f"({len(extracted)} entries) → {evidence_path}"
-            )
+    if current_evidence is not None:
+        loc = current_evidence.localization
+        struc = current_evidence.structural
+        warnings: list[str] = []
+        if not loc.exact_code_regions:
+            warnings.append("exact_code_regions is empty")
+        if not loc.call_chain_context:
+            warnings.append("call_chain_context is empty")
+        if not loc.suspect_entities:
+            warnings.append("suspect_entities is empty")
+        if not struc.must_co_edit_relations:
+            warnings.append("must_co_edit_relations is empty")
+        if warnings:
+            for w in warnings:
+                print(f"[orchestrator] WARNING: {w}")
         else:
-            print(
-                "[orchestrator] WARNING: exact_code_regions still empty and no "
-                "EXACT_LINES block found in closure report."
-            )
+            print("[orchestrator] All mandatory evidence fields populated.")
 
-    report_path = output_dir / "closure_report.md"
-    report_path.write_text(final_result, encoding="utf-8")
-    print(f"[orchestrator] Closure report saved → {report_path}")
+        # Re-save final state (in case the last update_localization call
+        # was not the very last action)
+        evidence_path.resolve().write_text(
+            current_evidence.model_dump_json(indent=2), encoding="utf-8"
+        )
+        print(f"[orchestrator] Final evidence JSON saved → {evidence_path}")
+    else:
+        print("[orchestrator] ERROR: No evidence cards in memory after loop.")
 
-    return final_result
-
-
-def _parse_exact_lines_from_report(report: str) -> list[str]:
-    """Extract exact line references from the closure report.
-
-    Strategy 1 — structured block:
-        ## EXACT_LINES (machine-readable)
-        ```
-        path/to/file.py:89
-        path/to/file.py:126
-        ```
-
-    Strategy 2 — inline patterns (fallback):
-        Scans the whole report for 'some/file.py:N' or 'some/file.py:N-M' tokens.
-
-    Returns a deduplicated list of non-empty stripped strings, or [] if nothing found.
-    """
-    # Strategy 1: structured fenced block
-    block_match = re.search(
-        r"##\s+EXACT_LINES[^\n]*\n```[^\n]*\n(.*?)```",
-        report,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if block_match:
-        lines = [ln.strip() for ln in block_match.group(1).splitlines() if ln.strip()]
-        if lines:
-            return lines
-
-    # Strategy 2: inline file:line tokens  (e.g. "face_detector.py:89" or "models/face_detector.py:89-95")
-    inline = re.findall(
-        r"[\w./\-]+\.py:\d+(?:-\d+)?",
-        report,
-    )
-    seen: set[str] = set()
-    result: list[str] = []
-    for token in inline:
-        if token not in seen:
-            seen.add(token)
-            result.append(token)
-    return result
+    return str(evidence_path)
 
 
 def run_orchestrator(
