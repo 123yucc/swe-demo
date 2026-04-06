@@ -1,29 +1,53 @@
 """
 Parser sub-agent: reads 4 Markdown artifact files and extracts
-structured EvidenceCards via the submit_extracted_evidence MCP tool.
+structured EvidenceCards via SDK structured output (output_format).
 """
 
 import asyncio
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
 from src.config import sdk_env
 from src.models.context import EvidenceCards
-from src.tools.ingestion_tools import (
-    get_submitted_evidence,
-    ingestion_server,
-    reset_submitted_evidence,
-)
+
+
+def _deref_schema(schema: dict) -> dict:
+    """Inline all $ref references, removing $defs.
+
+    The Claude Agent SDK does not support $ref as a direct property value
+    (only inside 'items'). This function resolves all $ref pointers so the
+    schema is fully self-contained.
+    """
+    defs = schema.get("$defs", {})
+
+    def _resolve(node):
+        if isinstance(node, dict):
+            if "$ref" in node:
+                ref_name = node["$ref"].split("/")[-1]
+                resolved = dict(defs[ref_name])
+                for k, v in node.items():
+                    if k != "$ref":
+                        resolved[k] = v
+                return _resolve(resolved)
+            return {k: _resolve(v) for k, v in node.items() if k != "$defs"}
+        if isinstance(node, list):
+            return [_resolve(item) for item in node]
+        return node
+
+    return _resolve(schema)
+
+
+# Auto-generated from Pydantic model, then dereferenced for SDK compatibility.
+_EVIDENCE_CARDS_SCHEMA = _deref_schema(EvidenceCards.model_json_schema())
 
 PARSER_SYSTEM_PROMPT = """\
 You are a precise and methodical software-defect analyst.
 
 Your task is to read a set of issue artifact documents (provided in the user
 message) and extract structured evidence into four multi-dimensional cards.
-You MUST call the `mcp__ingestion__submit_extracted_evidence` tool exactly once
-after you have read and analysed all documents.  Do NOT return evidence as plain
-text — the only valid output is that tool call.
+Return your analysis as a JSON object matching the required schema — that is
+your ONLY output.  Do NOT return plain text or Markdown.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL: AS-IS vs TO-BE — You MUST distinguish these two states at all times.
@@ -89,33 +113,38 @@ list — do NOT guess.
 """
 
 
-async def _prompt_stream(text: str):
-    """Wrap a plain string as the async generator required by in-process MCP servers."""
-    yield {
-        "type": "user",
-        "message": {"role": "user", "content": text},
-    }
-
-
 async def _run_parser_async(md_contents: str) -> EvidenceCards:
-    reset_submitted_evidence()
-
-    tool_name = "mcp__ingestion__submit_extracted_evidence"
     options = ClaudeAgentOptions(
         system_prompt=PARSER_SYSTEM_PROMPT,
-        mcp_servers={"ingestion": ingestion_server},
-        allowed_tools=[tool_name],
+        allowed_tools=[],
         permission_mode="acceptEdits",
+        output_format={
+            "type": "json_schema",
+            "schema": _EVIDENCE_CARDS_SCHEMA,
+        },
         env=sdk_env(),
     )
 
-    async for _ in query(prompt=_prompt_stream(md_contents), options=options):
-        pass  # drain the stream; side-effect: tool populates _submitted_evidence
+    result_message: ResultMessage | None = None
+    async for message in query(prompt=md_contents, options=options):
+        if isinstance(message, ResultMessage):
+            result_message = message
 
-    evidence = get_submitted_evidence()
-    if evidence is None:
-        raise RuntimeError("Parser agent did not call submit_extracted_evidence.")
-    return evidence
+    if result_message is None:
+        raise RuntimeError("Parser agent returned no ResultMessage.")
+
+    if result_message.subtype == "error_max_structured_output_retries":
+        raise RuntimeError(
+            "Parser agent failed to produce valid structured output after retries."
+        )
+
+    if result_message.structured_output is None:
+        raise RuntimeError(
+            "Parser agent ResultMessage has no structured_output. "
+            f"subtype={result_message.subtype}"
+        )
+
+    return EvidenceCards.model_validate(result_message.structured_output)
 
 
 def run_parser(md_contents: str) -> EvidenceCards:

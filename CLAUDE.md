@@ -26,11 +26,11 @@ python -m src.main face_recognition_issue_001 \
 - `expected_and_current_behavior.md`
 
 **Output** written to `<artifacts_dir>/../evidence/`:
-- `evidence_cards.json` �? structured evidence (Pydantic model �? JSON), the sole Source of Truth
+- `evidence_cards.json` �? structured evidence (Pydantic model �? JSON), the sole Source of Truth
 
 ## API Credentials
 
-Config is loaded from `.env` at project root (no extra deps �??? simple key=value parser in `src/config.py`):
+Config is loaded from `.env` at project root (no extra deps �??? simple key=value parser in `src/config.py`):
 
 ```
 ANTHROPIC_API_KEY=sk-...
@@ -44,7 +44,7 @@ ANTHROPIC_BASE_URL=https://your-relay.example.com/v1  # optional, for proxy/rela
 ### State Machine
 
 ```
-Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence Refining �??? Closed
+Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence Refining �??? Closed
 ```
 
 ### Components
@@ -53,22 +53,100 @@ Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence Refi
 |-----------|------|------|
 | CLI | `src/main.py` | Validates args, calls `run_orchestrator()` |
 | Config | `src/config.py` | Reads `.env`, exposes `sdk_env()` |
-| Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, extracts `EvidenceCards` via Claude Agent SDK; calls `mcp__ingestion__submit_extracted_evidence` |
+| Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output (`output_format`) |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration (call chains, data flow, similar patterns); returns Markdown with `EXACT_LINES` block |
-| Orchestrator | `src/orchestrator/engine.py` | Main loop as a Claude Agent SDK agent; delegates to Deep Search via `Agent` tool; persists findings via `mcp__evidence__update_localization` |
-| MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `submit_extracted_evidence` and `update_localization` |
-| Data Models | `src/models/evidence.py`, `src/models/context.py` | Pydantic v2 models for 4 evidence cards + session context |
+| Orchestrator | `src/orchestrator/engine.py` | Main loop as a Claude Agent SDK agent; delegates to Deep Search via `Agent` tool; persists findings via `mcp__evidence__update_localization` and `mcp__evidence__cache_retrieved_code` |
+| MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` and `cache_retrieved_code` |
+| Data Models | `src/models/evidence.py`, `src/models/context.py`, `src/models/memory.py` | Pydantic v2 models for 4 evidence cards, session context, and `SharedWorkingMemory` |
 
-### Four Evidence Cards (Pydantic models �? multi-dimensional)
+### `src/` File Structure (with annotations)
 
-- **SymptomCard** �? `observable_failures` (error messages, stack traces), `repair_targets` (expected behaviour), `regression_expectations` (must-not-break behaviours)
-- **ConstraintCard** �? `semantic_boundaries` (API contracts), `behavioral_constraints` (assertions/invariants; TO-BE items prefixed `TO-BE:`), `backward_compatibility`, `similar_implementation_patterns` (existing similar APIs as reference), `missing_elements_to_implement` (TO-BE elements confirmed absent from codebase)
-- **LocalizationCard** �? `suspect_entities` (files, classes, functions, variables), `exact_code_regions` (confirmed `path:line` strings), `call_chain_context` (Caller-Callee chains), `dataflow_relevant_uses` (Def-Use relationships)
-- **StructuralCard** �? `must_co_edit_relations` (if A changes, B must too), `dependency_propagation` (interface/package/config dependency paths)
+```text
+src/
+    __init__.py                      # Package marker for Python imports
+    main.py                          # CLI entry; validates args and launches orchestrator
+    config.py                        # Loads .env and provides sdk_env() for all agents
+
+    agents/
+        __init__.py                    # Subpackage marker
+        parser_agent.py                # Parses 4 artifact markdown files into structured EvidenceCards
+        deep_search_agent.py           # Runs focused repository investigation using Grep/Read/Glob
+
+    models/
+        __init__.py                    # Subpackage marker
+        evidence.py                    # Definitions of Symptom/Constraint/Localization/Structural cards
+        context.py                     # Top-level EvidenceCards and session-oriented context models
+        memory.py                      # SharedWorkingMemory model used across orchestrator and sub-agents
+
+    orchestrator/
+        __init__.py                    # Subpackage marker
+        engine.py                      # Main evidence-closure loop and sub-agent dispatching logic
+
+    tools/
+        __init__.py                    # Subpackage marker
+        ingestion_tools.py             # Custom MCP tools: update_localization and cache_retrieved_code
+```
+
+### Four Evidence Cards（Pydantic 多维证据卡，字段中文说明）
+
+以下四张卡共同构成唯一证据真相源（Source of Truth）。每个字段都应尽量基于可验证事实填写，避免推测。
+
+#### 1) SymptomCard（现象卡）
+
+- `observable_failures`：可观测故障现象。
+    记录用户真实看到的问题，例如报错信息、异常类型、堆栈、错误输出、功能失效表现。
+- `repair_targets`：修复目标。
+    记录“修好后应达到什么行为”，即期望结果与验收目标。
+- `regression_expectations`：回归保护项。
+    记录修复后不能被破坏的既有正确行为（must-not-break）。
+
+#### 2) ConstraintCard（约束卡）
+
+- `semantic_boundaries`：语义边界。
+    记录 API/接口契约、函数签名、类型约束、文档明确要求的边界条件。
+- `behavioral_constraints`：行为约束。
+    记录不变量、断言、业务规则、输入输出约束。
+    若是“未来要新增”的要求，必须使用 `TO-BE:` 前缀标记，避免误当成现状。
+- `backward_compatibility`：兼容性要求。
+    记录必须保持的向后兼容行为（例如默认参数、旧调用方式不破坏）。
+- `similar_implementation_patterns`：相似实现模式。
+    记录代码库中可参考的类似实现（同类 API、类似模块模式）。
+- `missing_elements_to_implement`：缺失待实现元素。
+    记录被证实“规范要求存在但当前代码库中不存在”的类/方法/接口。
+    该字段用于防止下游代理误以为这些能力已经存在。
+
+#### 3) LocalizationCard（定位卡）
+
+- `suspect_entities`：可疑实体。
+    记录可疑文件、类、函数、变量等定位线索。
+- `exact_code_regions`：精确代码区间。
+    记录已确认的精确位置，格式必须是 `path/to/file.py:LINE` 或 `path/to/file.py:LINE-LINE`。
+- `call_chain_context`：调用链上下文。
+    记录 Caller -> Callee 链路，说明问题是如何被触发到该位置的。
+- `dataflow_relevant_uses`：数据流相关使用点。
+    记录 Def-Use（定义-使用）关系，说明关键变量/配置如何流经系统并影响故障。
+
+#### 4) StructuralCard（结构卡）
+
+- `must_co_edit_relations`：必须联动修改关系。
+    记录“如果改 A，必须同步改 B”的关系，避免只改局部导致系统不一致。
+- `dependency_propagation`：依赖传播路径。
+    记录接口、包、配置、模块之间的依赖传播链路，说明改动影响面。
+
+#### 字段填写原则（建议）
+
+- 优先记录可验证事实（代码检索、行号、调用链），避免纯推断。
+- `TO-BE:` 仅表示未来待实现需求，不等于当前已存在实现。
+- 若 Deep Search 发现了精确行号但未写入 `exact_code_regions`，视为证据未落盘。
+- 四张卡应互相补充：
+    现象卡回答“出了什么问题”；
+    约束卡回答“修复不能越界”；
+    定位卡回答“问题在什么位置”；
+    结构卡回答“改动会牵连哪里”。
 
 ### Orchestrator: Gap-Filling Loop
 
-The orchestrator acts as an Information Foraging Orchestrator. After every Deep Search return it re-assesses each card for gaps (empty key fields) and dispatches targeted Deep Search TODOs until no evidence is still missing. It does NOT judge relevance �? only ensures cards have evidence.
+The orchestrator acts as an Information Foraging Orchestrator. After every Deep Search return it re-assesses each card for gaps (empty key fields) and dispatches targeted Deep Search TODOs until no evidence is still missing. It does NOT judge relevance �? only ensures cards have evidence.
 
 ### Hard Closure Rules (enforced in orchestrator prompt)
 
@@ -77,10 +155,21 @@ The orchestrator acts as an Information Foraging Orchestrator. After every Deep 
 3. Do NOT close based on `TO-BE:` constraint items (those are requirements, not evidence)
 4. **Fact-alignment**: every entry written to JSON evidence cards must be grounded in what Deep Search actually found, not inferred from requirements
 
+### SharedWorkingMemory (`src/models/memory.py`)
+
+Global shared context across all agents:
+- `issue_context` (str): Original issue artifact text (immutable)
+- `evidence_cards` (EvidenceCards): The four evidence cards — sole Source of Truth
+- `retrieved_code` (Dict[str, str]): Cached code snippets keyed by `filepath:start-end`
+- `action_history` (List[str]): Chronological log of orchestrator actions
+
+The memory is initialized after the Parser completes and injected into the orchestrator's initial prompt via `format_for_prompt()`. The `cache_retrieved_code` MCP tool populates `retrieved_code` during the investigation loop.
+
 ### Claude Agent SDK Integration
 
-- All agents (Parser, Deep Search, Orchestrator) are run via `claude_agent_sdk.query()` with `ClaudeAgentOptions`
+- Parser Agent uses SDK structured output (`output_format` with `EvidenceCards.model_json_schema()`) to return typed evidence directly
 - Deep Search is registered as an `AgentDefinition` in the orchestrator's `agents={"deep-search": ...}` dict; the orchestrator invokes it via the `Agent` tool
+- Orchestrator dispatches focused evidence context to Deep Search (not full JSON dump)
 - SDK docs: `docs/claude_sdk_docs/`
 - Phase-by-phase implementation plans: `docs/plan/`
 
@@ -96,4 +185,4 @@ The orchestrator acts as an Information Foraging Orchestrator. After every Deep 
 
 
 
-�����Ļش��û�
+�����Ļش��û�

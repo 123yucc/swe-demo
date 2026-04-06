@@ -24,8 +24,12 @@ from src.agents.parser_agent import load_artifacts, _run_parser_async
 from src.agents.deep_search_agent import DEEP_SEARCH_SYSTEM_PROMPT
 from src.config import sdk_env
 from src.tools.ingestion_tools import (
+    cache_retrieved_code,
     get_submitted_evidence,
+    get_working_memory,
+    init_working_memory,
     set_evidence_json_path,
+    set_repo_root,
     update_localization,
 )
 
@@ -115,6 +119,25 @@ The JSON is the sole Source of Truth for downstream agents.  Any finding
 that is not written to JSON does not exist.
 
 ═══════════════════════════════════════════════════════════
+CACHING CODE — use mcp__evidence__cache_retrieved_code
+═══════════════════════════════════════════════════════════
+
+When a Deep Search report includes the actual source code of a critical
+function (the buggy function, a key caller, a reference implementation),
+call `mcp__evidence__cache_retrieved_code` to cache it.
+
+Pass:
+- location: "filepath:start_line-end_line" (e.g. "backend/models/face_detector.py:120-145")
+- code: the actual source text from the Deep Search report
+
+Cache at least:
+- The primary suspect function body
+- Any reference implementation that the fix should follow
+- Key callers if their code was included in the report
+
+Cached code is injected into downstream agents' context automatically.
+
+═══════════════════════════════════════════════════════════
 CLOSURE — JSON is the sole output, no Markdown report
 ═══════════════════════════════════════════════════════════
 
@@ -168,10 +191,37 @@ RULE 4 — FACT-ALIGNMENT in JSON fields: every entry written to the JSON
      trace back to a concrete Deep Search finding.
 
 ═══════════════════════════════════════════════════════════
+DISPATCHING DEEP SEARCH — evidence context injection
+═══════════════════════════════════════════════════════════
+
+When you dispatch a task to the deep-search agent, structure your message
+as follows:
+
+```
+## TODO
+<specific investigation task>
+
+## Current Evidence Context
+<only the fields RELEVANT to this task — do NOT dump the full JSON>
+- Suspect entities: ...
+- Exact code regions found so far: ...
+- Known call chains: ...
+- Known constraints / TO-BE items: ...
+(omit sections that are empty or irrelevant to this specific task)
+
+## What to focus on
+<which evidence dimensions this task should fill — e.g. call chains,
+co-edit relations, dataflow, etc.>
+```
+
+This focused injection prevents the sub-agent from being overwhelmed by
+irrelevant context and keeps its attention on the specific investigation gap.
+
+═══════════════════════════════════════════════════════════
 Other rules:
 ═══════════════════════════════════════════════════════════
 - Allowed tools: Agent (deep-search sub-agent), TodoWrite,
-  mcp__evidence__update_localization.
+  mcp__evidence__update_localization, mcp__evidence__cache_retrieved_code.
 - Do NOT read files directly — delegate all file access to Deep Search.
 - Keep your TodoWrite list up-to-date; mark tasks done as you go.
 """
@@ -187,6 +237,20 @@ _DEEP_SEARCH_AGENT_DEF = AgentDefinition(
     tools=["Grep", "Read", "Glob", "TodoWrite"],
     model="sonnet",
 )
+
+
+def _build_initial_prompt(
+    issue_id: str,
+    repo_dir: Path,
+    memory_text: str,
+) -> str:
+    """Build the initial user message for the orchestrator agent."""
+    return (
+        f"Issue ID: {issue_id}\n"
+        f"Repository root: {repo_dir}\n\n"
+        f"{memory_text}\n\n"
+        "Begin the gap-filling evidence-closure loop now."
+    )
 
 
 async def _run_orchestrator_async(
@@ -207,11 +271,19 @@ async def _run_orchestrator_async(
     artifacts_dir = Path(artifacts_dir)
     repo_dir = Path(repo_dir)
 
-    # Step 1: Run parser standalone (MCP works reliably outside subagent context)
+    # Step 1: Run parser with structured output
     artifact_text = load_artifacts(artifacts_dir)
     print("[orchestrator] Running parser agent...")
     evidence = await _run_parser_async(artifact_text)
     print("[orchestrator] Parser done.")
+
+    # Step 2: Initialize SharedWorkingMemory and repo root for path normalization
+    set_repo_root(repo_dir)
+    memory = init_working_memory(
+        issue_context=artifact_text,
+        evidence=evidence,
+    )
+    memory.record_action("Parser completed — initial evidence cards created.")
 
     output_dir = artifacts_dir.parent / "evidence"
     output_dir.mkdir(exist_ok=True)
@@ -220,30 +292,33 @@ async def _run_orchestrator_async(
     print(f"[orchestrator] Evidence cards saved → {evidence_path}")
 
     # Register absolute path so update_localization MCP tool can write back to it
-    # regardless of what cwd the MCP server process uses.
     set_evidence_json_path(evidence_path.resolve())
 
-    initial_prompt_text = (
-        f"Issue ID: {issue_id}\n"
-        f"Repository root: {repo_dir}\n\n"
-        f"Initial EvidenceCards (parsed from artifacts):\n"
-        f"```json\n{evidence.model_dump_json(indent=2)}\n```\n\n"
-        "Begin the gap-filling evidence-closure loop now."
+    # Step 3: Build initial prompt with working memory context
+    initial_prompt_text = _build_initial_prompt(
+        issue_id=issue_id,
+        repo_dir=repo_dir,
+        memory_text=memory.format_for_prompt(),
+    )
+
+    evidence_mcp = create_sdk_mcp_server(
+        name="evidence",
+        version="1.0.0",
+        tools=[update_localization, cache_retrieved_code],
     )
 
     options = ClaudeAgentOptions(
         system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
-        allowed_tools=["Agent", "TodoWrite", "mcp__evidence__update_localization"],
+        allowed_tools=[
+            "Agent",
+            "TodoWrite",
+            "mcp__evidence__update_localization",
+            "mcp__evidence__cache_retrieved_code",
+        ],
         agents={
             "deep-search": _DEEP_SEARCH_AGENT_DEF,
         },
-        mcp_servers={
-            "evidence": create_sdk_mcp_server(
-                name="evidence",
-                version="1.0.0",
-                tools=[update_localization],
-            ),
-        },
+        mcp_servers={"evidence": evidence_mcp},
         cwd=str(repo_dir),
         permission_mode="acceptEdits",
         env=sdk_env(),
@@ -252,7 +327,7 @@ async def _run_orchestrator_async(
     async with ClaudeSDKClient(options=options) as client:
         await client.query(initial_prompt_text)
         async for message in client.receive_response():
-            pass  # Evidence is persisted to JSON via update_localization MCP calls
+            pass  # Evidence is persisted to JSON via MCP tool calls
 
     # --- Post-loop validation: warn about empty mandatory fields ---
     current_evidence = get_submitted_evidence()
@@ -274,14 +349,24 @@ async def _run_orchestrator_async(
         else:
             print("[orchestrator] All mandatory evidence fields populated.")
 
-        # Re-save final state (in case the last update_localization call
-        # was not the very last action)
+        # Re-save final state
         evidence_path.resolve().write_text(
             current_evidence.model_dump_json(indent=2), encoding="utf-8"
         )
         print(f"[orchestrator] Final evidence JSON saved → {evidence_path}")
     else:
         print("[orchestrator] ERROR: No evidence cards in memory after loop.")
+
+    # Save full working memory to disk
+    wm = get_working_memory()
+    if wm is not None:
+        wm_path = output_dir / "working_memory.json"
+        wm_path.write_text(wm.model_dump_json(indent=2), encoding="utf-8")
+        print(
+            f"[orchestrator] Working memory saved → {wm_path} "
+            f"({len(wm.retrieved_code)} cached snippets, "
+            f"{len(wm.action_history)} actions)"
+        )
 
     return str(evidence_path)
 
