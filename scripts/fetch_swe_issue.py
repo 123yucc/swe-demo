@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 
+
 DATASET_NAME = "ScaleAI/SWE-bench_Pro"
 DATASET_SPLIT = "test"
 DOCKER_IMAGE_PREFIX = "jefzda/sweap-images"
@@ -47,134 +48,6 @@ def load_first_instance() -> dict:
     instance: dict = dataset[0]
     print(f"Loaded instance: {instance.get('instance_id', '<unknown>')}")
     return instance
-
-
-def build_problem_statement_md(instance: dict) -> str:
-    """Build problem_statement.md content from dataset instance."""
-    problem_statement = instance.get("problem_statement", "").strip()
-    instance_id = instance.get("instance_id", "")
-    repo = instance.get("repo", "")
-    base_commit = instance.get("base_commit", "")
-
-    lines = [
-        f"# Problem Statement",
-        f"",
-        f"**Instance ID:** `{instance_id}`  ",
-        f"**Repository:** `{repo}`  ",
-        f"**Base Commit:** `{base_commit}`  ",
-        f"",
-        problem_statement,
-    ]
-    return "\n".join(lines)
-
-
-def build_requirements_md(instance: dict) -> str:
-    """Build requirements.md content from dataset instance."""
-    fail_to_pass = instance.get("FAIL_TO_PASS", [])
-    pass_to_pass = instance.get("PASS_TO_PASS", [])
-
-    # Normalize: the dataset may store these as JSON strings or lists
-    if isinstance(fail_to_pass, str):
-        try:
-            fail_to_pass = json.loads(fail_to_pass)
-        except json.JSONDecodeError:
-            fail_to_pass = [fail_to_pass]
-    if isinstance(pass_to_pass, str):
-        try:
-            pass_to_pass = json.loads(pass_to_pass)
-        except json.JSONDecodeError:
-            pass_to_pass = [pass_to_pass]
-
-    fail_lines = "\n".join(f"- `{t}`" for t in fail_to_pass) if fail_to_pass else "_None specified_"
-    pass_lines = "\n".join(f"- `{t}`" for t in pass_to_pass) if pass_to_pass else "_None specified_"
-
-    lines = [
-        "# Requirements",
-        "",
-        "## Tests That Must Pass After the Fix (FAIL_TO_PASS)",
-        "",
-        "The following tests are currently failing and must pass once the fix is applied:",
-        "",
-        fail_lines,
-        "",
-        "## Tests That Must Continue to Pass (PASS_TO_PASS)",
-        "",
-        "The following tests are currently passing and must not regress:",
-        "",
-        pass_lines,
-    ]
-    return "\n".join(lines)
-
-
-def build_new_interfaces_md(instance: dict) -> str:
-    """Build new_interfaces.md content from dataset instance."""
-    # SWE-bench Pro does not typically include new interface specifications.
-    # Provide a structured placeholder so the parser agent handles it gracefully.
-    instance_id = instance.get("instance_id", "")
-    lines = [
-        "# New Interfaces",
-        "",
-        f"This document covers new or modified public interfaces required by the fix "
-        f"for `{instance_id}`.",
-        "",
-        "No explicit new interface specifications are provided for this SWE-bench Pro "
-        "instance. The fix is expected to restore existing behaviour without introducing "
-        "new public APIs.",
-    ]
-    return "\n".join(lines)
-
-
-def build_expected_and_current_behavior_md(instance: dict) -> str:
-    """Build expected_and_current_behavior.md content from dataset instance."""
-    problem_statement = instance.get("problem_statement", "").strip()
-    fail_to_pass = instance.get("FAIL_TO_PASS", [])
-    if isinstance(fail_to_pass, str):
-        try:
-            fail_to_pass = json.loads(fail_to_pass)
-        except json.JSONDecodeError:
-            fail_to_pass = [fail_to_pass]
-
-    failing_tests = "\n".join(f"- `{t}`" for t in fail_to_pass) if fail_to_pass else "_See problem statement_"
-
-    lines = [
-        "# Expected and Current Behavior",
-        "",
-        "## Current (Broken) Behavior",
-        "",
-        "The repository at the base commit exhibits the bug described in the problem statement.",
-        "The following tests are currently failing due to this bug:",
-        "",
-        failing_tests,
-        "",
-        "## Problem Description",
-        "",
-        problem_statement,
-        "",
-        "## Expected Behavior",
-        "",
-        "After the fix is applied:",
-        "- All tests listed in the FAIL_TO_PASS section of `requirements.md` must pass.",
-        "- No tests listed in the PASS_TO_PASS section of `requirements.md` may regress.",
-        "- The repository behaviour must conform to the description in `problem_statement.md`.",
-    ]
-    return "\n".join(lines)
-
-
-def write_artifacts(artifacts_dir: Path, instance: dict) -> None:
-    """Write the 4 Markdown artifact files to artifacts_dir."""
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    files = {
-        "problem_statement.md": build_problem_statement_md(instance),
-        "requirements.md": build_requirements_md(instance),
-        "new_interfaces.md": build_new_interfaces_md(instance),
-        "expected_and_current_behavior.md": build_expected_and_current_behavior_md(instance),
-    }
-
-    for filename, content in files.items():
-        path = artifacts_dir / filename
-        path.write_text(content, encoding="utf-8")
-        print(f"  Written: {path}")
 
 
 def clone_repo(instance: dict, repo_dir: Path) -> None:
@@ -303,8 +176,11 @@ def main() -> None:
     print(f"Docker tag  : {instance.get('dockerhub_tag', '')}")
     print()
 
-    print("--- Writing artifact files ---")
-    write_artifacts(artifacts_dir, instance)
+    print("--- Writing issue file ---")
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    issue_path = artifacts_dir / "issue.md"
+    issue_path.write_text(instance.get("problem_statement", ""), encoding="utf-8")
+    print(f"  Written: {issue_path}")
 
     print("\n--- Saving instance metadata ---")
     save_instance_metadata(instance, issue_dir)
@@ -324,8 +200,8 @@ def main() -> None:
     print("\n=== Setup complete ===")
     print(f"Run the harness with:")
     print(
-        f"  python -m src.main {instance_id} "
-        f"{artifacts_dir} {repo_dir}"
+        f"  python -m src.main --instance-json {issue_dir / 'instance_metadata.json'} "
+        f"--repo-dir {repo_dir}"
     )
 
 

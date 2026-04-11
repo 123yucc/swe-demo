@@ -6,9 +6,12 @@ of orchestrator actions.  Local memory (subagent conversation history) is
 implicit in the SDK — each subagent session is its own local memory.
 """
 
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 
 from src.models.context import EvidenceCards
+from src.models.patch import PatchPlan
 
 
 class SharedWorkingMemory(BaseModel):
@@ -29,6 +32,13 @@ class SharedWorkingMemory(BaseModel):
     )
     evidence_cards: EvidenceCards = Field(
         description="Current state of the four evidence cards.",
+    )
+    patch_plan: PatchPlan | None = Field(
+        default=None,
+        description=(
+            "Structured edit plan produced by the Patch Planner agent. "
+            "None until the planner has run."
+        ),
     )
     retrieved_code: dict[str, str] = Field(
         default_factory=dict,
@@ -70,10 +80,18 @@ class SharedWorkingMemory(BaseModel):
         else:
             history_section = "(no actions yet)"
 
+        patch_section = ""
+        if self.patch_plan is not None:
+            patch_section = (
+                "## Patch Plan\n"
+                f"```json\n{self.patch_plan.model_dump_json(indent=2)}\n```\n\n"
+            )
+
         return (
             "═══ SHARED WORKING MEMORY ═══\n\n"
             "## Evidence Cards (current state)\n"
             f"```json\n{self.evidence_cards.model_dump_json(indent=2)}\n```\n\n"
+            f"{patch_section}"
             "## Retrieved Code Cache\n"
             f"{code_section}\n\n"
             "## Action History\n"

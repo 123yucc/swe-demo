@@ -285,7 +285,7 @@ _UPDATE_LOCALIZATION_SCHEMA = {
             ),
         },
     },
-    "required": ["exact_code_regions"],
+    "required": [],
 }
 
 
@@ -302,6 +302,7 @@ _UPDATE_LOCALIZATION_SCHEMA = {
 async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
     """Write confirmed localization, structural, and constraint data back to
     the evidence JSON file."""
+    print(f"[update_localization CALLED] args keys: {list(args.keys())}", flush=True)
     global _working_memory, _evidence_json_path
 
     if _working_memory is None:

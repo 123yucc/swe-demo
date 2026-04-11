@@ -1,0 +1,138 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "FaceDetector fails to detect faces smaller than 40x40 pixels (min_face_size=40 hardcoded in MTCNN constructor at face_detector.py:89)",
+      "Faces detected with confidence below 0.9 are ignored even when valid (hardcoded at face_detector.py:126)",
+      "Low-resolution images result in frequent missed detections (MTCNN min_face_size=40 is frozen at construction, face_detector.py:80-95)",
+      "No adaptation mechanism exists for varying image quality (_adjust_detection_parameters exists at face_detector.py:33-55 but is DEAD CODE — never called)"
+    ],
+    "repair_targets": [
+      "FaceDetector.detect_faces must call _adjust_detection_parameters() before MTCNN invocation and use the returned dynamic (adjusted_min_face_size, adjusted_confidence_threshold) instead of hardcoded values",
+      "Implement dynamic adjustment of min_face_size based on image characteristics",
+      "Implement dynamic adjustment of confidence thresholds based on image characteristics",
+      "Ensure faces in low-resolution or small-face images are reliably detected",
+      "Backend/config.py MTCNN_CONFIG['min_face_size':40] should be wired to FaceDetector instead of being dead config"
+    ],
+    "regression_expectations": [
+      "Existing detection behavior on standard/high-quality images must not degrade",
+      "Default detection parameters (min_face_size=40, confidence=0.9) must remain when sensitivity is not configured",
+      "Face detection on high-resolution images must continue to work correctly"
+    ]
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "FaceDetector class is located at repo/backend/models/face_detector.py:8",
+      "MTCNN model is used internally for face detection",
+      "min_face_size is currently fixed at 40 pixels at face_detector.py:89; confidence threshold is currently fixed at 0.9 at face_detector.py:126",
+      "set_detection_sensitivity() must accept min_face_size_factor: float = 1.0 and confidence_threshold_offset: float = 0.0",
+      "_adjust_detection_parameters() must accept a PIL.Image.Image and return (min_face_size: int, confidence_threshold: float)"
+    ],
+    "behavioral_constraints": [
+      "EXISTS (DEAD): _adjust_detection_parameters(image_width, image_height) defined at face_detector.py:33-55 — computes adjusted min_face_size and confidence_threshold using stored sensitivity factors, includes low-res override, clamps values. MUST BE CALLED from detect_faces before line 126.",
+      "EXISTS (DEAD): set_detection_sensitivity(min_face_size_factor, confidence_threshold_offset) defined at face_detector.py:19-31 — validates and stores to instance variables. MUST BE CALLED by API or wired to take effect.",
+      "When set_detection_sensitivity is called with min_face_size_factor=0.5, effective min_face_size should halve (e.g., 40 -> 20) via _adjust_detection_parameters",
+      "When set_detection_sensitivity is called with confidence_threshold_offset=-0.1, effective confidence threshold should lower by 0.1 (e.g., 0.9 -> 0.8) via _adjust_detection_parameters",
+      "Detection parameters must update immediately upon set_detection_sensitivity() being called — currently no caller exists",
+      "Pre-processing steps (super-resolution or adaptive upsampling) may be used as an alternative implementation strategy"
+    ],
+    "backward_compatibility": [
+      "Default parameter values (min_face_size=40, confidence_threshold=0.9) must be preserved when set_detection_sensitivity is not called",
+      "Existing face detection on standard or high-quality images must not be negatively impacted"
+    ],
+    "similar_implementation_patterns": [
+      "backend/models/face_detector.py:33-55 — _adjust_detection_parameters() is the primary adaptive param adjustment pattern: takes image_width/height, applies _min_face_size_factor multiplier and _confidence_threshold_offset to base values 40/0.9, includes low-res override (reduces by 20% for dims < 200px), clamps min_face_size to >=20 and threshold to [0.5, 0.99]. This method EXISTS but is DEAD CODE — never called from anywhere.",
+      "backend/models/face_detector.py:19-31 — set_detection_sensitivity() is the sensitivity setter pattern: validates min_face_size_factor in [0.1, 2.0] and confidence_threshold_offset in [-0.5, 0.5], stores to instance variables. This method EXISTS but is NEVER CALLED.",
+      "backend/utils/image_processor.py:96-97, 107-121 — PIL.Image width/height reading and resize patterns: image.width/height attributes, image.resize(size, Image.BILINEAR), isinstance(image, np.ndarray) then Image.fromarray() pattern.",
+      "backend/nmodels/utils/detect_face.py:339-343 — get_size() helper handles np/tensor/PIL uniformly: numpy/torch uses img.shape[1::-1], PIL uses img.size.",
+      "backend/nmodels/utils/detect_face.py:308-329 — imresample() and crop_resize() with cv2/PIL/torch branches for upsampling/interpolation in MTCNN scale pyramid.",
+      "backend/config.py:23, 38-40 — Static threshold constants: similarity threshold 0.6, min_face_size 40, MTCNN 3-stage thresholds [0.6, 0.7, 0.7], factor 0.709. These are defined but never consumed by FaceDetector (dead config).",
+      "backend/nmodels/utils/detect_face.py:79, 126, 157 — Three-stage threshold application: per-network threshold array [0.6, 0.7, 0.7] applied sequentially in PNet, RNet, ONet.",
+      "backend/models/face_detector.py:126-127 — Post-detection filtering pattern: hardcoded prob > 0.9 filter applied after MTCNN returns results."
+    ],
+    "missing_elements_to_implement": [
+      "detect_faces() (face_detector.py:103-139) must call _adjust_detection_parameters() before line 126 using image dimensions (w, h = image.size available at line 134) and use the returned adjusted_confidence_threshold instead of hardcoded prob > 0.9",
+      "MTCNN min_face_size (currently frozen at face_detector.py:89) must become dynamic — either MTCNN must support per-call min_face_size override, or _load_detector() must be restructured to support lazy re-instantiation with per-call adjusted parameters",
+      "backend/config.py:38 MTCNN_CONFIG['min_face_size':40] must be wired into FaceDetector._load_detector() or detect_faces() — currently dead config entry never consumed",
+      "backend/config.py:39 MTCNN_CONFIG['thresholds':[0.6,0.7,0.7]] must be wired into FaceDetector._load_detector() — currently hardcoded duplicate at face_detector.py:90"
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "backend/models/face_detector.py:8 — FaceDetector class definition",
+      "backend/models/face_detector.py:11-17 — __init__ initializes _min_face_size_factor=1.0 and _confidence_threshold_offset=0.0 but these are never used in detection",
+      "backend/models/face_detector.py:80-95 — _load_detector() hardcodes min_face_size=40 into MTCNN constructor (line 89) — ignores stored sensitivity factor",
+      "backend/models/face_detector.py:103-139 — detect_faces() hardcodes prob > 0.9 at line 126 and never calls _adjust_detection_parameters (dead method at lines 33-55)",
+      "backend/models/face_detector.py:33-55 — _adjust_detection_parameters() is DEAD CODE: defined with correct logic but never invoked from any caller",
+      "backend/models/face_detector.py:19-31 — set_detection_sensitivity() stores sensitivity factors to instance but is NEVER CALLED from anywhere in codebase",
+      "backend/config.py:38 — MTCNN_CONFIG['min_face_size': 40] is defined but never imported or consumed by FaceDetector (dead config entry)"
+    ],
+    "exact_code_regions": [
+      "backend/models/face_detector.py:8",
+      "backend/models/face_detector.py:11",
+      "backend/models/face_detector.py:14",
+      "backend/models/face_detector.py:15",
+      "backend/models/face_detector.py:19-31",
+      "backend/models/face_detector.py:33-55",
+      "backend/models/face_detector.py:37",
+      "backend/models/face_detector.py:38",
+      "backend/models/face_detector.py:41",
+      "backend/models/face_detector.py:46",
+      "backend/models/face_detector.py:52-53",
+      "backend/models/face_detector.py:80-95",
+      "backend/models/face_detector.py:86-95",
+      "backend/models/face_detector.py:89",
+      "backend/models/face_detector.py:103-139",
+      "backend/models/face_detector.py:120",
+      "backend/models/face_detector.py:126-127",
+      "backend/models/face_detector.py:134",
+      "backend/models/face_detector.py:141",
+      "backend/models/face_detector.py:148",
+      "backend/models/face_detector.py:159",
+      "backend/models/face_detector.py:177",
+      "backend/config.py:38",
+      "backend/nnmodels/mtcnn.py:199-207",
+      "backend/nnmodels/mtcnn.py:207",
+      "backend/nnmodels/mtcnn.py:315"
+    ],
+    "call_chain_context": [
+      "HTTP POST /api/enroll/single -> app.py:76 enroll_single() -> app.py:93 face_detector.detect_faces(image) -> face_detector.py:103 detect_faces() -> face_detector.py:120 self.mtcnn.detect(image) -> mtcnn.py:273 detect() -> mtcnn.py:315 detect_face(img, self.min_face_size) -> detect_face.py:29,54 scale pyramid uses minsize",
+      "HTTP POST /api/enroll/batch -> app.py:130 enroll_batch() -> app.py:144 face_detector.detect_faces(image) -> face_detector.py:103 detect_faces() -> face_detector.py:120 self.mtcnn.detect(image) -> mtcnn.py:273 detect()",
+      "HTTP POST /api/enroll/group -> app.py:188 enroll_group() -> app.py:202 face_detector.detect_faces(image) -> face_detector.py:103 detect_faces() -> face_detector.py:120 self.mtcnn.detect(image) -> mtcnn.py:273 detect()",
+      "HTTP POST /api/recognize -> app.py:263 recognize() -> app.py:277 face_detector.detect_faces(image) -> face_detector.py:103 detect_faces() -> face_detector.py:120 self.mtcnn.detect(image) -> mtcnn.py:273 detect()",
+      "app.py:35 FaceDetector() singleton instantiation -> face_detector.py:11 __init__ -> face_detector.py:16 _ensure_mtcnn_data()",
+      "app.py:35 FaceDetector() -> face_detector.py:11 __init__ -> face_detector.py:17 _load_detector() -> face_detector.py:86-95 MTCNN(min_face_size=40) — frozen at construction",
+      "face_detector.py:141 detect_largest_face() -> face_detector.py:148 detect_faces()",
+      "face_detector.py:159 detect_and_align() -> face_detector.py:177 detect_faces()"
+    ],
+    "dataflow_relevant_uses": [
+      "_min_face_size_factor: DEF at face_detector.py:14 (initialized to 1.0) -> NEVER USED anywhere in detection pipeline (dead variable)",
+      "_confidence_threshold_offset: DEF at face_detector.py:15 (initialized to 0.0) -> NEVER USED anywhere in detection pipeline (dead variable)",
+      "base_min_face_size=40: DEF at face_detector.py:37 (inside _adjust_detection_parameters) -> USE at face_detector.py:41 (multiplied by factor) -> result returned but discarded — method is DEAD CODE never called",
+      "min_face_size=40 hardcoded: DEF at face_detector.py:89 (passed to MTCNN constructor) -> USE at mtcnn.py:207 (self.min_face_size stored) -> USE at mtcnn.py:315 (passed to detect_face) -> USE at detect_face.py:29,54 (scale pyramid m=12.0/minsize)",
+      "base_confidence_threshold=0.9: DEF at face_detector.py:38 (inside _adjust_detection_parameters) -> USE at face_detector.py:46 (offset applied) -> result returned but discarded — method is DEAD CODE never called",
+      "prob > 0.9 hardcoded: DEF at face_detector.py:126 (inline post-filter) -> USE at face_detector.py:127 (valid_boxes.append) — ignores _adjust_detection_parameters entirely",
+      "MTCNN_CONFIG['min_face_size']: DEF at config.py:38 -> NEVER IMPORTED or USED anywhere (dead config)",
+      "MTCNN_CONFIG['thresholds']: DEF at config.py:39 -> NEVER IMPORTED or USED anywhere (dead config)",
+      "self.mtcnn: DEF at face_detector.py:86-95 (constructed once in _load_detector) -> USE at face_detector.py:120 (self.mtcnn.detect) -> USE at face_detector.py:166 (in detect_and_align)",
+      "w, h = image.size: DEF at face_detector.py:134 -> available for use in _adjust_detection_parameters call but currently unused"
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "If face_detector.py:89 changes min_face_size=40 to dynamic: MTCNN constructor called once in _load_detector; min_face_size cannot be changed after construction — detect_faces or _load_detector must be restructured to support per-call dynamic parameter",
+      "If face_detector.py:126 changes prob>0.9 to use _adjust_detection_parameters: _adjust_detection_parameters must be called before line 126 using image dimensions w,h = image.size from line 134",
+      "If face_detector.py:80-95 _load_detector changes MTCNN initialization: face_detector.py:14-15 (instance variable defs in __init__) and face_detector.py:19-31 (set_detection_sensitivity) must remain consistent",
+      "If face_detector.py:103 detect_faces signature changes: app.py:93,144,202,277 (all four Flask route callers) must be updated",
+      "If face_detector.py:11 __init__ signature changes: app.py:35 (singleton instantiation) must be updated",
+      "backend/config.py:38 MTCNN_CONFIG['min_face_size'] could be wired to FaceDetector to centralize config — currently dead, if activated requires co-edit with face_detector.py:89"
+    ],
+    "dependency_propagation": [
+      "app.py:35 (FaceDetector singleton) -> face_detector.py:8 (FaceDetector class) -> nnmodels/mtcnn.py (imported at face_detector.py:84) -> nnmodels/data/pnet.pt, rnet.pt, onet.pt (MTCNN weights downloaded at face_detector.py:16 _ensure_mtcnn_data)",
+      "face_detector.py:80-95 _load_detector -> mtcnn.py:199-207 MTCNN constructor with hardcoded min_face_size=40, thresholds=[0.6,0.7,0.7] -> mtcnn.py:315 detect_face called with frozen self.min_face_size -> detect_face.py:29,54 scale pyramid m=12.0/minsize",
+      "face_detector.py:103-139 detect_faces -> mtcnn.py:273 detect() -> mtcnn.py:315 detect_face(img, self.min_face_size) — detection result returned -> face_detector.py:126 prob>0.9 hardcoded post-filter applied",
+      "face_detector.py:126 prob>0.9 depends on output of face_detector.py:33-55 _adjust_detection_parameters which is DEFINED but NEVER CALLED — dependency chain is broken",
+      "backend/config.py:35-43 MTCNN_CONFIG dict is never imported or consumed by any module — dead dependency",
+      "backend/models/face_detector.py:14-15 (_min_face_size_factor, _confidence_threshold_offset) stored in __init__ but never read during detection — dead state propagation"
+    ]
+  }
+}

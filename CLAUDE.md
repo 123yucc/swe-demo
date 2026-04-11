@@ -11,22 +11,21 @@ Evidence-Closure-Aware Repair Harness: an automated bug-investigation system tha
 ```bash
 pip install -r requirements.txt
 
-python -m src.main <issue_id> <artifacts_dir> <repo_dir>
+# By dataset index (loads from HuggingFace)
+python -m src.main --index 0 --repo-dir /app
 
-# Example:
-python -m src.main face_recognition_issue_001 \
-    workdir/face_recognition_issue_001/artifacts \
-    workdir/face_recognition_issue_001/repo
+# By instance_id
+python -m src.main --instance-id django__django-16046 --repo-dir /app
+
+# From local instance metadata JSON
+python -m src.main --instance-json workdir/swe_issue_001/instance_metadata.json \
+    --repo-dir workdir/swe_issue_001/repo
 ```
 
-**Input artifacts** (4 Markdown files in `artifacts_dir`):
-- `problem_statement.md`
-- `requirements.md`
-- `new_interfaces.md`
-- `expected_and_current_behavior.md`
-
-**Output** written to `<artifacts_dir>/../evidence/`:
-- `evidence_cards.json` �? structured evidence (Pydantic model �? JSON), the sole Source of Truth
+**Output** written to `<output-dir>/` (defaults to `workdir/<instance_id>/evidence/`):
+- `evidence_cards.json` — structured evidence
+- `model_patch.diff` — git diff patch
+- `prediction.json` — SWE-bench eval format (`{instance_id, model_patch}`)
 
 ## API Credentials
 
@@ -51,7 +50,8 @@ Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence 
 
 | Component | File | Role |
 |-----------|------|------|
-| CLI | `src/main.py` | Validates args, calls `run_orchestrator()` |
+| CLI | `src/main.py` | Unified entry point: supports SWE-bench Pro instances, local JSON, and legacy artifacts dir |
+| Artifacts | `src/artifacts.py` | Converts SWE-bench `problem_statement` into 4 Markdown artifact files |
 | Config | `src/config.py` | Reads `.env`, exposes `sdk_env()` |
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output (`output_format`) |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration (call chains, data flow, similar patterns); returns Markdown with `EXACT_LINES` block |
@@ -64,7 +64,8 @@ Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence 
 ```text
 src/
     __init__.py                      # Package marker for Python imports
-    main.py                          # CLI entry; validates args and launches orchestrator
+    main.py                          # CLI entry: loads SWE-bench Pro instance, runs full pipeline
+    artifacts.py                     # Converts SWE-bench instance to 4 Markdown artifact files
     config.py                        # Loads .env and provides sdk_env() for all agents
 
     agents/
