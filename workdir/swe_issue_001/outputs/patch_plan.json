@@ -1,0 +1,21 @@
+{
+  "overview": "Root cause: Two bugs — (1) PostgreSQL db.mget has a `LIMIT 1` clause that silently drops all matching rows except the first, breaking bulk confirmation lookups needed by loadUserInfo for email:pending/email:expired flags; (2) sendValidationEmail falls back to the stored user profile email instead of checking the pending email in the confirm object, potentially emailing the wrong address during email change workflows. Fix approach: Remove LIMIT 1 from postgres mget and map results back to input key order (null for missing keys); update email.js fallback to call getEmailForValidation(uid) to get the pending confirm-object email before falling back to stored profile email.",
+  "edits": [
+    {
+      "filepath": "src/database/postgres/main.js",
+      "target_functions": [
+        "mget"
+      ],
+      "change_rationale": "exact_code_region postgres/main.js:177-199 — the SQL query uses ANY($1::TEXT[]) to match keys but has LIMIT 1, so only the first matching row is ever returned regardless of how many keys are passed. This breaks loadUserInfo's bulk lookup of confirm:byUid:<uid> keys for email:pending/email:expired flag derivation. Fix: remove LIMIT 1 and add ORDER BY idx to preserve input key order, returning null for missing keys.",
+      "co_edit_dependencies": []
+    },
+    {
+      "filepath": "src/user/email.js",
+      "target_functions": [
+        "sendValidationEmail"
+      ],
+      "change_rationale": "exact_code_region email.js:128-130 — when options.email is not provided, the fallback is user.getUserField(uid, 'email') which reads the stored profile email, not the pending confirm-object email. This means a user who has requested an email change receives the validation link at the OLD email address instead of the NEW one. Fix: call getEmailForValidation(uid) first as fallback before using the stored profile email. Backward-compat: getEmailForValidation returns null when no confirm object exists, so the stored profile email is still used as the final fallback.",
+      "co_edit_dependencies": []
+    }
+  ]
+}

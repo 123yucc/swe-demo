@@ -1,0 +1,501 @@
+diff --git a/qutebrowser/utils/log.py b/qutebrowser/utils/log.py
+index 76599dd..fe74b36 100644
+--- a/qutebrowser/utils/log.py
++++ b/qutebrowser/utils/log.py
+@@ -32,6 +32,8 @@ from typing import (TYPE_CHECKING, Any, Iterator, Mapping, MutableSequence,
+                     Optional, Set, Tuple, Union, TextIO, Literal, cast)
+ 
+ from qutebrowser.utils import qtlog
++hide_qt_warning = qtlog.hide_qt_warning
++QtWarningFilter = qtlog.QtWarningFilter
+ # Optional imports
+ try:
+     import colorama
+@@ -359,18 +361,6 @@ def change_console_formatter(level: int) -> None:
+         assert isinstance(old_formatter, JSONFormatter), old_formatter
+ 
+ 
+-@contextlib.contextmanager
+-def hide_qt_warning(pattern: str, logger: str = 'qt') -> Iterator[None]:
+-    """Hide Qt warnings matching the given regex."""
+-    log_filter = QtWarningFilter(pattern)
+-    logger_obj = logging.getLogger(logger)
+-    logger_obj.addFilter(log_filter)
+-    try:
+-        yield
+-    finally:
+-        logger_obj.removeFilter(log_filter)
+-
+-
+ def init_from_config(conf: 'configmodule.ConfigContainer') -> None:
+     """Initialize logging settings from the config.
+ 
+@@ -401,24 +391,6 @@ def init_from_config(conf: 'configmodule.ConfigContainer') -> None:
+             change_console_formatter(level)
+ 
+ 
+-class QtWarningFilter(logging.Filter):
+-
+-    """Filter to filter Qt warnings.
+-
+-    Attributes:
+-        _pattern: The start of the message.
+-    """
+-
+-    def __init__(self, pattern: str) -> None:
+-        super().__init__()
+-        self._pattern = pattern
+-
+-    def filter(self, record: logging.LogRecord) -> bool:
+-        """Determine if the specified record is to be logged."""
+-        do_log = not record.msg.strip().startswith(self._pattern)
+-        return do_log
+-
+-
+ class InvalidLogFilterError(Exception):
+ 
+     """Raised when an invalid filter string is passed to LogFilter.parse()."""
+diff --git a/qutebrowser/utils/qtlog.py b/qutebrowser/utils/qtlog.py
+index e0b310d..bcf899d 100644
+--- a/qutebrowser/utils/qtlog.py
++++ b/qutebrowser/utils/qtlog.py
+@@ -27,12 +27,45 @@ from typing import Iterator, Optional, Callable, cast
+ 
+ from qutebrowser.qt import core as qtcore, machinery
+ 
+-# FIXME(pylbrecht): move this back to qutebrowser.utils.log once `qtlog.init()` is
+-# extracted from `qutebrowser.utils.log.init_log()`
+ qt = logging.getLogger('qt')  # Warnings produced by Qt
+ _args = None
+ 
+ 
++@contextlib.contextmanager
++def hide_qt_warning(pattern: str, *loggers: str) -> Iterator[None]:
++    """Hide Qt warnings matching the given regex."""
++    if not loggers:
++        loggers = ('qt',)
++    log_filter = QtWarningFilter(pattern)
++    for logger in loggers:
++        logger_obj = logging.getLogger(logger)
++        logger_obj.addFilter(log_filter)
++    try:
++        yield
++    finally:
++        for logger in loggers:
++            logger_obj = logging.getLogger(logger)
++            logger_obj.removeFilter(log_filter)
++
++
++class QtWarningFilter(logging.Filter):
++
++    """Filter to filter Qt warnings.
++
++    Attributes:
++        _pattern: The start of the message.
++    """
++
++    def __init__(self, pattern: str, logger: Optional[str] = None) -> None:
++        super().__init__()
++        self._pattern = pattern
++
++    def filter(self, record: logging.LogRecord) -> bool:
++        """Determine if the specified record is to be logged."""
++        do_log = not record.msg.strip().startswith(self._pattern)
++        return do_log
++
++
+ def init(args: argparse.Namespace) -> None:
+     """Install Qt message handler based on the argparse namespace passed."""
+     global _args
+diff --git a/scripts/dev/run_vulture.py b/scripts/dev/run_vulture.py
+index 960b5a5..872d32a 100755
+--- a/scripts/dev/run_vulture.py
++++ b/scripts/dev/run_vulture.py
+@@ -77,7 +77,7 @@ def whitelist_generator():  # noqa: C901
+     # Other false-positives
+     yield 'qutebrowser.completion.models.listcategory.ListCategory().lessThan'
+     yield 'qutebrowser.utils.jinja.Loader.get_source'
+-    yield 'qutebrowser.utils.log.QtWarningFilter.filter'
++    yield 'qutebrowser.utils.qtlog.QtWarningFilter.filter'
+     yield 'qutebrowser.browser.pdfjs.is_available'
+     yield 'qutebrowser.utils.usertypes.ExitStatus.reserved'
+     yield 'QEvent.posted'
+diff --git a/tests/unit/utils/test_log.py b/tests/unit/utils/test_log.py
+index a8880a7..4e89572 100644
+--- a/tests/unit/utils/test_log.py
++++ b/tests/unit/utils/test_log.py
+@@ -339,36 +339,6 @@ class TestInitLog:
+         log.init_log(args)
+         assert log.console_filter.names == {'misc'}
+ 
+-
+-class TestHideQtWarning:
+-
+-    """Tests for hide_qt_warning/QtWarningFilter."""
+-
+-    @pytest.fixture
+-    def qt_logger(self):
+-        return logging.getLogger('qt-tests')
+-
+-    def test_unfiltered(self, qt_logger, caplog):
+-        with log.hide_qt_warning("World", 'qt-tests'):
+-            with caplog.at_level(logging.WARNING, 'qt-tests'):
+-                qt_logger.warning("Hello World")
+-        assert len(caplog.records) == 1
+-        record = caplog.records[0]
+-        assert record.levelname == 'WARNING'
+-        assert record.message == "Hello World"
+-
+-    @pytest.mark.parametrize('line', [
+-        "Hello",  # exact match
+-        "Hello World",  # match at start of line
+-        "  Hello World  ",  # match with spaces
+-    ])
+-    def test_filtered(self, qt_logger, caplog, line):
+-        with log.hide_qt_warning("Hello", 'qt-tests'):
+-            with caplog.at_level(logging.WARNING, 'qt-tests'):
+-                qt_logger.warning(line)
+-        assert not caplog.records
+-
+-
+ @pytest.mark.parametrize('suffix, expected', [
+     ('', 'STUB: test_stub'),
+     ('foo', 'STUB: test_stub (foo)'),
+diff --git a/tests/unit/utils/test_qtlog.py b/tests/unit/utils/test_qtlog.py
+index 35a5015..4793d44 100644
+--- a/tests/unit/utils/test_qtlog.py
++++ b/tests/unit/utils/test_qtlog.py
+@@ -1,3 +1,137 @@
++========================================================================
++class TestHideQtWarning:
++================================================================================
++        assert caplog.messages == ["Logged empty message!"]
++
++
++class TestHideQtWarning:
++
++
++===
++class TestHideQtWarning:
++
++    """Tests for hide_qt_warning/QtWarningFilter."""
++
++    @pytest.fixture
++    def qt_logger(self):
++        return logging.getLogger('qt-tests')
++
++    @pytest.mark.parametrize('line', [
++        "Hello",  # exact match
++        "Hello World",  # match at start of line
++        "  Hello World  ",  # match with spaces
++    ])
++    def test_filtered(self, qt_logger, caplog, line):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning(line)
++        assert not caplog.records
++
++    def test_cleanup_after_exit(self, qt_logger, caplog):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning("Hello World")
++        assert len(caplog.records) == 1
++        assert caplog.records[0].message == "Hello World"
++
++    def test_default_logger(self, caplog):
++        with qtlog.hide_qt_warning("secret"):
++            with caplog.at_level(logging.WARNING, 'qt'):
++                logger = logging.getLogger('qt')
++                logger.warning("secret token=xyz")
++        assert not caplog.records
++
++    def test_direct_filter(self, caplog):
++        filter_obj = qtlog.QtWarningFilter("Hidden", 'qt-direct')
++        record = logging.LogRecord(
++            name='qt-direct',
++            level=logging.WARNING,
++            pathname='',
++            lineno=0,
++            msg="Hidden message",
++            args=(),
++            exc_info=None,
++        )
++        assert filter_obj.filter(record) is False
++
++    def test_multi_logger_consistency(self, caplog):
++        logger_a = logging.getLogger('qt-multi-a')
++        logger_b = logging.getLogger('qt-multi-b')
++        with qtlog.hide_qt_warning("Blocked", 'qt-multi-a', 'qt-multi-b'):
++            with caplog.at_level(logging.WARNING, 'qt-multi-a'):
++                with caplog.at_level(logging.WARNING, 'qt-multi-b'):
++                    logger_a.warning("Blocked message")
++                    logger_b.warning("Blocked message")
++        assert not caplog.records
++================================================================================
++=======
++====================================================================
++class TestHideQtWarning:
++================================================================================
++        assert caplog.messages == ["Logged empty message!"]
++
++
++class TestHideQtWarning:
++
++
++===
++class TestHideQtWarning:
++
++    """Tests for hide_qt_warning/QtWarningFilter."""
++
++    @pytest.fixture
++    def qt_logger(self):
++        return logging.getLogger('qt-tests')
++
++    @pytest.mark.parametrize('line', [
++        "Hello",  # exact match
++        "Hello World",  # match at start of line
++        "  Hello World  ",  # match with spaces
++    ])
++    def test_filtered(self, qt_logger, caplog, line):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning(line)
++        assert not caplog.records
++
++    def test_cleanup_after_exit(self, qt_logger, caplog):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning("Hello World")
++        assert len(caplog.records) == 1
++        assert caplog.records[0].message == "Hello World"
++
++    def test_default_logger(self, caplog):
++        with qtlog.hide_qt_warning("secret"):
++            with caplog.at_level(logging.WARNING, 'qt'):
++                logger = logging.getLogger('qt')
++                logger.warning("secret token=xyz")
++        assert not caplog.records
++
++    def test_direct_filter(self, caplog):
++        filter_obj = qtlog.QtWarningFilter("Hidden", 'qt-direct')
++        record = logging.LogRecord(
++            name='qt-direct',
++            level=logging.WARNING,
++            pathname='',
++            lineno=0,
++            msg="Hidden message",
++            args=(),
++            exc_info=None,
++        )
++        assert filter_obj.filter(record) is False
++
++    def test_multi_logger_consistency(self, caplog):
++        logger_a = logging.getLogger('qt-multi-a')
++        logger_b = logging.getLogger('qt-multi-b')
++        with qtlog.hide_qt_warning("Blocked", 'qt-multi-a', 'qt-multi-b'):
++            with caplog.at_level(logging.WARNING, 'qt-multi-a'):
++                with caplog.at_level(logging.WARNING, 'qt-multi-b'):
++                    logger_a.warning("Blocked message")
++                    logger_b.warning("Blocked message")
++        assert not caplog.records
++================================================================================
++=======
+ # Copyright 2014-2021 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+ #
+ # This file is part of qutebrowser.
+@@ -19,6 +153,7 @@
+ """Tests for qutebrowser.utils.qtlog."""
+ 
+ import dataclasses
++import logging
+ 
+ import pytest
+ 
+@@ -50,3 +185,187 @@ class TestQtMessageHandler:
+         """Make sure there's no crash with an empty message."""
+         qtlog.qt_message_handler(qtcore.QtMsgType.QtDebugMsg, self.Context(), "")
+         assert caplog.messages == ["Logged empty message!"]
++
++
++class TestHideQtWarning:
++
++    """Tests for hide_qt_warning/QtWarningFilter."""
++
++    @pytest.fixture
++    def qt_logger(self):
++        return logging.getLogger('qt-tests')
++
++    @pytest.mark.parametrize('line', [
++        "Hello",  # exact match
++        "Hello World",  # match at start of line
++        "  Hello World  ",  # match with spaces
++    ])
++    def test_filtered(self, qt_logger, caplog, line):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning(line)
++        assert not caplog.records
++
++    def test_cleanup_after_exit(self, qt_logger, caplog):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning("Hello World")
++        assert len(caplog.records) == 1
++        assert caplog.records[0].message == "Hello World"
++
++    def test_default_logger(self, caplog):
++        with qtlog.hide_qt_warning("secret"):
++            with caplog.at_level(logging.WARNING, 'qt'):
++                logger = logging.getLogger('qt')
++                logger.warning("secret token=xyz")
++        assert not caplog.records
++
++    def test_direct_filter(self, caplog):
++        filter_obj = qtlog.QtWarningFilter("Hidden", 'qt-direct')
++        record = logging.LogRecord(
++            name='qt-direct',
++            level=logging.WARNING,
++            pathname='',
++            lineno=0,
++            msg="Hidden message",
++            args=(),
++            exc_info=None,
++        )
++        assert filter_obj.filter(record) is False
++
++    def test_multi_logger_consistency(self, caplog):
++        logger_a = logging.getLogger('qt-multi-a')
++        logger_b = logging.getLogger('qt-multi-b')
++        with qtlog.hide_qt_warning("Blocked", 'qt-multi-a', 'qt-multi-b'):
++            with caplog.at_level(logging.WARNING, 'qt-multi-a'):
++                with caplog.at_level(logging.WARNING, 'qt-multi-b'):
++                    logger_a.warning("Blocked message")
++                    logger_b.warning("Blocked message")
++        assert not caplog.records
++        assert caplog.messages == ["Logged empty message!"]
++
++
++class TestHideQtWarning:
++
++    """Tests for hide_qt_warning/QtWarningFilter."""
++
++    @pytest.fixture
++    def qt_logger(self):
++        return logging.getLogger('qt-tests')
++
++    @pytest.mark.parametrize('line', [
++        "Hello",  # exact match
++        "Hello World",  # match at start of line
++        "  Hello World  ",  # match with spaces
++    ])
++    def test_filtered(self, qt_logger, caplog, line):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning(line)
++        assert not caplog.records
++
++    def test_cleanup_after_exit(self, qt_logger, caplog):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning("Hello World")
++        assert len(caplog.records) == 1
++        assert caplog.records[0].message == "Hello World"
++
++    def test_default_logger(self, caplog):
++        with qtlog.hide_qt_warning("secret"):
++            with caplog.at_level(logging.WARNING, 'qt'):
++                logger = logging.getLogger('qt')
++                logger.warning("secret token=xyz")
++        assert not caplog.records
++
++    def test_direct_filter(self, caplog):
++        filter_obj = qtlog.QtWarningFilter("Hidden", 'qt-direct')
++        record = logging.LogRecord(
++            name='qt-direct',
++            level=logging.WARNING,
++            pathname='',
++            lineno=0,
++            msg="Hidden message",
++            args=(),
++            exc_info=None,
++        )
++        assert filter_obj.filter(record) is False
++
++    def test_multi_logger_consistency(self, caplog):
++        logger_a = logging.getLogger('qt-multi-a')
++        logger_b = logging.getLogger('qt-multi-b')
++        with qtlog.hide_qt_warning("Blocked", 'qt-multi-a', 'qt-multi-b'):
++            with caplog.at_level(logging.WARNING, 'qt-multi-a'):
++                with caplog.at_level(logging.WARNING, 'qt-multi-b'):
++                    logger_a.warning("Blocked message")
++                    logger_b.warning("Blocked message")
++        assert not caplog.records
++============================================================================
++class TestHideQtWarning:
++=======
++        assert caplog.messages == ["Logged empty message!"]
++
++class TestHideQtWarning:
++
++
++===
++class TestHideQtWarning:
++
++    """Tests for hide_qt_warning/QtWarningFilter."""
++
++    @pytest.fixture
++    def qt_logger(self):
++        return logging.getLogger('qt-tests')
++
++    @pytest.mark.parametrize('line', [
++        "Hello",  # exact match
++        "Hello World",  # match at start of line
++        "  Hello World  ",  # match with spaces
++    ])
++    def test_filtered(self, qt_logger, caplog, line):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning(line)
++        assert not caplog.records
++
++    def test_cleanup_after_exit(self, qt_logger, caplog):
++        with qtlog.hide_qt_warning("Hello", 'qt-tests'):
++            with caplog.at_level(logging.WARNING, 'qt-tests'):
++                qt_logger.warning("Hello World")
++        assert len(caplog.records) == 1
++        assert caplog.records[0].message == "Hello World"
++
++    def test_default_logger(self, caplog):
++        with qtlog.hide_qt_warning("secret"):
++            with caplog.at_level(logging.WARNING, 'qt'):
++                logger = logging.getLogger('qt')
++                logger.warning("secret token=xyz")
++        assert not caplog.records
++
++    def test_direct_filter(self, caplog):
++        filter_obj = qtlog.QtWarningFilter("Hidden", 'qt-direct')
++        record = logging.LogRecord(
++            name='qt-direct',
++            level=logging.WARNING,
++            pathname='',
++            lineno=0,
++            msg="Hidden message",
++            args=(),
++            exc_info=None,
++        )
++        assert filter_obj.filter(record) is False
++
++    def test_multi_logger_consistency(self, caplog):
++        logger_a = logging.getLogger('qt-multi-a')
++        logger_b = logging.getLogger('qt-multi-b')
++        with qtlog.hide_qt_warning("Blocked", 'qt-multi-a', 'qt-multi-b'):
++            with caplog.at_level(logging.WARNING, 'qt-multi-a'):
++                with caplog.at_level(logging.WARNING, 'qt-multi-b'):
++====
++=======
++                    logger_a.warning("Blocked message")
++                    logger_b.warning("Blocked message")
++        assert not caplog.records
++====
++====
++

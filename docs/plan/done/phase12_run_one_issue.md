@@ -1,4 +1,4 @@
-根据 `scaleapi/SWE-bench_Pro-os` 的代码库和测试评估脚本 `swe_bench_pro_eval.py`，如果想在本地环境评估运行一个实例的测试，你可以使用官方提供的评测脚本。
+根据 `eval/SWE-bench_Pro-os` 的代码库和测试评估脚本 `swe_bench_pro_eval.py`，如果想在本地环境评估运行一个实例的测试，你可以使用仓库内提供的评测脚本。
 
 该脚本主要会拉取包含了整个运行环境与测试代码的 Docker 镜像，通过执行生成的代码 Patch 补丁（即模型预测出来的修改方案），然后运行这个实例内的 `run_script.sh` 测试文件，并比对测试结果是否通过。
 
@@ -25,10 +25,9 @@ pip install docker pandas tqdm
 ```
 
 ### 3. 克隆仓库以获取测试运行脚本
-在评估期间，脚本需要用到 `run_scripts` 和 `dockerfiles` 这两个目录里定义的辅助执行脚本（`run_script.sh`, `parser.py` 等）。
+在评估期间，脚本需要用到 `run_scripts` 和 `dockerfiles` 这两个目录里定义的辅助执行脚本（`run_script.sh`, `parser.py` 等）。在本仓库中它们位于 `eval/SWE-bench_Pro-os/` 下。
 ```bash
-git clone https://github.com/scaleapi/SWE-bench_Pro-os.git
-cd SWE-bench_Pro-os
+cd eval/SWE-bench_Pro-os
 ```
 
 ### 4. 运行评测命令
@@ -38,7 +37,7 @@ cd SWE-bench_Pro-os
 python swe_bench_pro_eval.py \
     --raw_sample_path=单个实例的数据.csv \
     --patch_path=你的补丁文件.json \
-    --output_dir=测试结果输出目录/ \
+  --output_dir=workdir/<issue_name>/eval_result/ \
     --scripts_dir=run_scripts \
     --dockerhub_username=jefzda \
     --use_local_docker
@@ -50,4 +49,4 @@ python swe_bench_pro_eval.py \
 2. 在本地通过 Docker 挂载一个 `/workspace`。
 3. 把你的 `patch.diff` 和它内置的测试脚本 `run_script.sh` 与 `parser.py` 写入 workspace。
 4. 容器启动后，自动打上你的代码补丁，然后运行测试 `bash /workspace/run_script.sh`。
-5. 脚本最终会收集 `output.json`，并与 `fail_to_pass` 和 `pass_to_pass` 期望结果比对，最终在 `output_dir` 生成 `eval_results.json` 判定是否成功修复。
+5. 脚本最终会收集 `output.json`，并与 `fail_to_pass` 和 `pass_to_pass` 期望结果比对，最终在 `workdir/<issue_name>/eval_result/` 生成 `eval_results.json` 判定是否成功修复。

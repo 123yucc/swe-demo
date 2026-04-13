@@ -31,7 +31,7 @@
 
 6. Phase F 端到端验证与回归（依赖 1-5）
 - 运行同一命令重放问题场景，验证 run_log 中出现：至少一次 Agent deep-search 调用、至少一次 post_tool_use auto-persist、非空 evidence 关键字段。
-- 验证输出产物：[workdir/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/evidence/evidence_cards.json](workdir/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/evidence/evidence_cards.json) 与 model_patch.diff 非空条件。
+- 验证输出产物：[workdir/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/outputs/evidence_cards.json](workdir/instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan/outputs/evidence_cards.json) 与 model_patch.diff 非空条件。
 - SDK 冲突检查：对照 [docs/claude_sdk_docs/sdk_references/python_sdk.md](docs/claude_sdk_docs/sdk_references/python_sdk.md) 的 max_turns/max_budget_usd 语义，必要时加上保护阈值避免新死循环。
 
 **Relevant files**

@@ -18,18 +18,19 @@ python -m src.main --index 0 --repo-dir /app
 python -m src.main --instance-id django__django-16046 --repo-dir /app
 
 # From local instance metadata JSON
-python -m src.main --instance-json workdir/swe_issue_001/instance_metadata.json \
+python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_metadata.json \
     --repo-dir workdir/swe_issue_001/repo
 ```
 
-**Output** written to `<output-dir>/` (defaults to `workdir/<instance_id>/evidence/`):
+**Output** written to `<output-dir>/` (defaults to `workdir/<issue_name>/outputs/` in `--instance-json` mode, otherwise `workdir/<instance_id>/outputs/`):
 - `evidence_cards.json` — structured evidence
 - `model_patch.diff` — git diff patch
 - `prediction.json` — SWE-bench eval format (`{instance_id, model_patch}`)
+- `patch_outcome.json` — closure-checker approval status and patch result (for long-term memory)
 
 ## API Credentials
 
-Config is loaded from `.env` at project root (no extra deps �??? simple key=value parser in `src/config.py`):
+Config is loaded from `.env` at project root (no extra deps — simple key=value parser in `src/config.py`):
 
 ```
 ANTHROPIC_API_KEY=sk-...
@@ -43,8 +44,25 @@ ANTHROPIC_BASE_URL=https://your-relay.example.com/v1  # optional, for proxy/rela
 ### State Machine
 
 ```
-Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence Refining �??? Closed
+Init -> (Parser) -> UnderSpecified --(deep-search)--> EvidenceRefining
+                        ^                                   |
+                        |                          (closure-checker)
+                        |                            /            \
+                    EVIDENCE_MISSING          CLOSURE_APPROVED
+                                                      |
+                                                    Closed
+                                                      |
+                                              (patch-planner)
+                                                      |
+                                                PatchPlanning
+                                                      |
+                                              (patch-generator)
+                                                /            \
+                                        PatchSuccess    PatchFailed
 ```
+
+Only the closure-checker subagent can transition from EvidenceRefining to Closed.
+No patch generation is allowed before Closed.
 
 ### Components
 
@@ -55,9 +73,13 @@ Init �??? (Parser) �??? UnderSpecified �??? (Deep Search) �??? Evidence 
 | Config | `src/config.py` | Reads `.env`, exposes `sdk_env()` |
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output (`output_format`) |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration (call chains, data flow, similar patterns); returns Markdown with `EXACT_LINES` block |
-| Orchestrator | `src/orchestrator/engine.py` | Main loop as a Claude Agent SDK agent; delegates to Deep Search via `Agent` tool; persists findings via `mcp__evidence__update_localization` and `mcp__evidence__cache_retrieved_code` |
-| MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` and `cache_retrieved_code` |
-| Data Models | `src/models/evidence.py`, `src/models/context.py`, `src/models/memory.py` | Pydantic v2 models for 4 evidence cards, session context, and `SharedWorkingMemory` |
+| Closure Checker Agent | `src/agents/closure_checker_agent.py` | Sole gatekeeper for evidence closure; evaluates all four cards against mandatory criteria; returns `CLOSURE_APPROVED` or `EVIDENCE_MISSING` with specific gaps |
+| Orchestrator | `src/orchestrator/engine.py` | State-machine driver; delegates to deep-search, closure-checker, patch-planner, and patch-generator via `Agent` tool; enforces state transitions host-side |
+| Patch Planner Agent | `src/agents/patch_planner_agent.py` | Reads evidence cards, produces structured PatchPlan via `submit_patch_plan` |
+| Patch Generator Agent | `src/agents/patch_generator_agent.py` | Reads PatchPlan and target files, applies SEARCH/REPLACE edits via `apply_search_replace` |
+| Evidence MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` and `cache_retrieved_code` |
+| Patch MCP Tools | `src/tools/patch_tools.py` | In-process MCP server exposing `submit_patch_plan` and `apply_search_replace` |
+| Data Models | `src/models/evidence.py`, `src/models/context.py`, `src/models/memory.py`, `src/models/patch.py` | Pydantic v2 models for 4 evidence cards, session context, `SharedWorkingMemory`, and `PatchPlan` |
 
 ### `src/` File Structure (with annotations)
 
@@ -72,12 +94,16 @@ src/
         __init__.py                    # Subpackage marker
         parser_agent.py                # Parses 4 artifact markdown files into structured EvidenceCards
         deep_search_agent.py           # Runs focused repository investigation using Grep/Read/Glob
+        closure_checker_agent.py       # Evaluates evidence completeness; sole closure gatekeeper
+        patch_planner_agent.py         # Reads evidence, produces structured PatchPlan
+        patch_generator_agent.py       # Executes PatchPlan via SEARCH/REPLACE edits
 
     models/
         __init__.py                    # Subpackage marker
         evidence.py                    # Definitions of Symptom/Constraint/Localization/Structural cards
         context.py                     # Top-level EvidenceCards and session-oriented context models
         memory.py                      # SharedWorkingMemory model used across orchestrator and sub-agents
+        patch.py                       # PatchPlan and FileEditPlan models
 
     orchestrator/
         __init__.py                    # Subpackage marker
@@ -85,7 +111,8 @@ src/
 
     tools/
         __init__.py                    # Subpackage marker
-        ingestion_tools.py             # Custom MCP tools: update_localization and cache_retrieved_code
+        ingestion_tools.py             # Evidence MCP tools: update_localization and cache_retrieved_code
+        patch_tools.py                 # Patch MCP tools: submit_patch_plan and apply_search_replace
 ```
 
 ### Four Evidence Cards（Pydantic 多维证据卡，字段中文说明）
@@ -145,16 +172,19 @@ src/
     定位卡回答“问题在什么位置”；
     结构卡回答“改动会牵连哪里”。
 
-### Orchestrator: Gap-Filling Loop
+### Orchestrator: State-Machine Driven Pipeline
 
-The orchestrator acts as an Information Foraging Orchestrator. After every Deep Search return it re-assesses each card for gaps (empty key fields) and dispatches targeted Deep Search TODOs until no evidence is still missing. It does NOT judge relevance �? only ensures cards have evidence.
+The orchestrator drives a 5-state machine (UnderSpecified, EvidenceRefining, Closed, PatchPlanning, PatchSuccess/PatchFailed). In the UnderSpecified state it dispatches deep-search to fill evidence gaps. After deep-search returns (EvidenceRefining), ONLY the closure-checker subagent can approve the transition to Closed. If the closure-checker returns EVIDENCE_MISSING, the orchestrator loops back to UnderSpecified with targeted deep-search tasks. No patch generation is permitted before Closed.
 
-### Hard Closure Rules (enforced in orchestrator prompt)
+Host-side safety nets in `engine.py` enforce these transitions: if the LLM skips closure-checker or attempts patches before closure, the host forces recovery turns.
 
-1. `exact_code_regions` must NOT be empty before declaring closure
+### Hard Closure Rules (enforced by closure-checker + host-side validation)
+
+1. `exact_code_regions` must NOT be empty before closure
 2. Localization must have at least one concrete file AND function in `suspect_entities`
 3. Do NOT close based on `TO-BE:` constraint items (those are requirements, not evidence)
 4. **Fact-alignment**: every entry written to JSON evidence cards must be grounded in what Deep Search actually found, not inferred from requirements
+5. **Closure-checker gate**: only the closure-checker subagent can approve the EvidenceRefining -> Closed transition; the orchestrator LLM must NOT self-judge closure
 
 ### SharedWorkingMemory (`src/models/memory.py`)
 
@@ -169,7 +199,9 @@ The memory is initialized after the Parser completes and injected into the orche
 ### Claude Agent SDK Integration
 
 - Parser Agent uses SDK structured output (`output_format` with `EvidenceCards.model_json_schema()`) to return typed evidence directly
-- Deep Search is registered as an `AgentDefinition` in the orchestrator's `agents={"deep-search": ...}` dict; the orchestrator invokes it via the `Agent` tool
+- Deep Search, Closure Checker, Patch Planner, and Patch Generator are registered as `AgentDefinition`s in the orchestrator's `agents={...}` dict; invoked via the `Agent` tool
+- Closure Checker receives no tools — it only evaluates evidence cards and returns a verdict
+- PostToolUse hooks auto-persist deep-search findings and track closure-checker verdicts
 - Orchestrator dispatches focused evidence context to Deep Search (not full JSON dump)
 - SDK docs: `docs/claude_sdk_docs/`
 - Phase-by-phase implementation plans: `docs/plan/`
@@ -183,7 +215,3 @@ The memory is initialized after the Parser completes and injected into the orche
 - The `exact_code_regions` output format must remain `path/to/file.py:LINE` or `path/to/file.py:LINE-LINE`
 - Constantly prioritize the cleanup of legacy artifacts; after each version iteration, rescan the entire codebase to remove obsolete code.
 
-
-
-
-�����Ļش��û�

@@ -78,10 +78,11 @@ Rules:
 Multi-dimensional extraction guidelines:
 ═══════════════════════════════════════════════════════════
 
-SYMPTOM CARD — extract from problem_statement.md and expected_and_current_behavior.md:
+SYMPTOM CARD — extract from problem_statement.md (and requirements.md for expected behaviour):
   • observable_failures: every visible symptom — error messages, exception types,
     stack traces, incorrect outputs, and any other observable anomalies.
   • repair_targets: what the fix should achieve — the expected correct behaviour.
+    Include requirements that describe the desired end-state.
   • regression_expectations: existing correct behaviours explicitly mentioned
     that MUST NOT break after the fix.
 
@@ -93,6 +94,10 @@ CONSTRAINT CARD — extract from requirements.md, new_interfaces.md:
   • backward_compatibility: backward-compatibility requirements.
   • similar_implementation_patterns: if the documents mention existing similar
     APIs or patterns to follow, record them here.  Leave empty if none mentioned.
+  • missing_elements_to_implement: classes, methods, or interfaces that
+    new_interfaces.md declares but do NOT yet exist in the codebase.  Record
+    each with its expected signature.  These are TO-BE items — the downstream
+    Deep Search agent will verify whether they truly are absent.
 
 LOCALIZATION CARD — extract from problem_statement.md and any file that names
   specific code locations:

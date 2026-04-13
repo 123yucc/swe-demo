@@ -220,7 +220,7 @@ in the `result` field.
 
 1. From the project root:
    ```bash
-   python -m src.main --instance-json workdir/swe_issue_001/instance_metadata.json \
+   python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_metadata.json \
        --repo-dir workdir/swe_issue_001/repo
    ```
 2. Verify in the run log:
@@ -229,13 +229,13 @@ in the `result` field.
      no `isolation` key was ever attempted (both are acceptable outcomes).
    - `[update_localization CALLED]` lines appear after every Deep Search
      return, whether driven by the orchestrator LLM or by the PostToolUse hook.
-   - `workdir/swe_issue_001/evidence/evidence_cards.json` has non-empty
+    - `workdir/swe_issue_001/outputs/evidence_cards.json` has non-empty
      `localization.exact_code_regions`, `localization.suspect_entities`, and
      `structural.must_co_edit_relations`.
 3. Confirm downstream `patch-planner` and `patch-generator` subagents now
    receive populated evidence and emit a non-empty `model_patch.diff`.
 4. Run the SWE-bench Pro evaluation per `docs/plan/phase12_run_one_issue.md`
-   and check `eval_results.json` for a resolved status.
+   and check `workdir/swe_issue_001/eval_result/eval_results.json` for a resolved status.
 
 ## Acceptance Criteria
 

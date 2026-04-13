@@ -1,0 +1,135 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "ACP does not accurately reflect email validation status of users (validated, pending, expired, or missing)",
+      "Expired confirmation keys prevent email validation even when they should still be actionable",
+      "Email status display in ACP is unclear or incorrect",
+      "\"Validate\" action fails when expected data (confirm:<code> object) is missing",
+      "\"Send validation email\" action fails when expected email data is missing or keys have expired",
+      "No fallback mechanism to locate user emails when primary key lookup fails"
+    ],
+    "repair_targets": [
+      "Accurate display of email status in ACP (validated, pending, expired, or missing) via email:pending and email:expired flags on user objects",
+      "Email confirmation remains valid until explicitly expired (use stored expires timestamp, not DB-level TTL)",
+      "Validation actions fallback to alternative sources (confirm:<code> object email field) to locate user emails when primary user profile email is missing",
+      "User.validateEmail handler retrieves email via getEmailForValidation and saves it to user profile before confirming",
+      "User.sendValidationEmail handler obtains correct email via getEmailForValidation and passes it explicitly",
+      "User account deletion invokes User.email.expireValidation(uid) to clean up pending confirmation data",
+      "New getConfirmObjs() helper fetches confirmation codes using db.mget() and resolves expiry timestamps"
+    ],
+    "regression_expectations": [
+      "Existing database adapter API contracts must be respected (no signature changes to existing methods)",
+      "Standard or high-quality image/user inputs must not be negatively impacted by changes",
+      "loadUserInfo() must still return all existing user fields; only new flags are added",
+      "Existing confirmation expiry logic (database TTL) must not be broken for other code paths that rely on it"
+    ]
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "db.mget(keys: string[]): Promise<(string | null)[]> — batch retrieve values by keys, preserving input order; null for missing keys",
+      "user.email.getEmailForValidation(uid: number): Promise<string | null> — falls back from user:<uid> email to confirm:<code> email, only if UID matches",
+      "User.email.isValidationPending(uid, email): returns true only if confirmation object exists, current time < expires timestamp, and email matches if provided",
+      "User.email.canSendValidation(uid, email): interval check uses stored TTL timestamp (or current time as baseline) + configured interval against max confirmation period"
+    ],
+    "behavioral_constraints": [
+      "TO-BE: db.mget must be implemented in src/database/mongo/main.js, src/database/postgres/main.js, and src/database/redis/main.js",
+      "TO-BE: db.mget must use client.mget for Redis, $in filter on _key for MongoDB, JOIN of legacy_object_live and legacy_string for PostgreSQL",
+      "TO-BE: db.mget must preserve input key order and return null at the corresponding index for any key not found",
+      "TO-BE: loadUserInfo(callerUid, uids) must attach email:pending and email:expired flags derived by resolving confirm:byUid:<uid> keys via getConfirmObjs()",
+      "TO-BE: getConfirmObjs() within loadUserInfo() uses db.mget() on confirm:byUid:<uid> keys then db.getObjects() on confirm:<code> keys",
+      "TO-BE: User.email.sendValidationEmail must store expires as Unix timestamp in milliseconds in confirm:<code> instead of relying on DB-level TTL",
+      "TO-BE: user.email.getEmailForValidation must first try user:<uid> email, then fallback to confirm:<code> email field",
+      "TO-BE: user.email.expireValidation(uid) must be called on user account deletion"
+    ],
+    "backward_compatibility": [
+      "Existing db.get, db.getObject, db.set, db.sortedSetAdd signatures must not be changed",
+      "loadUserInfo return shape must remain backward compatible (existing fields unchanged, new flags added)",
+      "Database adapter method signatures outside of mget must not change"
+    ],
+    "similar_implementation_patterns": [
+      "Existing db.getObject() and db.getObjects() patterns in database adapters as reference for mget implementation",
+      "Existing user.email.confirmByUid() pattern for how confirmation logic currently works",
+      "Existing TTL/expires handling in confirmation system as baseline for new timestamp-based expiry"
+    ],
+    "missing_elements_to_implement": [
+      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/mongo/main.js",
+      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/postgres/main.js",
+      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/redis/main.js",
+      "getConfirmObjs() helper function within loadUserInfo() in src/user/index.js or related user module",
+      "user.email.getEmailForValidation(uid: number): Promise<string | null> in src/user/email.js",
+      "User.email.expireValidation(uid) invocation on user account deletion (caller site and method must both exist)"
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "src/database/mongo/main.js — missing db.mget implementation",
+      "src/database/postgres/main.js — missing db.mget implementation",
+      "src/database/redis/main.js — missing db.mget implementation",
+      "src/user/index.js or src/user/*.js — loadUserInfo function missing email:pending and email:expired flag logic",
+      "src/user/email.js — missing getEmailForValidation, insufficient isValidationPending/canSendValidation, missing expires timestamp storage in sendValidationEmail",
+      "src/user/email.js — User.validateEmail handler missing getEmailForValidation call",
+      "src/user/email.js — User.sendValidationEmail handler missing getEmailForValidation call and email passthrough",
+      "User deletion path — missing User.email.expireValidation(uid) call",
+      "src/database/mongo/main.js — db.mget EXISTS but reads only d.data, never d.value (latent inconsistency)",
+      "src/database/postgres/main.js — db.mget EXISTS but has LIMIT 1 bug causing incorrect results with multiple keys",
+      "src/database/redis/main.js — db.mget EXISTS and appears correct",
+      "src/controllers/admin/users.js:170-207 — loadUserInfo correctly uses db.mget + db.getObjects to derive email:pending and email:expired flags",
+      "src/user/email.js — all functions exist: getEmailForValidation (54-67), isValidationPending (69-75), canSendValidation (92-103), sendValidationEmail with expires timestamp (166), expireValidation (83-90)",
+      "src/socket.io/admin/user.js — User.validateEmail (65-77) and User.sendValidationEmail (79-104) correctly call getEmailForValidation",
+      "src/user/delete.js:170 — User.deleteAccount correctly calls User.email.expireValidation(uid)",
+      "src/user/email.js:128-130 — sendValidationEmail falls back to stored email (not confirm object email) when options.email is not provided — potential wrong email sent for pending email changes"
+    ],
+    "exact_code_regions": [
+      "src/database/mongo/main.js:93-109",
+      "src/database/postgres/main.js:177-199",
+      "src/database/redis/main.js:66-71",
+      "src/user/email.js:54-67",
+      "src/user/email.js:69-75",
+      "src/user/email.js:77-81",
+      "src/user/email.js:83-90",
+      "src/user/email.js:92-103",
+      "src/user/email.js:105-183",
+      "src/user/email.js:186-221",
+      "src/user/email.js:224-261",
+      "src/user/delete.js:170",
+      "src/controllers/admin/users.js:170-207",
+      "src/socket.io/admin/user.js:65-77",
+      "src/socket.io/admin/user.js:79-104"
+    ],
+    "call_chain_context": [
+      "getUsers (controllers/admin/users.js) -> loadUserInfo -> db.mget(confirm:byUid:<uid> keys) -> db.getObjects(confirm:<code> keys) -> email:pending/email:expired flags",
+      "User.validateEmail (socket.io/admin/user.js:65) -> user.email.getEmailForValidation(uid) -> user.setUserField + user.email.confirmByUid",
+      "User.sendValidationEmail (socket.io/admin/user.js:79) -> user.email.getEmailForValidation(uid) -> user.email.sendValidationEmail(uid, {email})",
+      "User.deleteAccount (delete.js:170) -> User.email.expireValidation(uid) -> db.deleteAll([confirm:byUid:<uid>, confirm:<code>])",
+      "UserEmail.confirmByCode (email.js:186) -> reads confirm:<code> -> calls expireValidation on expiry/mismatch"
+    ],
+    "dataflow_relevant_uses": [
+      "confirm:byUid:<uid> key stores the active code string; read by getEmailForValidation, isValidationPending, canSendValidation, expireValidation, loadUserInfo",
+      "confirm:<code> hash stores {email, uid, expires}; expires = Date.now() + emailConfirmExpiry hours",
+      "confirmObj.expires used by isValidationPending (email.js:72) and loadUserInfo (admin/users.js:200-201) to determine expired vs pending",
+      "user.email.getEmailForValidation reads confirm:byUid:<uid> then confirm:<code>.email when uid matches",
+      "User.email.sendValidationEmail stores expires as Date.now() + emailConfirmExpiry * 3600000 (milliseconds) at email.js:166"
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "src/database/mongo/main.js, src/database/postgres/main.js, src/database/redis/main.js — db.mget must be implemented in all three adapters simultaneously",
+      "src/user/email.js — getEmailForValidation must be called by both User.validateEmail and User.sendValidationEmail",
+      "src/user/index.js (or user/info.js) — loadUserInfo must be updated to use getConfirmObjs() and attach email:pending and email:expired flags",
+      "User deletion path — wherever user deletion is handled must call User.email.expireValidation(uid)",
+      "src/database/postgres/main.js — LIMIT 1 bug in mget SQL must be fixed for bulk confirmation lookups to work correctly",
+      "src/controllers/admin/users.js:174-179 — depends on db.mget returning results in input key order; LIMIT 1 bug causes incorrect results",
+      "src/user/email.js:128-130 — sendValidationEmail fallback uses stored email instead of pending confirm email; may send to wrong address for pending email changes"
+    ],
+    "dependency_propagation": [
+      "db.mget implementation in all three adapters is a prerequisite for getConfirmObjs() in loadUserInfo()",
+      "getConfirmObjs() result (confirm objects with expires timestamps) feeds the email:pending and email:expired flags in loadUserInfo()",
+      "User.email.sendValidationEmail storing expires timestamp in the confirmation object enables isValidationPending() and canSendValidation() correctness",
+      "getEmailForValidation() result is consumed by User.validateEmail (to set user field) and User.sendValidationEmail (to pass as email option)",
+      "User.email.expireValidation(uid) cleanup prevents stale confirmation data from persisting after user deletion",
+      "db.mget in postgres has LIMIT 1 bug — when multiple keys passed, only first result returned, breaking loadUserInfo email:pending/email:expired flag computation",
+      "db.mget correctness in all three adapters is prerequisite for loadUserInfo to display accurate email validation status in ACP",
+      "email.js:128-130 fallback logic determines what email receives validation message when ACP resends for pending email changes"
+    ]
+  }
+}

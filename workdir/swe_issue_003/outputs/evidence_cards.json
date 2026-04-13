@@ -1,0 +1,129 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "Requests to /.well-known/webfinger return HTTP 404 — no such endpoint exists",
+      "The /.well-known/change-password route is embedded in a user-specific route file, not a .well-known-specific router, reducing maintainability"
+    ],
+    "repair_targets": [
+      "Implement GET /.well-known/webfinger endpoint returning WebFinger-compliant JSON (subject, aliases, links)",
+      "Create src/controllers/well-known.js with webfinger handler including resource validation, authorization check, user resolution, and JSON response construction",
+      "Create src/routes/well-known.js defining both /.well-known/webfinger and /.well-known/change-password routes",
+      "Move /.well-known/change-password redirect from user-specific route module to src/routes/well-known.js",
+      "Integrate new well-known router into main route composition at app startup"
+    ],
+    "regression_expectations": [
+      "Existing route definitions must continue to work after changes",
+      "The /.well-known/change-password redirect must still redirect to /me/edit/password after being moved",
+      "Authentication and authorization system for other endpoints must remain unaffected",
+      "The privileges API must remain functional for other endpoints using groups:view:users permission"
+    ]
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "webfinger function accepts req (Express Request) with query.param.resource and res (Express Response)",
+      "Route module signature: (app, middleware, controllers) → void",
+      "Authorization gated by groups:view:users global permission via existing privileges API",
+      "Resource param format: acct:username@hostname where hostname == nconf.get('url_parsed').hostname"
+    ],
+    "behavioral_constraints": [
+      "TO-BE: webfinger handler must return HTTP 400 if resource query param is missing",
+      "TO-BE: webfinger handler must return HTTP 400 if resource does not begin with acct:",
+      "TO-BE: webfinger handler must return HTTP 400 if resource does not end with nconf.get('url_parsed').hostname",
+      "TO-BE: webfinger handler must return HTTP 404 if the user identified by the username portion of resource cannot be resolved",
+      "TO-BE: webfinger handler must return HTTP 403 if req.uid lacks the groups:view:users global permission",
+      "TO-BE: for unauthenticated requests (req.uid absent), authorization must be evaluated as the Guest role using the existing privileges API",
+      "TO-BE: on valid requests, response JSON must include subject field set to the original resource string",
+      "TO-BE: on valid requests, response JSON aliases array must contain both UID-based and slug-based user profile URLs",
+      "TO-BE: on valid requests, response JSON links array must include at least one entry referencing the user's HTML profile page (canonical /user/<slug> URL)",
+      "TO-BE: /.well-known/change-password must redirect requests to /me/edit/password independently of user authentication context"
+    ],
+    "backward_compatibility": [
+      "The /.well-known/change-password redirect behavior must be preserved after being moved from the user-specific route module to src/routes/well-known.js"
+    ],
+    "similar_implementation_patterns": [
+      "Use existing privileges API (similar to other permission-gated endpoints) for Guest role authorization check",
+      "Follow existing NodeBB route/controller file pattern (src/controllers/<module>.js + src/routes/<module>.js)",
+      "Integrate into main route composition at app startup, similar to other route modules"
+    ],
+    "missing_elements_to_implement": [
+      "src/controllers/well-known.js:webfinger(req: Request, res: Response) — handles GET /.well-known/webfinger, validates resource, checks authorization via privileges API (Guest role for unauthenticated), resolves username/slug to UID, returns { subject, aliases, links }",
+      "src/routes/well-known.js: route configuration module — mounts /.well-known/change-password (redirect to /me/edit/password) and GET /.well-known/webfinger delegating to controllers['well-known'].webfinger"
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "src/routes/well-known.js (new file — does not exist yet)",
+      "src/controllers/well-known.js (new file — does not exist yet)",
+      "User-specific route module where /.well-known/change-password is currently embedded (requires removal of redirect logic)",
+      "Main route composition file (requires integration of new well-known route)",
+      "src/routes/well-known.js (new file — already exists untracked, already wired in routes/index.js)",
+      "src/controllers/well-known.js (new file — already exists untracked, already implemented)",
+      "src/routes/index.js (line 25: wellKnown registration, line 154: _mounts.wellKnown call)",
+      "src/controllers/index.js (well-known controller NOT registered — inconsistency with other controllers)",
+      "src/controllers/well-known.js (webfinger function, lines 12-49; changePassword function, lines 8-10)",
+      "src/routes/well-known.js (route module, lines 1-8)",
+      "src/routes/index.js (well-known registration line 25, mounting line 154)",
+      "src/controllers/index.js (Controllers.wellKnown MISSING from export — no require('./well-known') line exists)"
+    ],
+    "exact_code_regions": [
+      "src/routes/well-known.js:1-8",
+      "src/controllers/well-known.js:1-50",
+      "src/routes/index.js:25",
+      "src/routes/index.js:154",
+      "src/privileges/global.js:1-80",
+      "src/middleware/user.js:138-147",
+      "src/controllers/index.js:1-42",
+      "src/controllers/index.js:14-41",
+      "src/routes/index.js:19-26",
+      "src/routes/index.js:153-154",
+      "src/routes/user.js:1-52"
+    ],
+    "call_chain_context": [
+      "src/start.js -> src/webserver.js -> src/routes/index.js -> _mounts.wellKnown(app, middleware, controllers) -> src/routes/well-known.js -> controllers['well-known'].webfinger",
+      "src/routes/well-known.js:6 -> app.get('/.well-known/webfinger', controllers.webfinger)",
+      "src/middleware/user.js:138-147 -> privileges.global.can('view:users', req.uid) for authorization",
+      "src/user/index.js:97-102 -> user.getUidByUsername(username) for user resolution",
+      "src/routes/index.js:154 -> _mounts.wellKnown(app, middleware, controllers) -> src/routes/well-known.js",
+      "src/routes/well-known.js:6 -> app.get('/.well-known/webfinger', controllers.webfinger) -> src/controllers/well-known.js:webfinger",
+      "src/routes/well-known.js:7 -> app.use('/.well-known/change-password', controllers.changePassword) -> src/controllers/well-known.js:changePassword",
+      "src/controllers/well-known.js:31 -> user.getUidByUsername(username) -> src/user/index.js:97-102"
+    ],
+    "dataflow_relevant_uses": [
+      "src/controllers/well-known.js:24-25: const url = nconf.get('url'); new URL(url).hostname for hostname extraction",
+      "src/controllers/well-known.js:31: const uid = await user.getUidByUsername(username) for user lookup",
+      "src/controllers/well-known.js:36: const userslug = await user.getUserField(uid, 'userslug') for profile URL construction",
+      "src/privileges/global.js:58: view:users maps to groups:view:users via automatic group key construction",
+      "src/middleware/user.js:142: privileges.global.can('view:users', req.uid) — same privilege used by webfinger",
+      "src/controllers/well-known.js:13: req.query.resource — webfinger input",
+      "src/controllers/well-known.js:24-25: nconf.get('url') + new URL(url).hostname — hostname validation",
+      "src/controllers/well-known.js:9: nconf.get('relative_path') — change-password redirect target",
+      "src/controllers/well-known.js:31: user.getUidByUsername(username) — user resolution",
+      "src/controllers/well-known.js:36: user.getUserField(uid, 'userslug') — profile URL construction",
+      "src/privileges/global.js:58: view:users -> groups:view:users automatic group key mapping"
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "New src/routes/well-known.js must be integrated into main route composition (app startup)",
+      "The /.well-known/change-password redirect logic must be REMOVED from the user-specific route module when added to src/routes/well-known.js",
+      "If src/routes/well-known.js is modified — no other files need co-edits, already wired",
+      "If src/controllers/index.js changes — well-known controller not registered there (inconsistency to fix)",
+      "Controllers.wellKnown registration in src/controllers/index.js requires ONLY adding one line: Controllers.wellKnown = require('./well-known') — no other file changes needed",
+      "src/routes/well-known.js and src/controllers/well-known.js must be committed together (already paired)",
+      "src/routes/user.js does NOT contain /.well-known/change-password — no removal needed from user routes"
+    ],
+    "dependency_propagation": [
+      "Authorization check for webfinger endpoint depends on groups:view:users global permission via existing privileges API",
+      "Hostname validation for resource param depends on nconf.get('url_parsed').hostname",
+      "New well-known router must be integrated into main route composition and mounted during app startup",
+      "Authorization for webfinger endpoint: privileges.global.can('view:users', req.uid) from src/middleware/user.js:142",
+      "Hostname validation: nconf.get('url') pattern from src/controllers/well-known.js:24-25",
+      "User resolution: user.getUidByUsername(username) from src/user/index.js:97-102",
+      "Group privilege key mapping: view:users -> groups:view:users via src/privileges/global.js:58",
+      "nconf url/relative_path config -> src/controllers/well-known.js lines 3, 9, 24 for hostname validation and redirect target",
+      "user module -> src/controllers/well-known.js lines 4, 31, 36 for user resolution and slug lookup",
+      "privileges.global.can('view:users', req.uid) -> src/middleware/user.js:142, but webfinger controller does NOT currently call this — authorization check is TO-BE",
+      "src/routes/index.js _mounts object (line 25) -> src/routes/well-known.js -> src/controllers/well-known.js"
+    ]
+  }
+}

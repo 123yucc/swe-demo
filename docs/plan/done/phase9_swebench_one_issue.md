@@ -3,7 +3,7 @@
 
 
 
-根据 `scaleapi/SWE-bench_Pro-os` 的官方文档，要获取单个 SWE-bench Pro 实例的问题描述（issue description）、代码库（codebase）以及 Docker 镜像文件，可以通过使用 HuggingFace 的 `datasets` 库并访问预构建的 Docker 镜像来实现。
+根据 `eval/SWE-bench_Pro-os` 的官方文档，要获取单个 SWE-bench Pro 实例的问题描述（issue description）、代码库（codebase）以及 Docker 镜像文件，可以通过使用 HuggingFace 的 `datasets` 库并访问预构建的 Docker 镜像来实现。
 
 具体步骤如下：
 

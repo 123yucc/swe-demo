@@ -13,7 +13,7 @@ Usage:
   python -m src.main --instance-id django__django-16046 --repo-dir /app
 
   # From a local instance metadata JSON:
-  python -m src.main --instance-json workdir/swe_issue_001/instance_metadata.json \
+    python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_metadata.json \
       --repo-dir workdir/swe_issue_001/repo
 """
 
@@ -107,7 +107,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Output directory. Defaults to workdir/<instance_id>/evidence.",
+        help=(
+            "Output directory. Defaults to workdir/<issue_name>/outputs for "
+            "--instance-json mode, otherwise workdir/<instance_id>/outputs."
+        ),
     )
 
     args = parser.parse_args()
@@ -138,7 +141,16 @@ def main() -> None:
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path("workdir") / instance_id / "evidence"
+        if args.instance_json:
+            instance_json_path = Path(args.instance_json).resolve()
+            # Preferred layout: workdir/<issue_name>/artifacts/instance_metadata.json
+            if instance_json_path.parent.name == "artifacts":
+                issue_dir = instance_json_path.parent.parent
+            else:
+                issue_dir = instance_json_path.parent
+            output_dir = issue_dir / "outputs"
+        else:
+            output_dir = Path("workdir") / instance_id / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Convert instance to artifact text ---

