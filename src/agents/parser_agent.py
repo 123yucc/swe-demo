@@ -1,155 +1,114 @@
 """
-Parser sub-agent: reads 4 Markdown artifact files and extracts
-structured EvidenceCards via SDK structured output (output_format).
+Parser sub-agent: reads the SWE-bench Pro problem statement text and extracts
+structured EvidenceCards.
+
+Structured output is produced via the relay-compatible helper
+(src/agents/_structured.py), not the SDK's output_format — see docs/api.md
+for the relay-adaptation rationale.
 """
 
 import asyncio
 from pathlib import Path
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
-
-from src.config import sdk_env
+from src.agents._structured import run_structured_query
 from src.models.context import EvidenceCards
 
 
-def _deref_schema(schema: dict) -> dict:
-    """Inline all $ref references, removing $defs.
-
-    The Claude Agent SDK does not support $ref as a direct property value
-    (only inside 'items'). This function resolves all $ref pointers so the
-    schema is fully self-contained.
-    """
-    defs = schema.get("$defs", {})
-
-    def _resolve(node):
-        if isinstance(node, dict):
-            if "$ref" in node:
-                ref_name = node["$ref"].split("/")[-1]
-                resolved = dict(defs[ref_name])
-                for k, v in node.items():
-                    if k != "$ref":
-                        resolved[k] = v
-                return _resolve(resolved)
-            return {k: _resolve(v) for k, v in node.items() if k != "$defs"}
-        if isinstance(node, list):
-            return [_resolve(item) for item in node]
-        return node
-
-    return _resolve(schema)
-
-
-# Auto-generated from Pydantic model, then dereferenced for SDK compatibility.
-_EVIDENCE_CARDS_SCHEMA = _deref_schema(EvidenceCards.model_json_schema())
-
 PARSER_SYSTEM_PROMPT = """\
-You are a precise and methodical software-defect analyst.
+You are a software-defect analyst. Read the SWE-bench Pro problem statement
+(may contain "Requirements:" and "New interfaces introduced:" sections) and
+emit JSON matching the required schema. No Markdown, no prose, no guessing.
 
-Your task is to read a set of issue artifact documents (provided in the user
-message) and extract structured evidence into four multi-dimensional cards.
-Return your analysis as a JSON object matching the required schema — that is
-your ONLY output.  Do NOT return plain text or Markdown.
+Fill ONLY these fields. Leave every other field as an empty list.
 
-═══════════════════════════════════════════════════════════
-CRITICAL: AS-IS vs TO-BE — You MUST distinguish these two states at all times.
-═══════════════════════════════════════════════════════════
+symptom.observable_failures
+  Visible symptoms from the problem statement (errors, traces, wrong output).
+symptom.repair_targets
+  The fix's end-goal behavior, stated in the problem statement.
+symptom.regression_expectations
+  Correct behaviors the problem statement says MUST NOT break.
 
-• AS-IS  = the CURRENT state of the codebase (what exists right now).
-• TO-BE  = the DESIRED future state described in requirement / interface
-           documents (e.g. new_interfaces.md, desired_*.md).
+constraint.missing_elements_to_implement
+  New API signatures from "New interfaces introduced:" (verbatim, one per entry).
+  If the section is absent, leave empty.
 
-Rules:
-1. Documents named new_interfaces.md, desired_*.md, expected_*.md, or any file
-   that describes NEW APIs / behaviours to be implemented are TO-BE documents.
-   The interfaces and methods they describe DO NOT yet exist in the codebase.
+requirements
+  One RequirementItem per line in the "Requirements:" section (and per top-level
+  expectation in "New interfaces introduced:"). For each item:
+    - id:      "req-001", "req-002", ... in input order
+    - text:    the verbatim requirement line (do NOT truncate or paraphrase)
+    - origin:  "requirements" for items under Requirements:,
+               "new_interfaces" for items under New interfaces introduced:.
+               Do NOT use "problem_statement" — problem-statement facts belong
+               in symptom.* instead.
+    - verdict: always "UNCHECKED"
+    - evidence_locations: []
+    - findings: ""
 
-2. NEVER treat a TO-BE specification as an AS-IS fact.
-   Example: if new_interfaces.md says "add set_detection_sensitivity()", that
-   method does NOT exist yet — do NOT write that it "already exists".
+schema_version: "v2".
 
-3. In the constraint card, use the `behavioral_constraints` field to record
-   TO-BE requirements with the explicit prefix "TO-BE: ", e.g.:
-     "TO-BE: add method set_detection_sensitivity(min_face_size_factor, confidence_threshold_offset)"
-   This marks it as something that must be ADDED, not something already present.
-
-4. Extract ONLY what the documents explicitly state.  Do NOT infer, invent, or
-   add capabilities that are not literally written in the documents.
-
-═══════════════════════════════════════════════════════════
-Multi-dimensional extraction guidelines:
-═══════════════════════════════════════════════════════════
-
-SYMPTOM CARD — extract from problem_statement.md (and requirements.md for expected behaviour):
-  • observable_failures: every visible symptom — error messages, exception types,
-    stack traces, incorrect outputs, and any other observable anomalies.
-  • repair_targets: what the fix should achieve — the expected correct behaviour.
-    Include requirements that describe the desired end-state.
-  • regression_expectations: existing correct behaviours explicitly mentioned
-    that MUST NOT break after the fix.
-
-CONSTRAINT CARD — extract from requirements.md, new_interfaces.md:
-  • semantic_boundaries: API contracts, documented constraints in docstrings
-    or annotations, function signatures that must be respected.
-  • behavioral_constraints: assertions, invariants, schema constraints, and
-    TO-BE requirements (prefixed "TO-BE: ").
-  • backward_compatibility: backward-compatibility requirements.
-  • similar_implementation_patterns: if the documents mention existing similar
-    APIs or patterns to follow, record them here.  Leave empty if none mentioned.
-  • missing_elements_to_implement: classes, methods, or interfaces that
-    new_interfaces.md declares but do NOT yet exist in the codebase.  Record
-    each with its expected signature.  These are TO-BE items — the downstream
-    Deep Search agent will verify whether they truly are absent.
-
-LOCALIZATION CARD — extract from problem_statement.md and any file that names
-  specific code locations:
-  • suspect_entities: suspected files, classes, functions, or variables.
-  • exact_code_regions: leave EMPTY unless documents cite exact line numbers.
-  • call_chain_context: leave EMPTY — will be filled by Deep Search.
-  • dataflow_relevant_uses: leave EMPTY — will be filled by Deep Search.
-
-STRUCTURAL CARD — extract from requirements.md, new_interfaces.md:
-  • must_co_edit_relations: if the documents mention that changing one place
-    requires updating another (e.g. "update both the model and the serializer"),
-    record those pairs here.
-  • dependency_propagation: cross-cutting dependencies mentioned in the docs
-    (e.g. "config changes propagate to module X").
-
-If the documents do not provide information for a field, leave it as an empty
-list — do NOT guess.
+All other fields (constraint.behavioral_constraints, semantic_boundaries,
+backward_compatibility, similar_implementation_patterns, localization.*,
+structural.*) are deep-search's responsibility. You MUST leave them empty.
 """
 
 
+_PARSER_FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
+    "localization": (
+        "suspect_entities",
+        "exact_code_regions",
+        "call_chain_context",
+        "dataflow_relevant_uses",
+    ),
+    "structural": (
+        "must_co_edit_relations",
+        "dependency_propagation",
+    ),
+    "constraint": (
+        "behavioral_constraints",
+        "semantic_boundaries",
+        "backward_compatibility",
+        "similar_implementation_patterns",
+    ),
+}
+
+
+def _enforce_parser_field_whitelist(evidence: EvidenceCards) -> None:
+    """Force parser-output to only populate parser-owned fields.
+
+    Phase 16 field-ownership rules: Parser owns symptom.*,
+    constraint.missing_elements_to_implement, and requirements[].  Any
+    deep-search-owned field accidentally filled by the parser is cleared
+    and a warning is logged.
+    """
+    cleared: list[str] = []
+    for card_name, field_names in _PARSER_FORBIDDEN_FIELDS.items():
+        card = getattr(evidence, card_name)
+        for field_name in field_names:
+            if getattr(card, field_name):
+                cleared.append(f"{card_name}.{field_name}")
+                setattr(card, field_name, [])
+
+    if cleared:
+        print(
+            f"[parser] field-whitelist: cleared deep-search-owned fields "
+            f"the parser should not populate: {cleared}",
+            flush=True,
+        )
+
+
 async def _run_parser_async(md_contents: str) -> EvidenceCards:
-    options = ClaudeAgentOptions(
+    evidence = await run_structured_query(
         system_prompt=PARSER_SYSTEM_PROMPT,
+        user_prompt=md_contents,
+        response_model=EvidenceCards,
+        component="parser",
         allowed_tools=[],
-        permission_mode="acceptEdits",
-        output_format={
-            "type": "json_schema",
-            "schema": _EVIDENCE_CARDS_SCHEMA,
-        },
-        env=sdk_env(),
+        max_turns=10,
+        max_budget_usd=1.0,
     )
-
-    result_message: ResultMessage | None = None
-    async for message in query(prompt=md_contents, options=options):
-        if isinstance(message, ResultMessage):
-            result_message = message
-
-    if result_message is None:
-        raise RuntimeError("Parser agent returned no ResultMessage.")
-
-    if result_message.subtype == "error_max_structured_output_retries":
-        raise RuntimeError(
-            "Parser agent failed to produce valid structured output after retries."
-        )
-
-    if result_message.structured_output is None:
-        raise RuntimeError(
-            "Parser agent ResultMessage has no structured_output. "
-            f"subtype={result_message.subtype}"
-        )
-
-    return EvidenceCards.model_validate(result_message.structured_output)
+    _enforce_parser_field_whitelist(evidence)
+    return evidence
 
 
 def run_parser(md_contents: str) -> EvidenceCards:

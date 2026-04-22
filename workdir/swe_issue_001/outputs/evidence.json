@@ -1,135 +1,295 @@
 {
   "symptom": {
     "observable_failures": [
-      "ACP does not accurately reflect email validation status of users (validated, pending, expired, or missing)",
-      "Expired confirmation keys prevent email validation even when they should still be actionable",
-      "Email status display in ACP is unclear or incorrect",
-      "\"Validate\" action fails when expected data (confirm:<code> object) is missing",
-      "\"Send validation email\" action fails when expected email data is missing or keys have expired",
-      "No fallback mechanism to locate user emails when primary key lookup fails"
+      "The Admin Control Panel (ACP) does not accurately reflect the email validation status of users",
+      "Expired confirmation keys prevented email validation",
+      "The email status was unclear or incorrect in ACP",
+      "\"Validate\" and \"Send validation email\" actions failed when the expected data was missing",
+      "Validation and confirmation processes rely on key expiration, which can prevent correct verification if the keys expire",
+      "No fallback to recover the email if it's not found under the expected keys"
     ],
     "repair_targets": [
-      "Accurate display of email status in ACP (validated, pending, expired, or missing) via email:pending and email:expired flags on user objects",
-      "Email confirmation remains valid until explicitly expired (use stored expires timestamp, not DB-level TTL)",
-      "Validation actions fallback to alternative sources (confirm:<code> object email field) to locate user emails when primary user profile email is missing",
-      "User.validateEmail handler retrieves email via getEmailForValidation and saves it to user profile before confirming",
-      "User.sendValidationEmail handler obtains correct email via getEmailForValidation and passes it explicitly",
-      "User account deletion invokes User.email.expireValidation(uid) to clean up pending confirmation data",
-      "New getConfirmObjs() helper fetches confirmation codes using db.mget() and resolves expiry timestamps"
+      "Accurate display of email status in ACP (validated, pending, expired, or missing)",
+      "Email confirmation should remain valid until it explicitly expires",
+      "Validation actions should fallback to alternative sources to locate user emails"
     ],
-    "regression_expectations": [
-      "Existing database adapter API contracts must be respected (no signature changes to existing methods)",
-      "Standard or high-quality image/user inputs must not be negatively impacted by changes",
-      "loadUserInfo() must still return all existing user fields; only new flags are added",
-      "Existing confirmation expiry logic (database TTL) must not be broken for other code paths that rely on it"
-    ]
+    "regression_expectations": []
   },
   "constraint": {
-    "semantic_boundaries": [
-      "db.mget(keys: string[]): Promise<(string | null)[]> — batch retrieve values by keys, preserving input order; null for missing keys",
-      "user.email.getEmailForValidation(uid: number): Promise<string | null> — falls back from user:<uid> email to confirm:<code> email, only if UID matches",
-      "User.email.isValidationPending(uid, email): returns true only if confirmation object exists, current time < expires timestamp, and email matches if provided",
-      "User.email.canSendValidation(uid, email): interval check uses stored TTL timestamp (or current time as baseline) + configured interval against max confirmation period"
-    ],
-    "behavioral_constraints": [
-      "TO-BE: db.mget must be implemented in src/database/mongo/main.js, src/database/postgres/main.js, and src/database/redis/main.js",
-      "TO-BE: db.mget must use client.mget for Redis, $in filter on _key for MongoDB, JOIN of legacy_object_live and legacy_string for PostgreSQL",
-      "TO-BE: db.mget must preserve input key order and return null at the corresponding index for any key not found",
-      "TO-BE: loadUserInfo(callerUid, uids) must attach email:pending and email:expired flags derived by resolving confirm:byUid:<uid> keys via getConfirmObjs()",
-      "TO-BE: getConfirmObjs() within loadUserInfo() uses db.mget() on confirm:byUid:<uid> keys then db.getObjects() on confirm:<code> keys",
-      "TO-BE: User.email.sendValidationEmail must store expires as Unix timestamp in milliseconds in confirm:<code> instead of relying on DB-level TTL",
-      "TO-BE: user.email.getEmailForValidation must first try user:<uid> email, then fallback to confirm:<code> email field",
-      "TO-BE: user.email.expireValidation(uid) must be called on user account deletion"
-    ],
-    "backward_compatibility": [
-      "Existing db.get, db.getObject, db.set, db.sortedSetAdd signatures must not be changed",
-      "loadUserInfo return shape must remain backward compatible (existing fields unchanged, new flags added)",
-      "Database adapter method signatures outside of mget must not change"
-    ],
+    "semantic_boundaries": [],
+    "behavioral_constraints": [],
+    "backward_compatibility": [],
     "similar_implementation_patterns": [
-      "Existing db.getObject() and db.getObjects() patterns in database adapters as reference for mget implementation",
-      "Existing user.email.confirmByUid() pattern for how confirmation logic currently works",
-      "Existing TTL/expires handling in confirmation system as baseline for new timestamp-based expiry"
+      "src/user/data.js:47-84 -- User.getUsersFields shows batch retrieval pattern using db.getObjectsFields",
+      "src/user/email.js:47-68 -- isValidationPending(uid, email) shows single-UID confirmation checking pattern that can be adapted for batch",
+      "src/database/mongo/main.js:87-106 -- db.mget(keys) batch string retrieval pattern",
+      "src/controllers/admin/users.js:164-166 -- getIPs inner function shows pattern of batch retrieval via Promise.all(uids.map())",
+      "src/user/data.js:47-84 -- User.getUsersFields shows batch retrieval using db.getObjectsFields",
+      "src/user/email.js:47-53 -- isValidationPending shows single-UID pattern: db.get(confirm:byUid:<uid>) then db.getObject(confirm:<code>)",
+      "src/database/mongo/main.js:95-105 -- mget uses keys.map(key => map[key] || null) for positional ordering",
+      "src/database/mongo/main.js:61-78 -- db.get shows single-key retrieval pattern that mget extends to batch",
+      "src/database/postgres/main.js:101-120 -- db.get shows single-key retrieval via legacy_object_live + legacy_string join pattern that mget extends",
+      "src/database/redis/main.js:59-61 -- db.get shows single-key retrieval using client.get that mget extends to client.mget",
+      "src/database/postgres/hash.js:142-148 -- Correct pattern: UNNEST WITH ORDINALITY k(\"_key\", i) with ORDER BY k.i ASC",
+      "src/database/postgres/sorted.js:262-263 -- Correct pattern: ORDER BY kvi.i ASC (ordinality column)",
+      "src/database/postgres/list.js:108-109 -- Correct pattern: ORDER BY m.i ASC (ordinality)",
+      "src/database/postgres/hash.js:142-148 -- Correct ordinality pattern: k(\"_key\", i) with ORDER BY k.i ASC (where i IS ordinality)",
+      "src/socket.io/admin/user.js -- User.sendValidationEmail uses similar getEmailForValidation pattern",
+      "src/user/email.js -- confirmByCode shows similar confirmation workflow pattern",
+      "src/socket.io/admin/user.js -- User.validateEmail uses same getEmailForValidation pattern before confirmByUid"
     ],
     "missing_elements_to_implement": [
-      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/mongo/main.js",
-      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/postgres/main.js",
-      "db.mget(keys: string[]): Promise<(string | null)[]> in src/database/redis/main.js",
-      "getConfirmObjs() helper function within loadUserInfo() in src/user/index.js or related user module",
-      "user.email.getEmailForValidation(uid: number): Promise<string | null> in src/user/email.js",
-      "User.email.expireValidation(uid) invocation on user account deletion (caller site and method must both exist)"
+      "Type: Method\n\nName: db.mget\n\nPath: src/database/mongo/main.js, src/database/postgres/main.js, src/database/redis/main.js\n\nInput: keys: string[] (An array of database keys to retrieve.)\n\nOutput: Promise<(string | null)[]> (A promise that resolves to an array of values. The order of values in the output array corresponds to the order of keys in the input array.)\n\nDescription: A method on the database abstraction layer that retrieves multiple objects from the database in a single batch operation.",
+      "Type: Function\n\nName: user.email.getEmailForValidation\n\nPath: src/user/email.js\n\nInput: uid: number (The user ID for which to find a validation email.)\n\nOutput: Promise<string | null> (A promise that resolves to the email address string, or `null` if no suitable email is found.)\n\nDescription: A utility function that retrieves the most appropriate email address for an administrative action like \"force validate\" or \"resend validation email\"."
     ]
   },
   "localization": {
     "suspect_entities": [
-      "src/database/mongo/main.js — missing db.mget implementation",
-      "src/database/postgres/main.js — missing db.mget implementation",
-      "src/database/redis/main.js — missing db.mget implementation",
-      "src/user/index.js or src/user/*.js — loadUserInfo function missing email:pending and email:expired flag logic",
-      "src/user/email.js — missing getEmailForValidation, insufficient isValidationPending/canSendValidation, missing expires timestamp storage in sendValidationEmail",
-      "src/user/email.js — User.validateEmail handler missing getEmailForValidation call",
-      "src/user/email.js — User.sendValidationEmail handler missing getEmailForValidation call and email passthrough",
-      "User deletion path — missing User.email.expireValidation(uid) call",
-      "src/database/mongo/main.js — db.mget EXISTS but reads only d.data, never d.value (latent inconsistency)",
-      "src/database/postgres/main.js — db.mget EXISTS but has LIMIT 1 bug causing incorrect results with multiple keys",
-      "src/database/redis/main.js — db.mget EXISTS and appears correct",
-      "src/controllers/admin/users.js:170-207 — loadUserInfo correctly uses db.mget + db.getObjects to derive email:pending and email:expired flags",
-      "src/user/email.js — all functions exist: getEmailForValidation (54-67), isValidationPending (69-75), canSendValidation (92-103), sendValidationEmail with expires timestamp (166), expireValidation (83-90)",
-      "src/socket.io/admin/user.js — User.validateEmail (65-77) and User.sendValidationEmail (79-104) correctly call getEmailForValidation",
-      "src/user/delete.js:170 — User.deleteAccount correctly calls User.email.expireValidation(uid)",
-      "src/user/email.js:128-130 — sendValidationEmail falls back to stored email (not confirm object email) when options.email is not provided — potential wrong email sent for pending email changes"
+      "loadUserInfo",
+      "src/controllers/admin/users.js",
+      "getConfirmObjs (MISSING)",
+      "module.mget in src/database/postgres/main.js",
+      "UNNEST WITH ORDINALITY column alias pattern",
+      "User.sendValidationEmail",
+      "UserEmail.getEmailForValidation",
+      "UserEmail.sendValidationEmail"
     ],
     "exact_code_regions": [
-      "src/database/mongo/main.js:93-109",
-      "src/database/postgres/main.js:177-199",
-      "src/database/redis/main.js:66-71",
-      "src/user/email.js:54-67",
-      "src/user/email.js:69-75",
-      "src/user/email.js:77-81",
-      "src/user/email.js:83-90",
-      "src/user/email.js:92-103",
-      "src/user/email.js:105-183",
-      "src/user/email.js:186-221",
-      "src/user/email.js:224-261",
-      "src/user/delete.js:170",
-      "src/controllers/admin/users.js:170-207",
-      "src/socket.io/admin/user.js:65-77",
-      "src/socket.io/admin/user.js:79-104"
+      "src/controllers/admin/users.js:163-185",
+      "src/controllers/admin/users.js:16-19",
+      "src/user/email.js:47-68",
+      "src/user/email.js:111-117",
+      "src/database/mongo/main.js:87-106",
+      "src/database/redis/main.js:67-73",
+      "src/database/postgres/main.js:141-159",
+      "src/controllers/admin/users.js:164-166",
+      "src/database/redis/hash.js:84-86",
+      "src/user/email.js:47-53",
+      "src/user/email.js:189-197",
+      "src/database/postgres/hash.js:138-153",
+      "src/database/postgres/hash.js:142-148",
+      "src/database/postgres/sorted.js:262-263",
+      "src/socket.io/admin/user.js",
+      "src/user/email.js",
+      "src/user/data.js"
     ],
     "call_chain_context": [
-      "getUsers (controllers/admin/users.js) -> loadUserInfo -> db.mget(confirm:byUid:<uid> keys) -> db.getObjects(confirm:<code> keys) -> email:pending/email:expired flags",
-      "User.validateEmail (socket.io/admin/user.js:65) -> user.email.getEmailForValidation(uid) -> user.setUserField + user.email.confirmByUid",
-      "User.sendValidationEmail (socket.io/admin/user.js:79) -> user.email.getEmailForValidation(uid) -> user.email.sendValidationEmail(uid, {email})",
-      "User.deleteAccount (delete.js:170) -> User.email.expireValidation(uid) -> db.deleteAll([confirm:byUid:<uid>, confirm:<code>])",
-      "UserEmail.confirmByCode (email.js:186) -> reads confirm:<code> -> calls expireValidation on expiry/mismatch"
+      "getUsers -> loadUserInfo(req.uid, uids)",
+      "usersController.search -> loadUserInfo(req.uid, uids)",
+      "getUsers -> loadUserInfo(req.uid, uids) -> NO getConfirmObjs call",
+      "usersController.search -> loadUserInfo(req.uid, uids) -> NO getConfirmObjs call",
+      "db.mget -> module.mget (postgres) -> UNNEST WITH ORDINALITY -> ORDER BY k.i (BUG: orders by key value, not position)",
+      "db.mget(keys) -> module.mget in postgres/main.js -> UNNEST WITH ORDINALITY -> ORDER BY k.i (BUG: orders by key value, not position)",
+      "Admin socket request -> User.validateEmail(socket, uids) -> user.email.getEmailForValidation(uid) -> user.setUserField(uid, 'email', email) -> user.email.confirmByUid(uid)",
+      "Admin socket request -> User.sendValidationEmail(socket, uids) -> user.email.getEmailForValidation(uid) -> user.email.sendValidationEmail(uid, { force: true, email })"
     ],
     "dataflow_relevant_uses": [
-      "confirm:byUid:<uid> key stores the active code string; read by getEmailForValidation, isValidationPending, canSendValidation, expireValidation, loadUserInfo",
-      "confirm:<code> hash stores {email, uid, expires}; expires = Date.now() + emailConfirmExpiry hours",
-      "confirmObj.expires used by isValidationPending (email.js:72) and loadUserInfo (admin/users.js:200-201) to determine expired vs pending",
-      "user.email.getEmailForValidation reads confirm:byUid:<uid> then confirm:<code>.email when uid matches",
-      "User.email.sendValidationEmail stores expires as Date.now() + emailConfirmExpiry * 3600000 (milliseconds) at email.js:166"
+      "uids array -> loadUserInfo(callerUid, uids) -> userData array returned to render()",
+      "user.getUsersWithFields(uids, userFields, callerUid) -> userData without email:pending/email:expired",
+      "uids array -> loadUserInfo(callerUid, uids) -> userData array returned WITHOUT email:pending/email:expired flags",
+      "confirm:byUid:<uid> key stores confirmation code string",
+      "confirm:<code> key stores object with {email, uid, expires} fields",
+      "db.mget(keys) -> returns values in positional order with null for missing keys",
+      "MongoDB mget: keys array -> $in query on _key -> map lookup -> positional array output",
+      "PostgreSQL mget: keys array -> UNNEST WITH ORDINALITY -> LEFT OUTER JOIN -> ORDER BY ordinality -> positional array output",
+      "Redis mget: keys array -> client.mget -> map null handling -> positional array output",
+      "PostgreSQL mget: keys array -> UNNEST WITH ORDINALITY AS k(i, v) where i=key, v=ordinality -> ORDER BY k.i (WRONG) -> res.rows in wrong order",
+      "MongoDB mget: keys array -> $in query -> keys.map for positional output (CORRECT)",
+      "Redis mget: keys array -> client.mget -> positional output (CORRECT)",
+      "uid parameter -> getEmailForValidation(uid) -> email (from profile or confirm object)",
+      "email variable (if truthy) -> setUserField(uid, 'email', email) -> stored in user object",
+      "uid parameter -> confirmByUid(uid) -> email confirmation workflow",
+      "uid parameter -> getEmailForValidation(uid) -> email string (from profile or confirmation object)",
+      "email variable -> passed as { force: true, email: email } -> sendValidationEmail uses options.email"
     ]
   },
   "structural": {
     "must_co_edit_relations": [
-      "src/database/mongo/main.js, src/database/postgres/main.js, src/database/redis/main.js — db.mget must be implemented in all three adapters simultaneously",
-      "src/user/email.js — getEmailForValidation must be called by both User.validateEmail and User.sendValidationEmail",
-      "src/user/index.js (or user/info.js) — loadUserInfo must be updated to use getConfirmObjs() and attach email:pending and email:expired flags",
-      "User deletion path — wherever user deletion is handled must call User.email.expireValidation(uid)",
-      "src/database/postgres/main.js — LIMIT 1 bug in mget SQL must be fixed for bulk confirmation lookups to work correctly",
-      "src/controllers/admin/users.js:174-179 — depends on db.mget returning results in input key order; LIMIT 1 bug causes incorrect results",
-      "src/user/email.js:128-130 — sendValidationEmail fallback uses stored email instead of pending confirm email; may send to wrong address for pending email changes"
+      "If loadUserInfo changes to add getConfirmObjs helper -> src/user/email.js may need to export batch confirmation retrieval",
+      "If email:pending/email:expired flags are added -> src/controllers/admin/users.js userFields array may need updating",
+      "If getConfirmObjs is added to loadUserInfo -> src/user/email.js may need to export a batch confirmation retrieval helper",
+      "If getConfirmObjs uses db.mget -> uids array must be mapped to confirm:byUid:<uid> keys maintaining position",
+      "If main.js mget ORDER BY is fixed -> no other files need changes",
+      "Reference pattern from hash.js getObjects should be followed",
+      "If postgres/main.js mget ORDER BY is fixed -> no other files need changes"
     ],
     "dependency_propagation": [
-      "db.mget implementation in all three adapters is a prerequisite for getConfirmObjs() in loadUserInfo()",
-      "getConfirmObjs() result (confirm objects with expires timestamps) feeds the email:pending and email:expired flags in loadUserInfo()",
-      "User.email.sendValidationEmail storing expires timestamp in the confirmation object enables isValidationPending() and canSendValidation() correctness",
-      "getEmailForValidation() result is consumed by User.validateEmail (to set user field) and User.sendValidationEmail (to pass as email option)",
-      "User.email.expireValidation(uid) cleanup prevents stale confirmation data from persisting after user deletion",
-      "db.mget in postgres has LIMIT 1 bug — when multiple keys passed, only first result returned, breaking loadUserInfo email:pending/email:expired flag computation",
-      "db.mget correctness in all three adapters is prerequisite for loadUserInfo to display accurate email validation status in ACP",
-      "email.js:128-130 fallback logic determines what email receives validation message when ACP resends for pending email changes"
+      "db.mget exists in mongo/main.js, redis/main.js, postgres/main.js - ready for batch key retrieval",
+      "db.getObjects exists for batch object retrieval",
+      "db.mget exists in mongo/main.js, redis/main.js, postgres/main.js - READY for batch key retrieval",
+      "db.getObjects exists in hash.js files - READY for batch object retrieval",
+      "Positional ordering is enforced: db.mget returns array in same order as input keys with null for missing",
+      "db.mget is ready for use in all three database adapters (MongoDB, PostgreSQL, Redis)",
+      "Positional ordering is enforced: all implementations return array in same order as input keys with null for missing",
+      "PostgreSQL mget defect affects all callers that rely on positional ordering",
+      "MongoDB and Redis implementations are independent and correct",
+      "User.validateEmail depends on user.email.getEmailForValidation",
+      "User.validateEmail depends on user.setUserField",
+      "User.validateEmail depends on user.email.confirmByUid",
+      "User.sendValidationEmail depends on user.email.getEmailForValidation",
+      "User.sendValidationEmail depends on user.email.sendValidationEmail"
     ]
-  }
+  },
+  "requirements": [
+    {
+      "id": "req-001",
+      "text": "The loadUserInfo(callerUid, uids) function should include logic to retrieve and attach `email:pending` and `email:expired` flags to each user object. These flags must be derived by resolving `confirm:byUid:<uid>` keys via the new `getConfirmObjs()` function and checking expires timestamps in corresponding `confirm:<code>` objects.",
+      "origin": "requirements",
+      "verdict": "TO_BE_MISSING",
+      "evidence_locations": [
+        "src/controllers/admin/users.js:163-185 -- loadUserInfo function without email:pending/email:expired flags",
+        "src/controllers/admin/users.js:16-19 -- userFields array includes email:confirmed but not email:pending/email:expired",
+        "src/user/email.js:47-68 -- isValidationPending shows the single-UID pattern for checking confirmation status",
+        "src/user/email.js:111-117 -- expireValidation shows the confirm:byUid and confirm:<code> key structure"
+      ],
+      "findings": "The `loadUserInfo(callerUid, uids)` function at `src/controllers/admin/users.js:163-185` does NOT include any logic to retrieve or attach `email:pending` and `email:expired` flags to user objects. The current implementation only retrieves basic user fields (uid, username, email, email:confirmed, etc.), IP addresses, and administrator status. There is NO `getConfirmObjs()` helper function defined anywhere in the codebase. The confirmation data infrastructure (`confirm:byUid:<uid>` keys and `confirm:<code>` objects) exists in `src/user/email.js` but is only used for single-UID operations, not batch retrieval. The `db.mget` method is already implemented in all three database adapters and could be used for batch key retrieval, but it is not currently utilized in `loadUserInfo`. EDGE CASES for proposed batch retrieval: (1) empty uids array must return gracefully; (2) orphaned confirm keys where `confirm:byUid:<uid>` exists but `confirm:<code>` is missing; (3) confirm objects without `expires` field need defined behavior; (4) exactly-at-expiry boundary when `expires === Date.now()`; (5) mixed uids with pending/expired/neither statuses all in one batch.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-002",
+      "text": "The `getConfirmObjs()` helper within `loadUserInfo()` should fetch confirmation codes using `db.mget()` on `confirm:byUid:<uid>` keys, then retrieve the corresponding `confirm:<code>` objects using `db.getObjects()`. The mapping must ensure each user's confirmation object is accurately indexed by position.",
+      "origin": "requirements",
+      "verdict": "TO_BE_MISSING",
+      "evidence_locations": [
+        "src/controllers/admin/users.js:163-185 -- loadUserInfo function lacks getConfirmObjs helper",
+        "src/controllers/admin/users.js:164-166 -- only getIPs inner function exists, no getConfirmObjs",
+        "src/database/mongo/main.js:87-106 -- db.mget implementation ready for batch key retrieval",
+        "src/database/redis/main.js:67-73 -- db.mget implementation using client.mget",
+        "src/database/postgres/main.js:141-159 -- db.mget implementation with positional ordering",
+        "src/database/redis/hash.js:84-86 -- db.getObjects implementation ready for batch object retrieval",
+        "src/user/email.js:47-53 -- single-UID confirmation retrieval pattern (db.get + db.getObject)",
+        "src/user/email.js:189-197 -- confirmation key structure: confirm:byUid:<uid> stores code, confirm:<code> stores object"
+      ],
+      "findings": "The `getConfirmObjs()` helper function does NOT exist within `loadUserInfo()` or anywhere in the codebase. The `loadUserInfo()` function at `src/controllers/admin/users.js:163-185` contains only an inner `getIPs()` helper, and there is no batch confirmation retrieval logic. However, the required infrastructure EXISTS: (1) `db.mget(keys)` is implemented in all three database adapters (mongo/main.js:87-106, redis/main.js:67-73, postgres/main.js:141-159) and returns values in positional order with null for missing keys; (2) `db.getObjects(keys)` exists in hash.js files for batch object retrieval; (3) the `confirm:byUid:<uid>` → `confirm:<code>` key pattern is established in `src/user/email.js`. The single-UID confirmation retrieval pattern (db.get on confirm:byUid, then db.getObject on confirm:<code>) exists at lines 48-53, 78-83, 97-102, and 112-115 in src/user/email.js, but NO batch implementation using db.mget/db.getObjects exists in loadUserInfo.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-003",
+      "text": "Each database adapter MongoDB, PostgreSQL, and Redis, must implement a `db.mget(keys: string[]): Promise<string[]>` method in their respective `main.js` files. This method takes an array of keys and returns an array of corresponding string values.",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [],
+      "findings": "All three database adapters (MongoDB, PostgreSQL, and Redis) have fully implemented the `db.mget(keys: string[]): Promise<string[]>` method in their respective `main.js` files. Each implementation: (1) accepts an array of keys as input, (2) returns a Promise resolving to an array of corresponding string values, (3) returns null at the corresponding index for keys not found in the database, and (4) preserves the input order of keys in the output array. MongoDB uses `$in` filter on `_key` field in the objects collection. PostgreSQL uses UNNEST WITH ORDINALITY combined with LEFT OUTER JOIN on legacy_object_live and legacy_string tables to retrieve values while preserving positional order. Redis uses the native `client.mget` command. All three implementations handle edge cases like empty arrays or non-array inputs by returning an empty array.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-004",
+      "text": "The `db.mget` implementation should ensure that for any keys not found in the database, the method returns null at the corresponding index in the output array. For Redis, this must be achieved using `client.mget`. For MongoDB, the objects collection must be queried using a `$in` filter on `_key`. For PostgreSQL, the implementation must join `legacy_object_live` and `legacy_string` tables to retrieve values by key.",
+      "origin": "requirements",
+      "verdict": "TO_BE_PARTIAL",
+      "evidence_locations": [
+        "src/database/postgres/main.js:155 -- ORDER BY k.i ASC should be ORDER BY k.v ASC",
+        "src/database/postgres/hash.js:142-148 -- Correct ordinality pattern: k(\"_key\", i) with ORDER BY k.i"
+      ],
+      "findings": "MongoDB and Redis mget implementations are correct: they return null for missing keys at the correct positions. PostgreSQL mget has a CRITICAL DEFECT: the ORDER BY clause uses `k.i ASC` (key value) instead of `k.v ASC` (ordinality), causing results to be returned in alphabetical key order rather than input order. For example, mget(['c','a','b']) would return results in order ['a','b','c'] instead of ['c','a','b']. The null handling via LEFT OUTER JOIN is correct, but positional ordering is BROKEN. Fix: change line 155 from `ORDER BY k.i ASC` to `ORDER BY k.v ASC`. Boundary cases verified: (1) empty array returns [] via guard clause, (2) single key works, (3) multiple keys in non-alphabetical order work with fix, (4) missing keys return null at correct position with fix, (5) duplicate keys work with fix. Reference implementation: hash.js getObjects uses `k(\"_key\", i)` and `ORDER BY k.i ASC` correctly.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-005",
+      "text": "The `mget` implementation in all database adapters should preserve the input order of keys and explicitly return null for any key that does not exist in the data store. This behavior should be enforced in the return mapping logic.",
+      "origin": "requirements",
+      "verdict": "TO_BE_PARTIAL",
+      "evidence_locations": [
+        "src/database/mongo/main.js:87-106 -- MongoDB mget correctly uses keys.map() to preserve order and returns null for missing keys",
+        "src/database/redis/main.js:67-73 -- Redis mget uses client.mget which preserves order, maps null correctly",
+        "src/database/postgres/main.js:141-159 -- PostgreSQL mget has ORDER BY k.i ASC bug (should be k.v ASC)",
+        "src/database/postgres/main.js:149 -- UNNEST WITH ORDINALITY AS k(i, v) where i=key, v=ordinality (reversed from standard pattern)",
+        "src/database/postgres/main.js:155 -- ORDER BY k.i ASC orders by key value, not position",
+        "src/database/postgres/hash.js:142-148 -- CORRECT pattern: k(\"_key\", i) with ORDER BY k.i ASC (i is ordinality)"
+      ],
+      "findings": "The mget implementations in MongoDB and Redis correctly preserve input order and return null for missing keys. However, the PostgreSQL mget has a CRITICAL BUG: the SQL uses `UNNEST($1::TEXT[]) WITH ORDINALITY AS k(i, v)` where `i` is the key value and `v` is the ordinality, but then orders by `k.i ASC` (key value alphabetically) instead of `k.v ASC` (ordinality/position). This causes results to be returned in alphabetical key order rather than input order. For example, `mget(['c','a','b'])` would return results in order `['a','b','c']` instead of `['c','a','b']`. The null handling via LEFT OUTER JOIN is correct. The fix is to change line 155 from `ORDER BY k.i ASC` to `ORDER BY k.v ASC`. Boundary verification: (1) Empty array input `mget([])` → empty UNNEST produces `[]` correctly; (2) All missing keys `mget(['x','y'])` → LEFT JOIN nulls ordered by ordinality `[null, null]` correctly; (3) Duplicate keys `mget(['a','a'])` → ordinalities (1,2) preserve order correctly; (4) Mixed found/missing preserves input order correctly with fix. The correct pattern is established elsewhere: hash.js:142-148 uses `k(\"_key\", i)` with `ORDER BY k.i ASC` correctly (where `i` IS ordinality), and sorted.js:262-263 uses `kvi(c, v, i)` with `ORDER BY kvi.i ASC` correctly.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-006",
+      "text": "The `User.validateEmail` handler should retrieve the user's email using `user.email.getEmailForValidation(uid)` before calling `user.email.confirmByUid(uid)`. If a valid email is found, it must be saved to the user's profile using `user.setUserField(uid, 'email', email)`.",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [],
+      "findings": "The `User.validateEmail` handler in `src/socket.io/admin/user.js` implements the required workflow: it retrieves the email via `user.email.getEmailForValidation(uid)`, saves it to the user's profile with `user.setUserField(uid, 'email', email)`, and then calls `user.email.confirmByUid(uid)`. The `getEmailForValidation` function in `src/user/email.js` implements the expected fallback logic: first checking the user's profile, then falling back to the confirmation object. The `setUserField` and `confirmByUid` functions are implemented in `src/user/data.js` and `src/user/email.js` respectively, completing the validation workflow.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-007",
+      "text": "The `User.sendValidationEmail` handler must use `user.email.getEmailForValidation(uid)` to obtain the correct email and explicitly pass it as the email option to `user.email.sendValidationEmail.`",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [],
+      "findings": "The `User.sendValidationEmail` handler in `src/socket.io/admin/user.js` correctly implements the requirement. It calls `user.email.getEmailForValidation(uid)` to obtain the correct email address, and then explicitly passes it as the email option to `user.email.sendValidationEmail(uid, { force: true, email: email })`. The `getEmailForValidation` function properly retrieves the email by first checking the user's profile, then falling back to the confirmation object. The `sendValidationEmail` function correctly accepts the email via the options parameter and uses it (only falling back to profile retrieval if no email is provided in options).",
+      "rework_context": ""
+    },
+    {
+      "id": "req-008",
+      "text": "When a user account is deleted, the system should invoke `User.email.expireValidation(uid)` to remove any pending email confirmation data associated with that user.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-009",
+      "text": "When generating a new email confirmation entry `confirm:<code>`, the `User.email.sendValidationEmail` function should store an expires field as a Unix timestamp in milliseconds in the confirmation object instead of relying on database-level TTL.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-010",
+      "text": "When generating a new email confirmation entry `confirm:<code>`, the `User.email.sendValidationEmail` function should store an expires field (as a Unix timestamp in milliseconds) in the confirmation object instead of relying on database-level TTL (e.g., pexpire). This timestamp must be used for all future expiry checks.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-011",
+      "text": "The method `User.email.getEmailForValidation(uid)` must first try to retrieve the email from the user's profile (user:<uid>). If no email is set, it must fallback to the email field in the confirmation object (confirm:<code>) corresponding to confirm:byUid:<uid>. It must only return the email if the UID matches.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-012",
+      "text": "The method `User.email.isValidationPending(uid, email)` must return true only if the confirmation object exists, the current time is before the expires timestamp, and if provided, the email matches the email in the confirmation object.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-013",
+      "text": "In `User.email.canSendValidation(uid, email)`, the interval check must compare the stored TTL timestamp if available (or, if TTL is unavailable, use the current time as the baseline) plus the configured interval against the max confirmation period, ensuring the system prevents excessive resends.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-014",
+      "text": "Type: Method\n\nName: db.mget\n\nPath: src/database/mongo/main.js, src/database/postgres/main.js, src/database/redis/main.js\n\nInput: keys: string[] (An array of database keys to retrieve.)\n\nOutput: Promise<(string | null)[]> (A promise that resolves to an array of values. The order of values in the output array corresponds to the order of keys in the input array.)\n\nDescription: A method on the database abstraction layer that retrieves multiple objects from the database in a single batch operation.",
+      "origin": "new_interfaces",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    },
+    {
+      "id": "req-015",
+      "text": "Type: Function\n\nName: user.email.getEmailForValidation\n\nPath: src/user/email.js\n\nInput: uid: number (The user ID for which to find a validation email.)\n\nOutput: Promise<string | null> (A promise that resolves to the email address string, or `null` if no suitable email is found.)\n\nDescription: A utility function that retrieves the most appropriate email address for an administrative action like \"force validate\" or \"resend validation email\".",
+      "origin": "new_interfaces",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "rework_context": ""
+    }
+  ],
+  "schema_version": "v2"
 }

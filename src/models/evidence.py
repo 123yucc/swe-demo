@@ -1,4 +1,73 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+RequirementVerdict = Literal[
+    "UNCHECKED",
+    "AS_IS_COMPLIANT",
+    "AS_IS_VIOLATED",
+    "TO_BE_MISSING",
+    "TO_BE_PARTIAL",
+]
+
+RequirementOrigin = Literal["problem_statement", "requirements", "new_interfaces"]
+
+
+class RequirementItem(BaseModel):
+    """One behavioral requirement extracted from the issue, tracked with a verdict.
+
+    RequirementItem is the task-driving unit across the whole pipeline.
+    Parser initializes each item with verdict=UNCHECKED; deep-search updates
+    verdict / evidence_locations / findings by calling update_requirement_verdict.
+    """
+
+    id: str = Field(
+        description="Stable identifier in the form 'req-001', 'req-002', ...",
+    )
+    text: str = Field(
+        description=(
+            "Original requirement text — do NOT truncate or paraphrase."
+        ),
+    )
+    origin: RequirementOrigin = Field(
+        description=(
+            "Which input section this requirement came from: "
+            "'problem_statement', 'requirements', or 'new_interfaces'."
+        ),
+    )
+    verdict: RequirementVerdict = Field(
+        default="UNCHECKED",
+        description=(
+            "Deep-search's verdict for this requirement after on-site verification. "
+            "UNCHECKED until deep-search has investigated it."
+        ),
+    )
+    evidence_locations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Code locations (e.g. 'path/to/file.py:LINE' or 'path/to/file.py:LINE-LINE') "
+            "that substantiate the verdict. Required to be non-empty unless "
+            "verdict == 'AS_IS_COMPLIANT'."
+        ),
+    )
+    findings: str = Field(
+        default="",
+        description=(
+            "Deep-search's on-site verification summary — what the code actually "
+            "says about this requirement. Used by downstream patch agents."
+        ),
+    )
+    rework_context: str = Field(
+        default="",
+        description=(
+            "Closure-checker's per-requirement audit feedback written here when "
+            "the requirement is re-opened for a rework cycle. Non-empty means "
+            "deep-search should read this and give a reasoning path different "
+            "from the previous verdict. Cleared automatically after the next "
+            "deep-search verdict is persisted."
+        ),
+    )
 
 
 class SymptomCard(BaseModel):

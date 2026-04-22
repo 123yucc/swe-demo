@@ -23,8 +23,8 @@ python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_meta
 ```
 
 **Output** written to `<output-dir>/` (defaults to `workdir/<issue_name>/outputs/` in `--instance-json` mode, otherwise `workdir/<instance_id>/outputs/`):
-- `evidence_cards.json` — structured evidence
-- `model_patch.diff` — git diff patch
+- `evidence.json` — structured evidence
+- `patch.diff` — git diff patch
 - `prediction.json` — SWE-bench eval format (`{instance_id, model_patch}`)
 - `patch_outcome.json` — closure-checker approval status and patch result (for long-term memory)
 
@@ -44,25 +44,31 @@ ANTHROPIC_BASE_URL=https://your-relay.example.com/v1  # optional, for proxy/rela
 ### State Machine
 
 ```
-Init -> (Parser) -> UnderSpecified --(deep-search)--> EvidenceRefining
+Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> EvidenceRefining
                         ^                                   |
-                        |                          (closure-checker)
+                        |                          Sufficiency + Correct-attribution
+                        |                          gates (code, format-only)
+                        |                                   |
+                        |                          (closure-checker: factual audit
+                        |                           of cited code + Consistency)
                         |                            /            \
-                    EVIDENCE_MISSING          CLOSURE_APPROVED
-                                                      |
-                                                    Closed
-                                                      |
-                                              (patch-planner)
-                                                      |
-                                                PatchPlanning
-                                                      |
-                                              (patch-generator)
-                                                /            \
-                                        PatchSuccess    PatchFailed
+              EVIDENCE_MISSING                CLOSURE_APPROVED
+                (re-open cited reqs,                   |
+                 write rework_context)               Closed
+                        |                              |
+               (rework budget / exhausted?)     (patch-planner)
+                   /            \                     |
+                  no            yes            PatchPlanning
+                  |              |                    |
+                loop           ClosureForcedFail  (patch-generator)
+                                (terminal)         /            \
+                                            PatchSuccess    PatchFailed
 ```
 
-Only the closure-checker subagent can transition from EvidenceRefining to Closed.
-No patch generation is allowed before Closed.
+- The closure-checker remains the sole approver of `EvidenceRefining -> Closed`.
+- `ClosureForcedFail` is the budget-exhaustion escape hatch (no patch phase;
+  `patch_outcome = EVIDENCE_INCOMPLETE`).
+- No patch generation is allowed before `Closed`.
 
 ### Components
 
@@ -71,15 +77,18 @@ No patch generation is allowed before Closed.
 | CLI | `src/main.py` | Unified entry point: supports SWE-bench Pro instances, local JSON, and legacy artifacts dir |
 | Artifacts | `src/artifacts.py` | Converts SWE-bench `problem_statement` into 4 Markdown artifact files |
 | Config | `src/config.py` | Reads `.env`, exposes `sdk_env()` |
-| Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output (`output_format`) |
-| Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration (call chains, data flow, similar patterns); returns Markdown with `EXACT_LINES` block |
-| Closure Checker Agent | `src/agents/closure_checker_agent.py` | Sole gatekeeper for evidence closure; evaluates all four cards against mandatory criteria; returns `CLOSURE_APPROVED` or `EVIDENCE_MISSING` with specific gaps |
-| Orchestrator | `src/orchestrator/engine.py` | State-machine driver; delegates to deep-search, closure-checker, patch-planner, and patch-generator via `Agent` tool; enforces state transitions host-side |
-| Patch Planner Agent | `src/agents/patch_planner_agent.py` | Reads evidence cards, produces structured PatchPlan via `submit_patch_plan` |
-| Patch Generator Agent | `src/agents/patch_generator_agent.py` | Reads PatchPlan and target files, applies SEARCH/REPLACE edits via `apply_search_replace` |
-| Evidence MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` and `cache_retrieved_code` |
+| Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output |
+| Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration; returns `DeepSearchReport` via SDK structured output. **Phase 18.E**: two-round design — Round 1 (primary investigation) + Round 2 (self-reflection checking token traceability, boundary enumeration, verdict consistency) |
+| Closure Checker Agent | `src/agents/closure_checker_agent.py` | Manifest-driven audit gate (phase 18.B/C): receives pre-computed `AuditManifest`, executes each `AuditTask` with Grep/Read/Glob; returns `ClosureVerdict` with per-task `AuditResult`. Three semantic check types: verdict_vs_code, findings_anti_hallucination, prescriptive_boundary_self_check |
+| Orchestrator | `src/orchestrator/engine.py` | Code-driven while-loop pipeline; calls sub-agents directly at semantic nodes; enforces state transitions via `PipelineState` enum. **Phase 18**: integrates `check_structural_invariants`, `build_audit_manifest`, validates manifest coverage, differentiated rework feedback |
+| State Machine | `src/orchestrator/states.py` | `PipelineState` enum (including terminal `CLOSURE_FORCED_FAIL`), `ALLOWED_TRANSITIONS` table, `STATE_ACTIONS` per-state allowed subagent types |
+| Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). `DeepSearchBudget` iteration limiter. |
+| Audit Builder | `src/orchestrator/audit.py` | **Phase 18.B**: `build_audit_manifest()` produces deterministic `AuditManifest` from evidence. All audit scope decisions are code-driven. |
+| Patch Planner Agent | `src/agents/patch_planner_agent.py` | Reads evidence cards, returns `PatchPlan` via SDK structured output. **Phase 18.D**: populates `preserved_findings` per file — verbatim prescriptive snippets from findings that are hard constraints for patch-generator. |
+| Patch Generator Agent | `src/agents/patch_generator_agent.py` | Reads PatchPlan and target files, applies SEARCH/REPLACE edits via MCP tool. **Phase 18.D**: respects `preserved_findings` as hard constraints, receives original requirements text in prompt. |
+| Evidence MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` (scope-based replace), `update_requirement_verdict`, and `cache_retrieved_code`; also provides `reset_requirement_for_rework(rid, audit_feedback)` for the phase-17 rework path (clears verdict/locations/findings, stashes audit feedback on `RequirementItem.rework_context`) |
 | Patch MCP Tools | `src/tools/patch_tools.py` | In-process MCP server exposing `submit_patch_plan` and `apply_search_replace` |
-| Data Models | `src/models/evidence.py`, `src/models/context.py`, `src/models/memory.py`, `src/models/patch.py` | Pydantic v2 models for 4 evidence cards, session context, `SharedWorkingMemory`, and `PatchPlan` |
+| Data Models | `src/models/evidence.py`, `context.py`, `memory.py`, `patch.py`, `verdict.py`, `report.py`, `audit.py` | Pydantic v2 models for evidence cards, `ClosureVerdict`, `DeepSearchReport`, `PatchPlan`, **Phase 18.B**: `AuditManifest`, `AuditTask`, `AuditResult` |
 
 ### `src/` File Structure (with annotations)
 
@@ -93,9 +102,9 @@ src/
     agents/
         __init__.py                    # Subpackage marker
         parser_agent.py                # Parses 4 artifact markdown files into structured EvidenceCards
-        deep_search_agent.py           # Runs focused repository investigation using Grep/Read/Glob
-        closure_checker_agent.py       # Evaluates evidence completeness; sole closure gatekeeper
-        patch_planner_agent.py         # Reads evidence, produces structured PatchPlan
+        deep_search_agent.py           # Returns DeepSearchReport via SDK structured output
+        closure_checker_agent.py       # Returns ClosureVerdict via SDK structured output
+        patch_planner_agent.py         # Returns PatchPlan via SDK structured output
         patch_generator_agent.py       # Executes PatchPlan via SEARCH/REPLACE edits
 
     models/
@@ -103,11 +112,17 @@ src/
         evidence.py                    # Definitions of Symptom/Constraint/Localization/Structural cards
         context.py                     # Top-level EvidenceCards and session-oriented context models
         memory.py                      # SharedWorkingMemory model used across orchestrator and sub-agents
-        patch.py                       # PatchPlan and FileEditPlan models
+        patch.py                       # PatchPlan and FileEditPlan models (Phase 18.D: preserved_findings field)
+        verdict.py                     # ClosureVerdict model (Phase 18.B: audited list of AuditResult)
+        report.py                      # DeepSearchReport model for deep-search structured output
+        audit.py                       # AuditManifest, AuditTask, AuditResult (Phase 18.B)
 
     orchestrator/
         __init__.py                    # Subpackage marker
-        engine.py                      # Main evidence-closure loop and sub-agent dispatching logic
+        engine.py                      # Code-driven while-loop pipeline with direct sub-agent calls
+        states.py                      # PipelineState enum, ALLOWED_TRANSITIONS, STATE_ACTIONS
+        guards.py                      # Mechanical pre-checks (sufficiency, attribution, structural invariants I1/I2/I3)
+        audit.py                       # build_audit_manifest() for deterministic audit scope (phase 18.B)
 
     tools/
         __init__.py                    # Subpackage marker
@@ -115,76 +130,74 @@ src/
         patch_tools.py                 # Patch MCP tools: submit_patch_plan and apply_search_replace
 ```
 
-### Four Evidence Cards（Pydantic 多维证据卡，字段中文说明）
+### Evidence Cards + RequirementItem[]
 
-以下四张卡共同构成唯一证据真相源（Source of Truth）。每个字段都应尽量基于可验证事实填写，避免推测。
+`EvidenceCards` (`schema_version == "v2"`) is the sole Source of Truth.
 
-#### 1) SymptomCard（现象卡）
+- **SymptomCard** — `observable_failures`, `repair_targets`, `regression_expectations`
+- **ConstraintCard** — `semantic_boundaries`, `behavioral_constraints`, `backward_compatibility`, `similar_implementation_patterns`, `missing_elements_to_implement`
+- **LocalizationCard** — `suspect_entities`, `exact_code_regions` (format: `path/to/file.py:LINE` or `path/to/file.py:LINE-LINE`), `call_chain_context`, `dataflow_relevant_uses`
+- **StructuralCard** — `must_co_edit_relations`, `dependency_propagation`
+- **requirements: list[RequirementItem]** — the task-driving unit. Each item has `id`, `text`, `origin`, `verdict` (`UNCHECKED | AS_IS_COMPLIANT | AS_IS_VIOLATED | TO_BE_MISSING | TO_BE_PARTIAL`), `evidence_locations`, `findings`.
 
-- `observable_failures`：可观测故障现象。
-    记录用户真实看到的问题，例如报错信息、异常类型、堆栈、错误输出、功能失效表现。
-- `repair_targets`：修复目标。
-    记录“修好后应达到什么行为”，即期望结果与验收目标。
-- `regression_expectations`：回归保护项。
-    记录修复后不能被破坏的既有正确行为（must-not-break）。
+Phase 16 removed the `TO-BE:` prefix convention: TO-BE requirements are first-class `RequirementItem`s, verdict-tracked.
 
-#### 2) ConstraintCard（约束卡）
+### Field → Writer Ownership
 
-- `semantic_boundaries`：语义边界。
-    记录 API/接口契约、函数签名、类型约束、文档明确要求的边界条件。
-- `behavioral_constraints`：行为约束。
-    记录不变量、断言、业务规则、输入输出约束。
-    若是“未来要新增”的要求，必须使用 `TO-BE:` 前缀标记，避免误当成现状。
-- `backward_compatibility`：兼容性要求。
-    记录必须保持的向后兼容行为（例如默认参数、旧调用方式不破坏）。
-- `similar_implementation_patterns`：相似实现模式。
-    记录代码库中可参考的类似实现（同类 API、类似模块模式）。
-- `missing_elements_to_implement`：缺失待实现元素。
-    记录被证实“规范要求存在但当前代码库中不存在”的类/方法/接口。
-    该字段用于防止下游代理误以为这些能力已经存在。
+| Field | Writer |
+|---|---|
+| `symptom.*` | Parser only |
+| `constraint.missing_elements_to_implement` | Parser only (from "New interfaces introduced:") |
+| `requirements` | Parser initializes (verdict=UNCHECKED); Deep-search updates via `update_requirement_verdict` |
+| `localization.*`, `structural.*` | Deep-search (via `update_localization`, scope-keyed by `requirement_id`) |
+| `constraint.behavioral_constraints / semantic_boundaries / backward_compatibility / similar_implementation_patterns` | Deep-search (AS-IS observations) |
 
-#### 3) LocalizationCard（定位卡）
+Ownership is enforced in two places:
+- Parser: `_enforce_parser_field_whitelist` clears any deep-search-owned field the parser mistakenly fills.
+- `update_localization`: rejects calls touching parser-owned field names (ERROR return value).
 
-- `suspect_entities`：可疑实体。
-    记录可疑文件、类、函数、变量等定位线索。
-- `exact_code_regions`：精确代码区间。
-    记录已确认的精确位置，格式必须是 `path/to/file.py:LINE` 或 `path/to/file.py:LINE-LINE`。
-- `call_chain_context`：调用链上下文。
-    记录 Caller -> Callee 链路，说明问题是如何被触发到该位置的。
-- `dataflow_relevant_uses`：数据流相关使用点。
-    记录 Def-Use（定义-使用）关系，说明关键变量/配置如何流经系统并影响故障。
+### Orchestrator: Code-Driven State-Machine Pipeline
 
-#### 4) StructuralCard（结构卡）
+The orchestrator drives a 7-state machine (`UnderSpecified`, `EvidenceRefining`, `Closed`, `PatchPlanning`, `PatchSuccess`, `PatchFailed`, `ClosureForcedFail`) via a **code while-loop**. LLM is only invoked at semantic decision points. All flow control is enforced by code:
 
-- `must_co_edit_relations`：必须联动修改关系。
-    记录“如果改 A，必须同步改 B”的关系，避免只改局部导致系统不一致。
-- `dependency_propagation`：依赖传播路径。
-    记录接口、包、配置、模块之间的依赖传播链路，说明改动影响面。
+- **State transitions** are validated against `ALLOWED_TRANSITIONS` in `states.py`.
+- **TODO picker** selects the next `UNCHECKED` RequirementItem; one requirement per deep-search round.
+- **Sufficiency gate** (`check_sufficiency`) requires every requirement to have a non-`UNCHECKED` verdict before the closure-checker is consulted.
+- **Correct-attribution gate** (`check_correct_attribution`) requires every non-compliant requirement to cite at least one `evidence_location`.
+- **Closure-checker** (phase 17) operates as a code-reviewer-style **auditor**: it opens each non-compliant requirement's cited `evidence_locations` via Grep/Read/Glob and judges (a) factual support — does the code actually show the claimed violation, and (b) cross-requirement consistency — when multiple requirements cite overlapping regions, are their verdicts compatible with the code.  AS_IS_COMPLIANT requirements with no overlap are skipped (cost control).
+- **Budget exhaustion**: `DeepSearchBudget` (default 5) allows exactly one forced closure-checker pass on exhaustion; any `EVIDENCE_MISSING` result at that point transitions to `CLOSURE_FORCED_FAIL` (patch phase skipped, `patch_outcome = EVIDENCE_INCOMPLETE`).
+- **Structured output** for all sub-agents — no regex parsing.
+- Findings are persisted via `update_requirement_verdict.handler()` + `update_localization.handler()` from engine code.
 
-#### 字段填写原则（建议）
+### Closure Rules (layered: mechanical gates + structural invariants + LLM audit, phase 18)
 
-- 优先记录可验证事实（代码检索、行号、调用链），避免纯推断。
-- `TO-BE:` 仅表示未来待实现需求，不等于当前已存在实现。
-- 若 Deep Search 发现了精确行号但未写入 `exact_code_regions`，视为证据未落盘。
-- 四张卡应互相补充：
-    现象卡回答“出了什么问题”；
-    约束卡回答“修复不能越界”；
-    定位卡回答“问题在什么位置”；
-    结构卡回答“改动会牵连哪里”。
+**Phase 18 added three layers of deterministic quality gates before closure-checker LLM invocation:**
 
-### Orchestrator: State-Machine Driven Pipeline
+1. **Sufficiency** (code): every `RequirementItem.verdict != "UNCHECKED"`.
+2. **Correct attribution** (code, format-only): every requirement with verdict ≠ `AS_IS_COMPLIANT` has non-empty `evidence_locations`, and every entry matches `path:LINE` or `path:LINE-LINE`.
+3. **Structural invariants** (code, phase 18.A):
+   - I1: new_interface ↔ missing_elements bidirectional mapping — every `origin=="new_interfaces"` req must have its interface name in `constraint.missing_elements_to_implement`, and every missing_element must correspond to a new_interface req.
+   - I2: new_interface cannot be AS_IS_COMPLIANT — by definition a new interface does not exist; any such verdict is deep-search hallucination, reset to UNCHECKED for rework.
+   - I3: symptom → requirements coverage — each `symptom.observable_failures` must share ≥2 non-stopword tokens with at least one `requirements`-origin req.
 
-The orchestrator drives a 5-state machine (UnderSpecified, EvidenceRefining, Closed, PatchPlanning, PatchSuccess/PatchFailed). In the UnderSpecified state it dispatches deep-search to fill evidence gaps. After deep-search returns (EvidenceRefining), ONLY the closure-checker subagent can approve the transition to Closed. If the closure-checker returns EVIDENCE_MISSING, the orchestrator loops back to UnderSpecified with targeted deep-search tasks. No patch generation is permitted before Closed.
+4. **AuditManifest** (code-driven scope, phase 18.B): `build_audit_manifest()` computes which requirements to audit and what checks each needs. Rules:
+   - Non-compliant reqs → full checks (verdict_vs_code + findings_anti_hallucination + prescriptive_boundary_self_check if findings contain prescriptive language)
+   - `origin==new_interfaces` → always verdict_vs_code + anti_hallucination
+   - AS_IS_COMPLIANT with overlapping evidence_locations → verdict_vs_code only
+   - Findings with backtick snippets → add findings_anti_hallucination
 
-Host-side safety nets in `engine.py` enforce these transitions: if the LLM skips closure-checker or attempts patches before closure, the host forces recovery turns.
+5. **Closure-checker LLM audit** (phase 18.C): executes the AuditManifest tasks, opens cited code via Grep/Read/Glob, and judges:
+   - **verdict_vs_code**: does the code at cited locations actually support the verdict?
+   - **findings_anti_hallucination**: are backtick-enclosed snippets in findings verified in the Read output?
+   - **prescriptive_boundary_self_check**: if findings contain prescriptive fix language, enumerate ≥2 edge cases and verify the fix satisfies all of them.
 
-### Hard Closure Rules (enforced by closure-checker + host-side validation)
+6. **Closure-checker gate**: returns `CLOSURE_APPROVED` if all AuditResult checks pass; `EVIDENCE_MISSING` otherwise. The orchestrator validates manifest coverage before accepting the verdict.
 
-1. `exact_code_regions` must NOT be empty before closure
-2. Localization must have at least one concrete file AND function in `suspect_entities`
-3. Do NOT close based on `TO-BE:` constraint items (those are requirements, not evidence)
-4. **Fact-alignment**: every entry written to JSON evidence cards must be grounded in what Deep Search actually found, not inferred from requirements
-5. **Closure-checker gate**: only the closure-checker subagent can approve the EvidenceRefining -> Closed transition; the orchestrator LLM must NOT self-judge closure
+7. **Rework path** (phase 18.F): on `EVIDENCE_MISSING`, per-requirement feedback is differentiated by failure type:
+   - new_interface_cannot_be_compliant → parser marked new interface, must be TO_BE_MISSING
+   - findings_anti_hallucination → findings claimed code that was not verified, delete/rephrase
+   - prescriptive_boundary_self_check → prescriptive fix fails edge case, re-verify
+   Capped at `rework_rounds_max = 3`; exhaustion → `CLOSURE_FORCED_FAIL`.
 
 ### SharedWorkingMemory (`src/models/memory.py`)
 
@@ -198,13 +211,19 @@ The memory is initialized after the Parser completes and injected into the orche
 
 ### Claude Agent SDK Integration
 
-- Parser Agent uses SDK structured output (`output_format` with `EvidenceCards.model_json_schema()`) to return typed evidence directly
-- Deep Search, Closure Checker, Patch Planner, and Patch Generator are registered as `AgentDefinition`s in the orchestrator's `agents={...}` dict; invoked via the `Agent` tool
-- Closure Checker receives no tools — it only evaluates evidence cards and returns a verdict
-- PostToolUse hooks auto-persist deep-search findings and track closure-checker verdicts
-- Orchestrator dispatches focused evidence context to Deep Search (not full JSON dump)
+- All sub-agents (Parser, Deep Search, Closure Checker, Patch Planner, Patch Generator) use SDK structured output (`output_format`) to return typed results — no free-text + regex parsing
+- The orchestrator calls sub-agents directly via `async` functions (`_run_deep_search_async`, `_run_closure_checker_async`, etc.) — not via the `Agent` tool
+- Patch Generator still uses `ClaudeSDKClient` with MCP tools for SEARCH/REPLACE edits
 - SDK docs: `docs/claude_sdk_docs/`
 - Phase-by-phase implementation plans: `docs/plan/`
+
+### SDK Alignment Decision Log
+
+These deliberate deviations from SDK "default" shapes are documented so they are not re-questioned later:
+
+- We do NOT use SDK `agents={}` + `AgentDefinition` + the `Agent` tool for sub-agent dispatch. SDK subagents return only the final assistant-message string, which prevents us from getting Pydantic-validated structured output. We instead open an independent `query()` per sub-agent with `output_format={"type": "json_schema", ...}` so every round yields a strongly typed result.
+- `action_history` stores ONLY cross-agent aggregate events. Per-message detail for a single `query()` is already persisted by the SDK under `~/.claude/projects/<encoded-cwd>/*.jsonl`; duplicating that in our memory would waste space and drift.
+- `DeepSearchBudget` is pipeline-level (caps total deep-search invocations). SDK's `max_turns` / `max_budget_usd` are single-query-level (caps tool-use rounds and dollar cost within one `query()` call). They are complementary, not redundant.
 
 ## Key Constraints When Modifying This Code
 
@@ -215,3 +234,5 @@ The memory is initialized after the Parser completes and injected into the orche
 - The `exact_code_regions` output format must remain `path/to/file.py:LINE` or `path/to/file.py:LINE-LINE`
 - Constantly prioritize the cleanup of legacy artifacts; after each version iteration, rescan the entire codebase to remove obsolete code.
 
+
+中文回答用户

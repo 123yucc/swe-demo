@@ -2,7 +2,9 @@
 Convert a SWE-bench Pro instance into the artifact text expected by the
 parser agent.
 
-SWE-bench Pro exposes three fields to the model:
+SWE-bench Pro exposes three fields to the model (see
+eval/SWE-bench_Pro-os/helper_code/create_problem_statement.py for the
+official format used by SWE-agent):
 - ``problem_statement``: the issue description
 - ``requirements``: behavioral requirements for the solution
 - ``interface``: (optional) class/function names the test suite expects
@@ -17,13 +19,10 @@ from __future__ import annotations
 def instance_to_artifact_text(instance: dict) -> str:
     """Build the artifact text that is fed to the parser agent.
 
-    Includes ``problem_statement``, ``requirements``, and ``interface``
-    (plus metadata like instance_id / repo / base_commit for context).
+    Follows the official SWE-bench Pro problem statement format from
+    eval/SWE-bench_Pro-os/helper_code/create_problem_statement.py.
+    Metadata (instance_id, repo, base_commit) is prepended for context.
     Test oracle fields (FAIL_TO_PASS, PASS_TO_PASS) are deliberately excluded.
-
-    Section names (``=== problem_statement.md ===``, ``=== requirements.md ===``,
-    ``=== new_interfaces.md ===``) match those referenced in the parser agent's
-    system prompt so that its extraction guidelines apply directly.
     """
     ps = instance.get("problem_statement", "").strip()
     iid = instance.get("instance_id", "")
@@ -33,30 +32,17 @@ def instance_to_artifact_text(instance: dict) -> str:
     interface = instance.get("interface", "").strip()
 
     parts = [
-        f"=== problem_statement.md ===\n"
-        f"# Problem Statement\n"
-        f"\n"
-        f"**Instance ID:** `{iid}`  \n"
-        f"**Repository:** `{repo}`  \n"
-        f"**Base Commit:** `{base_commit}`  \n"
-        f"\n"
-        f"{ps}\n",
+        f"Instance ID: {iid}",
+        f"Repository: {repo}",
+        f"Base Commit: {base_commit}",
+        f"",
+        ps,
     ]
 
     if requirements:
-        parts.append(
-            f"=== requirements.md ===\n"
-            f"# Requirements\n"
-            f"\n"
-            f"{requirements}\n"
-        )
+        parts += ["", "Requirements:", requirements]
 
     if interface:
-        parts.append(
-            f"=== new_interfaces.md ===\n"
-            f"# New Interfaces\n"
-            f"\n"
-            f"{interface}\n"
-        )
+        parts += ["", "New interfaces introduced:", interface]
 
     return "\n".join(parts)

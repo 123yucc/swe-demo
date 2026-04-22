@@ -1,15 +1,27 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from src.models.evidence import (
     ConstraintCard,
     LocalizationCard,
+    RequirementItem,
     StructuralCard,
     SymptomCard,
 )
 
 
+SchemaVersion = Literal["v2"]
+
+
 class EvidenceCards(BaseModel):
-    """Aggregates all four evidence cards for a single issue."""
+    """Aggregates all four evidence cards plus the RequirementItem task list
+    for a single issue.
+
+    schema_version == 'v2' introduced in phase 16: requirements is the primary
+    task-driving structure; localization.* / structural.* / constraint.* are
+    written ONLY by deep-search (no AS-IS/TO-BE prefix convention).
+    """
 
     symptom: SymptomCard = Field(
         description="Observable failure symptoms.",
@@ -22,6 +34,21 @@ class EvidenceCards(BaseModel):
     )
     structural: StructuralCard = Field(
         description="Architectural / module-level context.",
+    )
+    requirements: list[RequirementItem] = Field(
+        default_factory=list,
+        description=(
+            "Task-driving list of behavioral requirements. Parser initializes "
+            "with verdict=UNCHECKED; deep-search updates verdict / "
+            "evidence_locations / findings per requirement."
+        ),
+    )
+    schema_version: SchemaVersion = Field(
+        default="v2",
+        description=(
+            "Evidence-cards schema version. v2 introduced RequirementItem[] "
+            "and removed the AS-IS/TO-BE prefix convention."
+        ),
     )
 
 

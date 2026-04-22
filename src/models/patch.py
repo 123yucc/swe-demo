@@ -4,6 +4,10 @@ Patch planning and generation models.
 PatchPlan is produced by the Patch Planner agent and consumed by the
 Patch Generator agent.  It describes *what* to change and *why*, without
 containing actual code edits.
+
+Phase 18.D added preserved_findings to FileEditPlan — the patch-planner must
+copy prescriptive findings原文 to ensure boundary constraints reach the
+patch-generator without loss.
 """
 
 from pydantic import BaseModel, Field
@@ -29,6 +33,17 @@ class FileEditPlan(BaseModel):
             "Why this file needs to change — references the evidence cards "
             "(e.g. which exact_code_region, which constraint, which co-edit "
             "relation) that justify this edit."
+        ),
+    )
+    preserved_findings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Original prescriptive snippets from RequirementItem.findings that "
+            "apply to this file.  Patch-planner MUST copy these verbatim — "
+            "no summarization or paraphrasing.  Examples: backtick code "
+            "snippets, 'correct form is X', 'must use Y', explicit boundary "
+            "constraints.  These are hard constraints the patch-generator must "
+            "respect."
         ),
     )
     co_edit_dependencies: list[str] = Field(

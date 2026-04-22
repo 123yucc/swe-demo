@@ -153,6 +153,21 @@ def main() -> None:
             output_dir = Path("workdir") / instance_id / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Schema-version guard: refuse stale evidence.json ---
+    existing_evidence = output_dir / "evidence.json"
+    if existing_evidence.exists():
+        try:
+            existing = json.loads(existing_evidence.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = None
+        if isinstance(existing, dict) and existing.get("schema_version") != "v2":
+            print(
+                f"ERROR: existing {existing_evidence} is missing schema_version='v2'. "
+                "Phase 16 does NOT auto-migrate old-schema artifacts. "
+                "Move or delete the file and re-run to regenerate."
+            )
+            sys.exit(1)
+
     # --- Convert instance to artifact text ---
     artifact_text = instance_to_artifact_text(instance)
 
@@ -174,7 +189,7 @@ def main() -> None:
     print(f"Evidence JSON: {evidence_path}")
 
     # --- Write prediction for SWE-bench eval ---
-    patch_path = output_dir / "model_patch.diff"
+    patch_path = output_dir / "patch.diff"
     write_prediction(
         output_dir=output_dir,
         instance_id=instance_id,

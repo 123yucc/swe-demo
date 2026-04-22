@@ -10,6 +10,8 @@ State is shared with ingestion_tools via its accessor functions — no
 duplicate module-level state.
 """
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -132,8 +134,9 @@ async def submit_patch_plan(args: dict[str, Any]) -> dict[str, Any]:
 
     wm.patch_plan = plan
     wm.record_action(
-        f"submit_patch_plan: {len(edits)} file(s) — "
-        + ", ".join(e.filepath for e in edits)
+        phase="patch-planning",
+        subagent="submit_patch_plan",
+        outcome=f"{len(edits)}_files_submitted",
     )
 
     return {
@@ -168,11 +171,11 @@ _APPLY_SEARCH_REPLACE_SCHEMA = {
             "type": "string",
             "description": (
                 "One or more SEARCH/REPLACE blocks in the format:\n"
-                "<<<<\n"
+                "<<<<<<SEARCH\n"
                 "[exact old code to find]\n"
-                "====\n"
+                "======SPLIT\n"
                 "[new code to replace it with]\n"
-                ">>>>\n"
+                ">>>>>>REPLACE\n"
                 "\n"
                 "Multiple blocks are applied sequentially to the same file."
             ),
@@ -181,34 +184,42 @@ _APPLY_SEARCH_REPLACE_SCHEMA = {
 }
 
 
+_SEARCH_SEP = "<<<<<<SEARCH"
+_SPLIT_SEP = "======SPLIT"
+_REPLACE_SEP = ">>>>>>REPLACE"
+
+
 def _parse_search_replace_blocks(raw: str) -> list[tuple[str, str]]:
-    """Parse <<<< / ==== / >>>> delimited blocks.
+    """Parse <<<<<<SEARCH / ======SPLIT / >>>>>>REPLACE delimited blocks.
 
     Returns a list of (search, replace) tuples.
+
+    The longer, annotated delimiters avoid false matches on code content
+    such as ``====`` or ``>>>>`` that commonly appear in test files.
     """
     blocks: list[tuple[str, str]] = []
     remaining = raw
-    while "<<<<" in remaining:
-        start = remaining.index("<<<<")
-        remaining = remaining[start + 4 :]
+    while _SEARCH_SEP in remaining:
+        start = remaining.index(_SEARCH_SEP)
+        remaining = remaining[start + len(_SEARCH_SEP) :]
 
-        if "====" not in remaining:
+        if _SPLIT_SEP not in remaining:
             raise ValueError(
-                "Malformed SEARCH/REPLACE block: missing '====' separator."
+                f"Malformed SEARCH/REPLACE block: missing '{_SPLIT_SEP}' separator."
             )
-        sep = remaining.index("====")
+        sep = remaining.index(_SPLIT_SEP)
         search_text = remaining[:sep].strip("\n")
 
-        remaining = remaining[sep + 4 :]
+        remaining = remaining[sep + len(_SPLIT_SEP) :]
 
-        if ">>>>" not in remaining:
+        if _REPLACE_SEP not in remaining:
             raise ValueError(
-                "Malformed SEARCH/REPLACE block: missing '>>>>' terminator."
+                f"Malformed SEARCH/REPLACE block: missing '{_REPLACE_SEP}' terminator."
             )
-        end = remaining.index(">>>>")
+        end = remaining.index(_REPLACE_SEP)
         replace_text = remaining[:end].strip("\n")
 
-        remaining = remaining[end + 4 :]
+        remaining = remaining[end + len(_REPLACE_SEP) :]
 
         if not search_text:
             raise ValueError("SEARCH block is empty — nothing to find.")
@@ -216,6 +227,32 @@ def _parse_search_replace_blocks(raw: str) -> list[tuple[str, str]]:
         blocks.append((search_text, replace_text))
 
     return blocks
+
+
+def _validate_syntax(path: Path) -> str:
+    """Run a language-appropriate syntax check on *path*.
+
+    Returns an empty string on success, or an error message on failure.
+    Files with unsupported extensions are skipped (return "").
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".py":
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(path)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            return stderr or f"py_compile exited with code {result.returncode}"
+    elif suffix in (".js", ".mjs", ".cjs", ".ts"):
+        result = subprocess.run(
+            ["node", "--check", str(path)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            return stderr or f"node --check exited with code {result.returncode}"
+    return ""
 
 
 @tool(
@@ -279,8 +316,9 @@ async def apply_search_replace(args: dict[str, Any]) -> dict[str, Any]:
             ]
         }
 
-    # Read file content
-    content = abs_path.read_text(encoding="utf-8")
+    # Read file content (keep original for rollback)
+    original_content = abs_path.read_text(encoding="utf-8")
+    content = original_content
 
     # Apply blocks sequentially
     applied: list[str] = []
@@ -322,8 +360,28 @@ async def apply_search_replace(args: dict[str, Any]) -> dict[str, Any]:
     # Write back
     abs_path.write_text(content, encoding="utf-8")
 
+    # Syntax validation — rollback on failure
+    syntax_error = _validate_syntax(abs_path)
+    if syntax_error:
+        abs_path.write_text(original_content, encoding="utf-8")
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"ERROR: Syntax validation failed after applying edits to "
+                        f"{raw_filepath}. File has been rolled back to its original "
+                        f"state. Fix the REPLACE blocks and retry.\n"
+                        f"Syntax error: {syntax_error}"
+                    ),
+                }
+            ]
+        }
+
     wm.record_action(
-        f"apply_search_replace: {raw_filepath} — {len(blocks)} block(s) applied"
+        phase="patch-generation",
+        subagent="apply_search_replace",
+        outcome=f"{len(blocks)}_blocks_applied:{raw_filepath}",
     )
 
     return {

@@ -20,6 +20,10 @@ if _env_file.exists():
 
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_BASE_URL: str = os.environ.get("ANTHROPIC_BASE_URL", "")
+ANTHROPIC_MODEL: str = os.environ.get("ANTHROPIC_MODEL", "MiniMax-M2.7")
+ANTHROPIC_FALLBACK_MODEL: str = os.environ.get(
+    "ANTHROPIC_FALLBACK_MODEL", "MiniMax-M2.7-highspeed"
+)
 
 
 def sdk_env() -> dict[str, str]:
@@ -30,3 +34,28 @@ def sdk_env() -> dict[str, str]:
     if ANTHROPIC_BASE_URL:
         env["ANTHROPIC_BASE_URL"] = ANTHROPIC_BASE_URL
     return env
+
+
+def sdk_model_options() -> dict[str, str]:
+    """Return model options for ClaudeAgentOptions.
+
+    MiniMax Anthropic-compatible endpoints require MiniMax model names.
+    Setting these explicitly avoids falling back to SDK default model names.
+    """
+    options: dict[str, str] = {}
+    if ANTHROPIC_MODEL:
+        options["model"] = ANTHROPIC_MODEL
+    if ANTHROPIC_FALLBACK_MODEL:
+        options["fallback_model"] = ANTHROPIC_FALLBACK_MODEL
+    return options
+
+
+def sdk_stderr_logger(component: str):
+    """Create an SDK stderr callback with component prefix."""
+
+    def _logger(line: str) -> None:
+        msg = line.rstrip("\r\n")
+        if msg:
+            print(f"[sdk-stderr:{component}] {msg}", flush=True)
+
+    return _logger

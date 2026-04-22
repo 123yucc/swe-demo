@@ -1,20 +1,114 @@
 {
-  "overview": "Root cause: Two bugs — (1) PostgreSQL db.mget has a `LIMIT 1` clause that silently drops all matching rows except the first, breaking bulk confirmation lookups needed by loadUserInfo for email:pending/email:expired flags; (2) sendValidationEmail falls back to the stored user profile email instead of checking the pending email in the confirm object, potentially emailing the wrong address during email change workflows. Fix approach: Remove LIMIT 1 from postgres mget and map results back to input key order (null for missing keys); update email.js fallback to call getEmailForValidation(uid) to get the pending confirm-object email before falling back to stored profile email.",
+  "overview": "Root cause: Email validation system relies on database-level TTL (pexpire/pttl) instead of stored Unix timestamps, lacks fallback email retrieval from confirm objects when profile email is missing, and fails to clean up confirmation data during account deletion. Fix strategy: (1) Implement db.mget() batch string retrieval across all database adapters as foundation, (2) Add expires timestamp field to confirm objects and refactor expiry checks to use stored timestamps, (3) Implement getEmailForValidation() utility for fallback email retrieval, (4) Modify socket handlers to use getEmailForValidation before calling validation functions, (5) Add expireValidation cleanup to account deletion flow. Order respects dependencies: db.mget first, then email.js core changes, then socket handlers.",
   "edits": [
+    {
+      "filepath": "src/database/redis/main.js",
+      "target_functions": [
+        "module.mget"
+      ],
+      "change_rationale": "Prerequisite for all batch string retrieval. Evidence: req-003/req-004/req-014 mandate db.mget implementation. Similar pattern exists at lines 15-24 in module.exists using batch pattern. Redis uses client.mget which natively returns null for missing keys.",
+      "preserved_findings": [
+        "Redis module.get (line 60) uses module.client.get(key) for single string retrieval - no batch equivalent exists",
+        "Redis native client.mget returns null for missing keys - pattern not used in current code",
+        "All three adapters' module.exists implementations use position-preserving map patterns (key.map()) but return booleans, not values",
+        "Redis module.exists(array) uses batch pattern: const batch = module.client.batch(); key.forEach(key => batch.exists(key)); followed by helpers.execBatch(batch) and data.map() for position-preserving output"
+      ],
+      "co_edit_dependencies": [
+        "src/database/mongo/main.js",
+        "src/database/postgres/main.js"
+      ]
+    },
+    {
+      "filepath": "src/database/mongo/main.js",
+      "target_functions": [
+        "module.mget"
+      ],
+      "change_rationale": "Prerequisite for all batch string retrieval. Evidence: req-003/req-004/req-014 mandate db.mget implementation. Pattern from module.exists (lines 19-30) uses $in filter with position-preserving map.",
+      "preserved_findings": [
+        "MongoDB module.get (lines 66-77) uses findOne({ _key: key }) with data/value field extraction - no batch equivalent exists",
+        "MongoDB module.exists(array) uses find({ _key: { $in: key } }) with data.forEach to build map, then key.map(key => !!map[key]) for position-preserving output",
+        "If db.mget() is added to MongoDB main.js -> must use { _key: { $in: keys } } filter on objects collection with position-preserving map (pattern at lines 20-29)",
+        "db.mget implementation requires: MongoDB -> $in filter on _key with position map"
+      ],
+      "co_edit_dependencies": [
+        "src/database/redis/main.js",
+        "src/database/postgres/main.js"
+      ]
+    },
     {
       "filepath": "src/database/postgres/main.js",
       "target_functions": [
-        "mget"
+        "module.mget"
       ],
-      "change_rationale": "exact_code_region postgres/main.js:177-199 — the SQL query uses ANY($1::TEXT[]) to match keys but has LIMIT 1, so only the first matching row is ever returned regardless of how many keys are passed. This breaks loadUserInfo's bulk lookup of confirm:byUid:<uid> keys for email:pending/email:expired flag derivation. Fix: remove LIMIT 1 and add ORDER BY idx to preserve input key order, returning null for missing keys.",
-      "co_edit_dependencies": []
+      "change_rationale": "Prerequisite for all batch string retrieval. Evidence: req-003/req-004/req-014 mandate db.mget implementation. Pattern from getObjects (postgres/hash.js:131-153) uses UNNEST+ORDINALITY with LEFT OUTER JOIN for null handling.",
+      "preserved_findings": [
+        "PostgreSQL module.get (lines 106-119) joins legacy_object_live and legacy_string for single key - no batch equivalent exists",
+        "PostgreSQL module.exists(array) uses ANY($1::TEXT[]) with key.map(k => res.rows.some(r => r.k === k)) for position-preserving output",
+        "If db.mget() is added to PostgreSQL main.js -> must use UNNEST+ORDINALITY + LEFT OUTER JOIN legacy_object_live + LEFT OUTER JOIN legacy_string with ORDER BY ordinality (pattern at hash.js:131-153)",
+        "db.mget implementation requires: PostgreSQL -> UNNEST+ORDINALITY with LEFT OUTER JOIN for null handling"
+      ],
+      "co_edit_dependencies": [
+        "src/database/redis/main.js",
+        "src/database/mongo/main.js"
+      ]
     },
     {
       "filepath": "src/user/email.js",
       "target_functions": [
-        "sendValidationEmail"
+        "UserEmail.getEmailForValidation",
+        "UserEmail.isValidationPending",
+        "UserEmail.canSendValidation",
+        "UserEmail.getValidationExpiry",
+        "UserEmail.sendValidationEmail"
       ],
-      "change_rationale": "exact_code_region email.js:128-130 — when options.email is not provided, the fallback is user.getUserField(uid, 'email') which reads the stored profile email, not the pending confirm-object email. This means a user who has requested an email change receives the validation link at the OLD email address instead of the NEW one. Fix: call getEmailForValidation(uid) first as fallback before using the stored profile email. Backward-compat: getEmailForValidation returns null when no confirm object exists, so the stored profile email is still used as the final fallback.",
+      "change_rationale": "Core email validation logic requires multiple fixes: (1) Add getEmailForValidation() per req-011/req-015, (2) Store expires field in confirm objects per req-009/req-010, (3) Fix isValidationPending expiry check per req-012, (4) Fix canSendValidation edge cases per req-013. Evidence locations: lines 47-56, 58-61, 71-82, 84-159, 139-142.",
+      "preserved_findings": [
+        "src/user/email.js:139-142: db.setObject(`confirm:${confirm_code}`, { email, uid }) - confirmation object created WITHOUT expires field",
+        "src/user/email.js:48: db.get(`confirm:byUid:${uid}`) - retrieves confirmation code STRING",
+        "src/user/email.js:51: db.getObject(`confirm:${code}`) - retrieves confirmation object HASH",
+        "src/user/email.js:52: return !!(confirmObj && email === confirmObj.email) - returns based on object existence and email match only",
+        "src/user/email.js:55: return !!code - returns based on code existence only, NO confirmation object check",
+        "src/user/email.js:60: db.pttl(`confirm:byUid:${uid}`) - TTL retrieved from database, not from stored timestamp field",
+        "src/user/email.js:81: return ttl + interval < max - comparison executed without checking ttl validity (NaN, negative sentinel values)",
+        "src/database/redis/main.js:109: module.client.pttl(key) - Redis PTTL returns -1 (no expiry), -2 (missing key), or positive ms",
+        "src/database/mongo/main.js:148: getObjectField(key, 'expireAt') - Date.now() - returns NaN if expireAt is null",
+        "getEmailForValidation implementation must follow pattern: db.get(`confirm:byUid:${uid}`) -> db.getObject(`confirm:${code}`) -> verify confirmObj.uid matches input uid -> return confirmObj.email",
+        "If isValidationPending must check confirmation object existence when email not provided -> must add db.getObject(`confirm:${code}`) call and check confirmObj before returning true",
+        "If expires field is added -> getValidationExpiry must also be modified to use stored timestamp instead of db.pttl()"
+      ],
+      "co_edit_dependencies": [
+        "src/socket.io/admin/user.js"
+      ]
+    },
+    {
+      "filepath": "src/socket.io/admin/user.js",
+      "target_functions": [
+        "User.validateEmail",
+        "User.sendValidationEmail"
+      ],
+      "change_rationale": "Socket handlers must call getEmailForValidation before validation functions per req-006/req-007. Evidence: lines 62-70 validateEmail handler calls confirmByUid directly without email retrieval; lines 72-93 sendValidationEmail handler passes no email option.",
+      "preserved_findings": [
+        "src/socket.io/admin/user.js:68: user.email.confirmByUid(uid) called directly without prior email retrieval",
+        "src/socket.io/admin/user.js:80: user.email.sendValidationEmail(uid, { force: true }) - NO email option passed",
+        "If User.validateEmail handler is modified -> must call getEmailForValidation(uid) and potentially user.setUserField(uid, 'email', email) BEFORE confirmByUid(uid)",
+        "If User.sendValidationEmail handler is modified -> must call getEmailForValidation(uid) and pass email explicitly to sendValidationEmail"
+      ],
+      "co_edit_dependencies": [
+        "src/user/email.js"
+      ]
+    },
+    {
+      "filepath": "src/user/delete.js",
+      "target_functions": [
+        "User.deleteAccount"
+      ],
+      "change_rationale": "Account deletion must clean up email confirmation data per req-008. Evidence: lines 86-156 delete numerous keys but omit confirm:byUid and confirm:code cleanup. Similar pattern at line 151 shows User.reset.cleanByUid(uid) cleanup.",
+      "preserved_findings": [
+        "src/user/delete.js:151: User.reset.cleanByUid(uid) - similar cleanup pattern that IS implemented",
+        "src/user/email.js:63-69: UserEmail.expireValidation deletes confirm:byUid:${uid} and confirm:${code}",
+        "User.deleteAccount -> [MISSING] user.email.expireValidation(uid) -> confirm:byUid:${uid} deletion",
+        "User.deleteAccount -> [MISSING] user.email.expireValidation(uid) -> confirm:${code} deletion"
+      ],
       "co_edit_dependencies": []
     }
   ]

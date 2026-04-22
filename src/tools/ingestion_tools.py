@@ -1,14 +1,24 @@
 """
-Custom MCP tools for the evidence pipeline:
+Custom MCP tools for the evidence pipeline.
 
-1. update_localization — lets the Orchestrator persist confirmed code regions found
-   by Deep Search back to the evidence_cards.json file on disk.
-2. cache_retrieved_code — lets the Orchestrator cache critical code snippets
-   found by Deep Search into SharedWorkingMemory.
+Two tools are exposed:
 
-Uses module-level SharedWorkingMemory state so the calling Python code can
-retrieve results after the agent loop finishes.
+1. ``update_localization`` — persists deep-search's AS-IS code observations
+   back to the evidence cards.  Phase 16 redesign: each call is scoped to a
+   ``scope_requirement_id``; the scope's previous entries are fully replaced
+   (no merge, no dedup, no contradiction guard).
+
+2. ``cache_retrieved_code`` — caches critical code snippets in
+   SharedWorkingMemory for downstream agents.
+
+3. ``update_requirement_verdict`` — persists the verdict /
+   evidence_locations / findings for a specific RequirementItem.
+
+Module-level SharedWorkingMemory is used so the calling Python code can
+inspect the results after an agent loop finishes.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 import re
@@ -24,17 +34,64 @@ from src.models.evidence import (
 from src.models.context import EvidenceCards
 from src.models.memory import SharedWorkingMemory
 
-# Shared working memory; set by engine after parser returns,
-# read/updated by MCP tools during the orchestrator loop.
+
+# ── Module-level shared state ─────────────────────────────────────────────
+
 _working_memory: SharedWorkingMemory | None = None
-
-# Path where evidence_cards.json lives; set by the orchestrator engine before
-# launching the orchestrator agent so update_localization can write it back.
 _evidence_json_path: Path | None = None
-
-# Repo root path; set by the orchestrator engine so we can strip absolute paths.
 _repo_root: str = ""
 
+# Scope-based store for deep-search-owned fields.  Outer key: requirement id;
+# inner key: evidence-card field name; value: the full list of entries that
+# scope contributed (replaced wholesale on every update_localization call).
+_scoped_store: dict[str, dict[str, list[str]]] = {}
+
+
+# ── Field ownership tables (single source of truth) ──────────────────────
+
+# Fields deep-search may write (scope-keyed).  Any other key sent by
+# update_localization is a whitelist violation.
+DEEP_SEARCH_OWNED_FIELDS: tuple[str, ...] = (
+    "suspect_entities",
+    "exact_code_regions",
+    "call_chain_context",
+    "dataflow_relevant_uses",
+    "must_co_edit_relations",
+    "dependency_propagation",
+    "behavioral_constraints",
+    "semantic_boundaries",
+    "backward_compatibility",
+    "similar_implementation_patterns",
+)
+
+# Fields deep-search MUST NOT overwrite — always owned by parser.
+PARSER_OWNED_FIELDS: tuple[str, ...] = (
+    "observable_failures",
+    "repair_targets",
+    "regression_expectations",
+    "missing_elements_to_implement",
+    "requirements",
+)
+
+_LOCALIZATION_FIELDS = (
+    "suspect_entities",
+    "exact_code_regions",
+    "call_chain_context",
+    "dataflow_relevant_uses",
+)
+_STRUCTURAL_FIELDS = (
+    "must_co_edit_relations",
+    "dependency_propagation",
+)
+_CONSTRAINT_FIELDS = (
+    "behavioral_constraints",
+    "semantic_boundaries",
+    "backward_compatibility",
+    "similar_implementation_patterns",
+)
+
+
+# ── Accessors / setters ───────────────────────────────────────────────────
 
 def set_evidence_json_path(path: str | Path) -> None:
     global _evidence_json_path
@@ -54,12 +111,13 @@ def set_repo_root(path: str | Path) -> None:
 def init_working_memory(
     issue_context: str, evidence: EvidenceCards
 ) -> SharedWorkingMemory:
-    """Initialize the shared working memory (called by engine after parser)."""
-    global _working_memory
+    """Initialize shared working memory (called by engine after parser)."""
+    global _working_memory, _scoped_store
     _working_memory = SharedWorkingMemory(
         issue_context=issue_context,
         evidence_cards=evidence,
     )
+    _scoped_store = {}
     return _working_memory
 
 
@@ -87,341 +145,364 @@ def set_submitted_evidence(evidence: EvidenceCards) -> None:
 
 
 def reset_submitted_evidence() -> None:
-    global _working_memory
+    global _working_memory, _scoped_store
     _working_memory = None
+    _scoped_store = {}
 
 
-# ── Path & text normalization helpers ────────────────────────────────────
+def reset_requirement_for_rework(
+    requirement_id: str,
+    audit_feedback: str = "",
+) -> bool:
+    """Re-open a RequirementItem for a rework deep-search cycle.
+
+    Sets verdict back to UNCHECKED, clears its findings / evidence_locations,
+    and drops its scope in _scoped_store so stale localization entries do not
+    contaminate the next investigation.  Rebuilds the aggregate view.
+
+    *audit_feedback* — optional closure-checker audit text specific to this
+    requirement. Stored on ``RequirementItem.rework_context`` so the next
+    deep-search iteration can read it and steer its reasoning.  Deep-search
+    is responsible for clearing the field after a new verdict is persisted.
+
+    Returns True if the requirement existed and was reset.
+    """
+    global _scoped_store
+    if _working_memory is None:
+        return False
+    evidence = _working_memory.evidence_cards
+    target = None
+    for req in evidence.requirements:
+        if req.id == requirement_id:
+            target = req
+            break
+    if target is None:
+        return False
+    target.verdict = "UNCHECKED"
+    target.evidence_locations = []
+    target.findings = ""
+    target.rework_context = audit_feedback or ""
+    if requirement_id in _scoped_store:
+        del _scoped_store[requirement_id]
+        _rebuild_aggregate_view()
+    return True
+
+
+# ── Path normalization ────────────────────────────────────────────────────
 
 def _normalize_path(text: str) -> str:
-    """Normalize path references inside a free-form evidence string.
-
-    Handles:
-    - Backslashes → forward slashes
-    - Absolute path prefixes (e.g. D:/demo/workdir/.../repo/...) → relative
-    - Leading repo/ or ./ prefixes
-    """
+    """Normalize path references inside a free-form evidence string."""
     normalized = text.replace("\\", "/")
-
     if _repo_root:
         normalized = normalized.replace(_repo_root, "")
-
-    # Strip common prefix patterns
     normalized = re.sub(r"(?<![A-Za-z0-9_/])(?:\./)?repo/", "", normalized)
-
     return normalized
 
 
-def _extract_location_key(text: str) -> str | None:
-    """Extract the primary file:line location from an evidence entry.
+# ── Scope → aggregate rebuild ─────────────────────────────────────────────
 
-    Returns a normalized 'file.py:N' or 'file.py:N-M' string, or None.
-    """
-    m = re.search(r"([A-Za-z0-9_/.]+\.py):(\d+(?:-\d+)?)", text)
-    if m:
-        return f"{m.group(1)}:{m.group(2)}"
-    return None
-
-
-def _dedup_by_location(entries: list[str]) -> list[str]:
-    """Deduplicate entries that share the same primary file:line location.
-
-    When multiple entries reference the same file:line, keeps the longest
-    (most detailed) one.  Entries without a file:line are always kept.
-    """
-    by_loc: dict[str, str] = {}
-    no_loc: list[str] = []
-
-    for entry in entries:
-        loc = _extract_location_key(entry)
-        if loc is None:
-            no_loc.append(entry)
-        elif loc not in by_loc or len(entry) > len(by_loc[loc]):
-            by_loc[loc] = entry
-
-    # Preserve original order: walk entries, emit first occurrence per location
-    seen_locs: set[str] = set()
-    result: list[str] = []
-    no_loc_set = set(no_loc)
-    for entry in entries:
-        loc = _extract_location_key(entry)
-        if loc is None:
-            if entry in no_loc_set:
-                result.append(entry)
-                no_loc_set.discard(entry)
-        elif loc not in seen_locs:
-            result.append(by_loc[loc])
-            seen_locs.add(loc)
-
-    return result
+def _aggregate_field(field_name: str) -> list[str]:
+    """Flatten all scopes' contributions for one field, preserving scope
+    insertion order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for scope_entries in _scoped_store.values():
+        for v in scope_entries.get(field_name, []):
+            if v not in seen:
+                out.append(v)
+                seen.add(v)
+    return out
 
 
-# ── Symbol extraction for contradiction guard ────────────────────────────
+def _rebuild_aggregate_view() -> None:
+    """Rebuild LocalizationCard / StructuralCard / ConstraintCard (deep-search
+    subset) from the scoped store, preserving parser-owned fields intact."""
+    if _working_memory is None:
+        return
+    evidence = _working_memory.evidence_cards
 
-def _extract_primary_symbols(text: str) -> set[str]:
-    """Extract primary callable/class identifiers from an evidence entry.
+    evidence.localization = LocalizationCard(
+        **{name: _aggregate_field(name) for name in _LOCALIZATION_FIELDS}
+    )
+    evidence.structural = StructuralCard(
+        **{name: _aggregate_field(name) for name in _STRUCTURAL_FIELDS}
+    )
 
-    Matches:
-    - 'def X' / 'class X' patterns
-    - 'X(args)' call patterns
-    - '_method_name method/function' — common LLM phrasing for dead code entries
-    """
-    candidates: set[str] = set()
-    value = text.strip()
-    if not value:
-        return candidates
-
-    # 'def function_name'
-    for match in re.findall(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\b", value):
-        candidates.add(match.lower())
-
-    # 'class ClassName'
-    for match in re.findall(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b", value):
-        candidates.add(match.lower())
-
-    # 'name(args)' — function call signatures
-    for match in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*\(", value):
-        low = match.lower()
-        candidates.add(low)
-        if "." in low:
-            candidates.add(low.rsplit(".", 1)[-1])
-
-    # '_method_name method|function|方法' — LLM often writes entries like
-    # "_adjust_detection_parameters method in repo/..." for dead code.
-    for match in re.findall(
-        r"\b(_[A-Za-z_][A-Za-z0-9_]*)\s+(?:method|function|方法)\b", value
-    ):
-        candidates.add(match.lower())
-
-    # 'set_xxx method|function|方法' — public setter-like methods
-    for match in re.findall(
-        r"\b(set_[A-Za-z_][A-Za-z0-9_]*)\s+(?:method|function|方法)\b", value
-    ):
-        candidates.add(match.lower())
-
-    return candidates
+    # Constraint: preserve parser-owned missing_elements_to_implement;
+    # rebuild the deep-search-owned subset.
+    preserved_missing = list(evidence.constraint.missing_elements_to_implement)
+    evidence.constraint = ConstraintCard(
+        missing_elements_to_implement=preserved_missing,
+        **{name: _aggregate_field(name) for name in _CONSTRAINT_FIELDS},
+    )
 
 
-# ── Merge helpers ────────────────────────────────────────────────────────
+def _persist_evidence_to_disk() -> str:
+    if _evidence_json_path is None:
+        return " (evidence_json_path not set — in-memory only)"
+    if _working_memory is None:
+        return ""
+    _evidence_json_path.write_text(
+        _working_memory.evidence_cards.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    return f" Saved to {_evidence_json_path}."
 
-def _merge(existing: list[str], new: list[str]) -> list[str]:
-    """Merge two lists, preserving order, deduplicating by exact string."""
-    seen = set(existing)
-    merged = list(existing)
-    for v in new:
-        if v not in seen:
-            merged.append(v)
-            seen.add(v)
-    return merged
 
+# ── update_localization ───────────────────────────────────────────────────
 
-# ── MCP Tool Schemas ─────────────────────────────────────────────────────
-
-_UPDATE_LOCALIZATION_SCHEMA = {
+_UPDATE_LOCALIZATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
-        "Persist confirmed defect locations AND structural/constraint findings "
-        "from Deep Search back to evidence_cards.json.  Call this as soon as "
-        "you extract findings from a Deep Search report — do NOT wait until "
-        "final closure.  You MUST include ALL fields that Deep Search reported, "
-        "not just exact_code_regions."
+        "Persist AS-IS code observations from the deep-search agent. "
+        "Each call is scoped to a single requirement; the scope's previous "
+        "entries are fully REPLACED (no merge)."
     ),
+    "required": ["scope_requirement_id"],
     "properties": {
-        "exact_code_regions": {
-            "type": "array",
-            "items": {"type": "string"},
+        "scope_requirement_id": {
+            "type": "string",
             "description": (
-                "Exact line numbers or ranges in 'file.py:N' or 'file.py:N-M' form, "
-                "e.g. ['backend/models/face_detector.py:120', "
-                "'backend/models/face_detector.py:126']."
+                "RequirementItem.id that this batch of observations belongs to "
+                "(e.g. 'req-003'). Entries written under this scope REPLACE "
+                "any previous entries for the same scope."
             ),
         },
-        "suspect_entities": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Files, classes, functions, or variables confirmed or updated "
-                "by Deep Search."
-            ),
-        },
-        "call_chain_context": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Caller-Callee chains discovered by Deep Search, formatted as "
-                "'A -> B -> C' strings."
-            ),
-        },
-        "dataflow_relevant_uses": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Def-Use relationships discovered by Deep Search."
-            ),
-        },
-        "must_co_edit_relations": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Co-edit dependencies discovered by Deep Search: 'If A changes "
-                "→ B must also change'."
-            ),
-        },
-        "dependency_propagation": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Cross-cutting dependency paths discovered by Deep Search "
-                "(interface/package/config relationships)."
-            ),
-        },
-        "missing_elements_to_implement": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "TO-BE elements confirmed absent from the codebase by Deep "
-                "Search. These are interfaces/classes/methods required by "
-                "specifications but not yet implemented."
-            ),
+        **{
+            name: {"type": "array", "items": {"type": "string"}}
+            for name in DEEP_SEARCH_OWNED_FIELDS
         },
     },
-    "required": [],
 }
 
 
 @tool(
     "update_localization",
     (
-        "Persist confirmed defect locations and program-analysis context "
-        "discovered by Deep Search into the evidence_cards.json on disk. "
-        "You MUST call this tool before declaring evidence closure whenever "
-        "Deep Search has identified concrete code regions."
+        "Persist AS-IS code observations found by deep-search.  Must pass "
+        "scope_requirement_id; each call REPLACES the scope's previous "
+        "entries (no merge).  symptom.* and constraint.missing_elements_to_"
+        "implement are parser-only and cannot be written here."
     ),
     _UPDATE_LOCALIZATION_SCHEMA,
 )
 async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
-    """Write confirmed localization, structural, and constraint data back to
-    the evidence JSON file."""
     print(f"[update_localization CALLED] args keys: {list(args.keys())}", flush=True)
-    global _working_memory, _evidence_json_path
+    global _working_memory, _scoped_store
 
     if _working_memory is None:
         return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "ERROR: No working memory initialized. Run the parser first.",
-                }
-            ]
+            "content": [{
+                "type": "text",
+                "text": "ERROR: No working memory initialized. Run the parser first.",
+            }]
         }
 
-    evidence = _working_memory.evidence_cards
-
-    # ── Normalize all incoming paths ──
-    exact_code_regions = [_normalize_path(v) for v in args.get("exact_code_regions", [])]
-    suspect_entities = [_normalize_path(v) for v in args.get("suspect_entities", [])]
-    call_chain_context = [_normalize_path(v) for v in args.get("call_chain_context", [])]
-    dataflow_relevant_uses = [_normalize_path(v) for v in args.get("dataflow_relevant_uses", [])]
-    must_co_edit_relations = [_normalize_path(v) for v in args.get("must_co_edit_relations", [])]
-    dependency_propagation = [_normalize_path(v) for v in args.get("dependency_propagation", [])]
-    missing_elements = [_normalize_path(v) for v in args.get("missing_elements_to_implement", [])]
-
-    # ── Merge new values into existing cards ──
-    loc = evidence.localization
-    merged_suspect = _merge(loc.suspect_entities, suspect_entities)
-    merged_regions = _merge(loc.exact_code_regions, exact_code_regions)
-    merged_chains = _merge(loc.call_chain_context, call_chain_context)
-    merged_dataflow = _merge(loc.dataflow_relevant_uses, dataflow_relevant_uses)
-
-    # ── Dedup by file:line location ──
-    evidence.localization = LocalizationCard(
-        suspect_entities=_dedup_by_location(merged_suspect),
-        exact_code_regions=_dedup_by_location(merged_regions),
-        call_chain_context=_dedup_by_location(merged_chains),
-        dataflow_relevant_uses=_dedup_by_location(merged_dataflow),
-    )
-
-    if must_co_edit_relations or dependency_propagation:
-        struc = evidence.structural
-        evidence.structural = StructuralCard(
-            must_co_edit_relations=_dedup_by_location(
-                _merge(struc.must_co_edit_relations, must_co_edit_relations)
-            ),
-            dependency_propagation=_dedup_by_location(
-                _merge(struc.dependency_propagation, dependency_propagation)
-            ),
-        )
-
-    if missing_elements:
-        con = evidence.constraint
-        con.missing_elements_to_implement = _dedup_by_location(
-            _merge(con.missing_elements_to_implement, missing_elements)
-        )
-
-    # ── Contradiction guard ──
-    # Remove a missing_elements entry when its primary callable/class symbol
-    # is ALSO found as a primary symbol in suspect_entities.
-    con = evidence.constraint
-    loc = evidence.localization
-    suspect_symbols: set[str] = set()
-    for entity in loc.suspect_entities:
-        suspect_symbols.update(_extract_primary_symbols(entity))
-
-    filtered_missing: list[str] = []
-    removed_missing: list[str] = []
-    for item in con.missing_elements_to_implement:
-        item_symbols = _extract_primary_symbols(item)
-        if item_symbols and item_symbols.issubset(suspect_symbols):
-            removed_missing.append(item)
-            continue
-        filtered_missing.append(item)
-
-    if removed_missing:
-        con.missing_elements_to_implement = filtered_missing
-        for item in removed_missing:
-            print(
-                "[contradiction resolved] removed from "
-                f"missing_elements_to_implement (exists in suspect_entities): "
-                f"{item[:120]}"
-            )
-
-    # Record action in working memory
-    action_parts = []
-    if exact_code_regions:
-        action_parts.append(f"regions={len(exact_code_regions)}")
-    if suspect_entities:
-        action_parts.append(f"entities={len(suspect_entities)}")
-    if call_chain_context:
-        action_parts.append(f"chains={len(call_chain_context)}")
-    _working_memory.record_action(
-        f"update_localization: {', '.join(action_parts) or 'no new data'}"
-    )
-
-    if _evidence_json_path is not None:
-        _evidence_json_path.write_text(
-            evidence.model_dump_json(indent=2), encoding="utf-8"
-        )
-        saved_msg = f" Saved to {_evidence_json_path}."
-    else:
-        saved_msg = " (evidence_json_path not set — in-memory only)"
-
-    return {
-        "content": [
-            {
+    scope_id = args.get("scope_requirement_id")
+    if not scope_id or not isinstance(scope_id, str):
+        return {
+            "content": [{
                 "type": "text",
                 "text": (
-                    f"Evidence updated: exact_code_regions={len(exact_code_regions)}, "
-                    f"entities={len(suspect_entities)}, "
-                    f"call_chains={len(call_chain_context)}, "
-                    f"dataflow={len(dataflow_relevant_uses)}, "
-                    f"co_edits={len(must_co_edit_relations)}, "
-                    f"dep_propagation={len(dependency_propagation)}, "
-                    f"missing_elements={len(missing_elements)}.{saved_msg}"
+                    "ERROR: scope_requirement_id (str) is required — "
+                    "pass the RequirementItem.id this batch belongs to."
                 ),
-            }
-        ]
+            }]
+        }
+
+    # ── Whitelist check — parser-owned fields are forbidden here ──
+    forbidden = [k for k in args.keys()
+                 if k != "scope_requirement_id" and k in PARSER_OWNED_FIELDS]
+    if forbidden:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"ERROR: fields {forbidden} are parser-owned and cannot "
+                    "be written via update_localization. Use update_"
+                    "requirement_verdict for requirement state, and parser "
+                    "owns symptom.* / missing_elements_to_implement."
+                ),
+            }]
+        }
+
+    unknown = [k for k in args.keys()
+               if k != "scope_requirement_id"
+               and k not in DEEP_SEARCH_OWNED_FIELDS]
+    if unknown:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"ERROR: unknown fields {unknown}. Allowed keys: "
+                    f"scope_requirement_id, {list(DEEP_SEARCH_OWNED_FIELDS)}."
+                ),
+            }]
+        }
+
+    # ── Build fresh scope bucket (wholesale replace) ──
+    new_bucket: dict[str, list[str]] = {}
+    for name in DEEP_SEARCH_OWNED_FIELDS:
+        values = args.get(name)
+        if values:
+            new_bucket[name] = [_normalize_path(v) for v in values]
+
+    _scoped_store[scope_id] = new_bucket
+    _rebuild_aggregate_view()
+    saved_msg = _persist_evidence_to_disk()
+
+    counts = {k: len(v) for k, v in new_bucket.items()}
+    total = sum(counts.values()) if counts else 0
+    _working_memory.record_action(
+        phase="deep-search",
+        subagent="update_localization",
+        outcome=f"{total}_entries" if total else "cleared",
+        requirement_id=scope_id,
+    )
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Scope '{scope_id}' updated: {counts or 'cleared'}."
+                f"{saved_msg}"
+            ),
+        }]
     }
 
+
+# ── update_requirement_verdict ────────────────────────────────────────────
+
+_UPDATE_REQUIREMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Persist deep-search's verdict for one RequirementItem.  Replaces "
+        "the item's verdict / evidence_locations / findings wholesale."
+    ),
+    "required": ["requirement_id", "verdict"],
+    "properties": {
+        "requirement_id": {
+            "type": "string",
+            "description": "RequirementItem.id (e.g. 'req-003').",
+        },
+        "verdict": {
+            "type": "string",
+            "enum": [
+                "UNCHECKED",
+                "AS_IS_COMPLIANT",
+                "AS_IS_VIOLATED",
+                "TO_BE_MISSING",
+                "TO_BE_PARTIAL",
+            ],
+        },
+        "evidence_locations": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Code locations ('file.py:LINE' or 'file.py:LINE-LINE') "
+                "substantiating the verdict. Non-empty unless "
+                "verdict == 'AS_IS_COMPLIANT'."
+            ),
+        },
+        "findings": {
+            "type": "string",
+            "description": "Deep-search's on-site summary for this requirement.",
+        },
+    },
+}
+
+
+@tool(
+    "update_requirement_verdict",
+    (
+        "Update one RequirementItem after deep-search has verified it "
+        "against the code.  Sets verdict / evidence_locations / findings."
+    ),
+    _UPDATE_REQUIREMENT_SCHEMA,
+)
+async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
+    print(
+        f"[update_requirement_verdict CALLED] "
+        f"req={args.get('requirement_id')} verdict={args.get('verdict')}",
+        flush=True,
+    )
+    global _working_memory
+
+    if _working_memory is None:
+        return {
+            "content": [{
+                "type": "text",
+                "text": "ERROR: No working memory initialized. Run the parser first.",
+            }]
+        }
+
+    req_id = args.get("requirement_id")
+    verdict = args.get("verdict")
+    if not req_id or not verdict:
+        return {
+            "content": [{
+                "type": "text",
+                "text": "ERROR: requirement_id and verdict are both required.",
+            }]
+        }
+
+    evidence_locations = [_normalize_path(v) for v in args.get("evidence_locations", [])]
+    findings = args.get("findings", "") or ""
+
+    target = None
+    for item in _working_memory.evidence_cards.requirements:
+        if item.id == req_id:
+            target = item
+            break
+    if target is None:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"ERROR: requirement_id '{req_id}' not found among "
+                    f"{[r.id for r in _working_memory.evidence_cards.requirements]}."
+                ),
+            }]
+        }
+
+    if verdict != "AS_IS_COMPLIANT" and not evidence_locations:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"ERROR: evidence_locations must be non-empty for "
+                    f"verdict '{verdict}'."
+                ),
+            }]
+        }
+
+    target.verdict = verdict
+    target.evidence_locations = evidence_locations
+    target.findings = findings
+    # Consume any rework_context now that a fresh verdict has been recorded;
+    # the audit feedback was meant to steer this single iteration only.
+    target.rework_context = ""
+
+    _working_memory.record_action(
+        phase="deep-search",
+        subagent="update_requirement_verdict",
+        outcome=f"{verdict}:{len(evidence_locations)}_locs",
+        requirement_id=req_id,
+    )
+    saved_msg = _persist_evidence_to_disk()
+
+    return {
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Requirement '{req_id}' -> {verdict} with "
+                f"{len(evidence_locations)} locations.{saved_msg}"
+            ),
+        }]
+    }
+
+
+# ── cache_retrieved_code ──────────────────────────────────────────────────
 
 _CACHE_CODE_SCHEMA = {
     "type": "object",
@@ -464,29 +545,29 @@ async def cache_retrieved_code(args: dict[str, Any]) -> dict[str, Any]:
 
     if _working_memory is None:
         return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "ERROR: No working memory initialized. Run the parser first.",
-                }
-            ]
+            "content": [{
+                "type": "text",
+                "text": "ERROR: No working memory initialized. Run the parser first.",
+            }]
         }
 
     location: str = _normalize_path(args["location"])
     code: str = args["code"]
 
     _working_memory.retrieved_code[location] = code
-    _working_memory.record_action(f"cache_retrieved_code: {location}")
+    _working_memory.record_action(
+        phase="deep-search",
+        subagent="cache_retrieved_code",
+        outcome=f"cached:{location}",
+    )
 
     return {
-        "content": [
-            {
-                "type": "text",
-                "text": (
-                    f"Code cached: {location} "
-                    f"({len(code)} chars, "
-                    f"{len(_working_memory.retrieved_code)} total snippets)."
-                ),
-            }
-        ]
+        "content": [{
+            "type": "text",
+            "text": (
+                f"Code cached: {location} "
+                f"({len(code)} chars, "
+                f"{len(_working_memory.retrieved_code)} total snippets)."
+            ),
+        }]
     }
