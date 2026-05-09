@@ -1,28 +1,109 @@
 {
-  "overview": "Root cause: `hide_qt_warning` and `QtWarningFilter` were relocated from `qutebrowser/utils/log.py` to `qutebrowser/utils/qtlog.py`, but no test file `test_qtlog.py` was ever created to cover the relocated components. The implementation (qtlog.py:34-66) and backward-compatible re-exports (log.py:34-36) are fully correct. The only fix needed is to create a new test file `tests/unit/utils/test_qtlog.py` that imports directly from the `qtlog` module and exercises the context manager and filter class per the behavioral requirements. This mirrors the established precedent from `test_log.py`'s `test_py_warning_filter` and `TestLogFilter` test patterns.",
+  "overview": "The root cause is an incomplete module reorganization: `hide_qt_warning` and `QtWarningFilter` were intended to move from `qutebrowser/utils/log.py` to `qutebrowser/utils/qtlog.py`, but the move was never executed. Both symbols remain exclusively in `log.py` (lines 362–371 and 404–419). As a result, the production caller (`qtnetworkdownloads.py:124`) and the test class `TestHideQtWarning` (`test_log.py:343–369`) still reference the old module, and `test_qtlog.py` has no coverage for these symbols at all.\n\nThe fix strategy is a verbatim move in five coordinated edits, ordered so that the new definitions exist before any reference is updated:\n1. Add `QtWarningFilter` and `hide_qt_warning` to `qtlog.py` (the destination module).\n2. Remove both symbols from `log.py` (the source module).\n3. Update the production import in `qtnetworkdownloads.py`.\n4. Move `TestHideQtWarning` into `test_qtlog.py` (updating the import reference).\n5. Remove `TestHideQtWarning` from `test_log.py`.\n\nAll existing imports needed by the moved code (`contextlib`, `logging`, `Iterator`) are already present in `qtlog.py`, so no new import lines are required. The filtering logic itself is correct and must be preserved verbatim — only the module location changes.",
   "edits": [
+    {
+      "filepath": "qutebrowser/utils/qtlog.py",
+      "target_functions": [
+        "QtWarningFilter",
+        "QtWarningFilter.__init__",
+        "QtWarningFilter.filter",
+        "hide_qt_warning"
+      ],
+      "change_rationale": "req-007 (TO_BE_MISSING) and req-008 (TO_BE_MISSING) both require that `hide_qt_warning` and `QtWarningFilter` be defined here. The must_co_edit_relations state 'QtWarningFilter must be added to qtlog.py at the same time as hide_qt_warning'. The dependency_propagation confirms qtlog.py already imports `contextlib`, `logging`, and `Iterator` (lines 20–26), so no new imports are needed. The similar_implementation_patterns note that `disable_qt_msghandler` (qtlog.py:48–68) uses the identical `@contextlib.contextmanager + try/finally` pattern, which should be followed.",
+      "preserved_findings": [
+        "def hide_qt_warning(pattern: str, logger: str = 'qt') -> Iterator[None]:  # context manager in qutebrowser/utils/qtlog.py that temporarily suppresses Qt log warnings whose message starts with the given pattern for the specified logger",
+        "class QtWarningFilter(logging.Filter):  # in qutebrowser/utils/qtlog.py; __init__(self, pattern: str); filter(self, record: logging.LogRecord) -> bool",
+        "qutebrowser/utils/log.py:362-371 -- reference implementation of hide_qt_warning (to be moved verbatim to qtlog.py)",
+        "qutebrowser/utils/log.py:404-419 -- reference implementation of QtWarningFilter (to be moved verbatim to qtlog.py)",
+        "qutebrowser/utils/qtlog.py:48-68 -- disable_qt_msghandler uses the same @contextlib.contextmanager + try/finally pattern",
+        "qutebrowser/utils/qtlog.py:26 already imports Iterator from typing -- no new import needed",
+        "qutebrowser/utils/qtlog.py:20-21 already imports contextlib and logging -- no new imports needed for the move",
+        "log.py:365 -- log_filter = QtWarningFilter(pattern) instantiated inside hide_qt_warning",
+        "log.py:366 -- logger_obj = logging.getLogger(logger) fetches the named logger",
+        "log.py:367 -- logger_obj.addFilter(log_filter) attaches filter for context duration",
+        "log.py:371 -- logger_obj.removeFilter(log_filter) cleans up on exit",
+        "log.py:414: self._pattern = pattern (stored in __init__)",
+        "log.py:418: self._pattern consumed in filter() via record.msg.strip().startswith(self._pattern)",
+        "log.py:418 -- do_log = not record.msg.strip().startswith(self._pattern) is the actual suppression predicate",
+        "QtWarningFilter must be added alongside hide_qt_warning (req-007) since hide_qt_warning instantiates it at log.py:365"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/utils/log.py",
+        "qutebrowser/browser/qtnetworkdownloads.py",
+        "tests/unit/utils/test_qtlog.py"
+      ]
+    },
+    {
+      "filepath": "qutebrowser/utils/log.py",
+      "target_functions": [
+        "hide_qt_warning",
+        "QtWarningFilter"
+      ],
+      "change_rationale": "The must_co_edit_relations require: 'If hide_qt_warning is added to qtlog.py -> qutebrowser/utils/log.py:362-371 must be removed or re-exported' and 'If QtWarningFilter moves to qtlog.py -> qutebrowser/utils/log.py:404-419 must be removed or re-exported'. Leaving both definitions in log.py after adding them to qtlog.py would create duplicate symbols and mislead callers. The exact_code_regions identify lines 362–371 (hide_qt_warning) and 404–419 (QtWarningFilter) as the removal targets.",
+      "preserved_findings": [
+        "Both symbols still live exclusively in `qutebrowser/utils/log.py` (lines 362-371 and 404-419 respectively); they are absent from `qutebrowser/utils/qtlog.py` entirely",
+        "If hide_qt_warning is added to qtlog.py -> qutebrowser/utils/log.py:362-371 must be removed or re-exported",
+        "If QtWarningFilter moves to qtlog.py -> qutebrowser/utils/log.py:404-419 must be removed or re-exported",
+        "qutebrowser/utils/log.py:362-371",
+        "qutebrowser/utils/log.py:404-419"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/utils/qtlog.py"
+      ]
+    },
+    {
+      "filepath": "qutebrowser/browser/qtnetworkdownloads.py",
+      "target_functions": [],
+      "change_rationale": "The must_co_edit_relations state: 'If hide_qt_warning moves to qtlog.py -> qutebrowser/browser/qtnetworkdownloads.py:124 import must change'. The call_chain_context confirms: 'qutebrowser/browser/qtnetworkdownloads.py:124 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]'. Once hide_qt_warning is removed from log.py, this call site will fail at runtime unless updated.",
+      "preserved_findings": [
+        "qutebrowser/browser/qtnetworkdownloads.py:124 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]",
+        "If hide_qt_warning moves to qtlog.py -> qutebrowser/browser/qtnetworkdownloads.py:124 import must change"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/utils/qtlog.py"
+      ]
+    },
     {
       "filepath": "tests/unit/utils/test_qtlog.py",
       "target_functions": [
-        "TestQtWarningFilter.filter",
-        "TestQtWarningFilter.filter_leading_whitespace",
-        "test_hide_qt_warning_suppresses_matching",
-        "test_hide_qt_warning_allows_nonmatching",
-        "test_hide_qt_warning_multiple_loggers"
+        "TestHideQtWarning",
+        "TestHideQtWarning.test_unfiltered",
+        "TestHideQtWarning.test_filtered"
       ],
-      "change_rationale": "exact_code_region: qtlog.py:34-48 (hide_qt_warning), qtlog.py:51-66 (QtWarningFilter), log.py:34-36 (backward-compatible re-exports). constraint: 'similar_implementation_patterns' — log.py py_warning_filter context manager (log.py:227-237) has dedicated tests test_py_warning_filter and test_py_warning_filter_error in test_log.py, establishing the precedent for how hide_qt_warning should be tested. constraint: 'missing_elements_to_implement' — both hide_qt_warning and QtWarningFilter are listed as missing test coverage. co_edit_relation: test imports from qtlog must not break the log.py re-export chain (qtlog -> log.py:34-36 -> qtnetworkdownloads.py:124). regression_expectations require that filtering behavior (strip-before-startswith, prefix suppression, multi-logger consistency) be verified by automated tests.",
+      "change_rationale": "The must_co_edit_relations state: 'If hide_qt_warning moves to qtlog.py -> tests/unit/utils/test_log.py::TestHideQtWarning must move to test_qtlog.py'. The file currently exists (53 lines) but contains only TestQtMessageHandler; it has no coverage for hide_qt_warning or QtWarningFilter. The full TestHideQtWarning class (test_log.py:343–369) must be reproduced here, with all import references updated from `log.hide_qt_warning` to `qtlog.hide_qt_warning`. req-006 (TO_BE_PARTIAL) also requires that multi-logger consistency be verified, so the moved tests should cover the default 'qt' logger in addition to the existing 'qt-tests' fixture.",
       "preserved_findings": [
-        "The QtWarningFilter.filter() method (qtlog.py:63-66) returns True (allow log) when the record message does NOT start with the pattern",
-        "`do_log = not record.msg.strip().startswith(self._pattern)`",
-        "The filter checks `record.msg.strip().startswith(self._pattern)` and returns `False` when it matches (suppresses)",
-        "any(msg.strip().startswith(pattern) for pattern in suppressed_msgs) — prefix-check pattern confirms startswith is the intended matching semantics",
-        "qt_message_handler at qtlog.py:203 uses identical msg.strip().startswith(pattern) for suppressed_msgs prefix-check",
-        "The context manager should maintain consistent suppression behavior when applied to different Qt logger instances",
-        "same QtWarningFilter instance added to every logger via addFilter",
-        "The strip()-before-startswith pattern is consistent throughout the module",
-        "Filter pattern matching should properly handle warning messages that include leading whitespace characters or trailing spaces by applying the pattern comparison logic against the trimmed message content"
+        "If hide_qt_warning moves to qtlog.py -> tests/unit/utils/test_log.py::TestHideQtWarning must move to test_qtlog.py",
+        "tests/unit/utils/test_log.py:352 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]",
+        "tests/unit/utils/test_log.py:366 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]",
+        "test_log.py:343-369 (`TestHideQtWarning`) uses a single fixture logger `'qt-tests'` for both `test_unfiltered` (line 351) and `test_filtered` (line 365)",
+        "test_log.py:354 -- qt_logger.warning('Hello World') with pattern 'World' (not at start)",
+        "test_log.py:355-358 -- asserts 1 record captured, levelname=='WARNING', message=='Hello World'",
+        "test_log.py:361 -- parametrize value 'Hello' with comment '# exact match' exercises the exact-match suppression path",
+        "test_log.py:362 -- parametrize value 'Hello World' with comment '# match at start of line' directly exercises prefix-match suppression",
+        "test_log.py:363 -- parametrize value '  Hello World  ' (leading + trailing spaces) with comment '# match with spaces' directly exercises the whitespace-trimming path",
+        "test_log.py:369 -- assert not caplog.records confirms zero records captured (complete suppression)"
       ],
-      "co_edit_dependencies": []
+      "co_edit_dependencies": [
+        "qutebrowser/utils/qtlog.py",
+        "tests/unit/utils/test_log.py"
+      ]
+    },
+    {
+      "filepath": "tests/unit/utils/test_log.py",
+      "target_functions": [
+        "TestHideQtWarning"
+      ],
+      "change_rationale": "The must_co_edit_relations state: 'If hide_qt_warning moves to qtlog.py -> tests/unit/utils/test_log.py::TestHideQtWarning must move to test_qtlog.py'. The exact_code_regions identify lines 343–369 as the TestHideQtWarning class. Once the class is reproduced in test_qtlog.py and hide_qt_warning is removed from log.py, the references at lines 352 and 366 (`log.hide_qt_warning(...)`) will fail at import/runtime. The class must be removed from this file to eliminate the stale references.",
+      "preserved_findings": [
+        "The test suite in `tests/unit/utils/test_log.py` (class `TestHideQtWarning`, lines 343-369) still calls `log.hide_qt_warning(...)` on lines 352 and 366, referencing the old module.",
+        "tests/unit/utils/test_log.py:352 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]",
+        "tests/unit/utils/test_log.py:366 -> log.hide_qt_warning() [must change to qtlog.hide_qt_warning()]",
+        "If hide_qt_warning moves to qtlog.py -> tests/unit/utils/test_log.py::TestHideQtWarning must move to test_qtlog.py",
+        "tests/unit/utils/test_log.py:343-369"
+      ],
+      "co_edit_dependencies": [
+        "tests/unit/utils/test_qtlog.py"
+      ]
     }
   ]
 }

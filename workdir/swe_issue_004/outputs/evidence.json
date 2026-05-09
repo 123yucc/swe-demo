@@ -1,0 +1,215 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "With content.blocking.enabled turned on and example.com present in the blocklist, https://sub.example.com and deeper subdomains are not blocked.",
+      "Whitelisted URLs are only respected as part of the final boolean expression, rather than an early, clear override.",
+      "Requests are only blocked if the exact request hostname matches an entry in either the dynamically loaded blocked hosts set or the config-defined blocked hosts."
+    ],
+    "repair_targets": [
+      "If a parent domain is blocked, all of its subdomains should also be blocked unless explicitly whitelisted.",
+      "Blocking example.com should block example.com, sub.example.com, and a.b.example.com.",
+      "Whitelist rules should take precedence cleanly: if a request URL is whitelisted, it must not be blocked even if a parent domain matches the blocklist.",
+      "Blocking should consider a widened sequence of hostnames derived from the request host and return blocked on the first match in either the runtime or config block sets."
+    ],
+    "regression_expectations": [
+      "https://example.com continues to be blocked when example.com is present in the blocklist.",
+      "content.blocking.enabled toggle continues to suppress all blocking when disabled."
+    ]
+  },
+  "constraint": {
+    "semantic_boundaries": [],
+    "behavioral_constraints": [],
+    "backward_compatibility": [],
+    "similar_implementation_patterns": [
+      "qutebrowser/components/braveadblock.py:143-146 — self.enabled guard (checks content.blocking.method) fires before the per-URL toggle check at line 161",
+      "qutebrowser/components/braveadblock.py:143-146 — self.enabled guard fires unconditionally before any URL check, demonstrating the correct early-exit pattern that the whitelist check should mirror",
+      "qutebrowser/config/configutils.py:42-48 -- _widened_hostnames(hostname) yields hostname then strips leftmost label via partition('.'), identical semantics needed for blocking",
+      "qutebrowser/config/configutils.py:234 -- widened_hosts = _widened_hostnames(url.host().rstrip('.')) shows the call pattern: strip trailing dot then widen",
+      "qutebrowser/config/configutils.py:42-48 — _widened_hostnames(hostname) yields hostname then strips leftmost label via partition('.'), identical semantics needed for blocking",
+      "qutebrowser/config/configutils.py:234 — widened_hosts = _widened_hostnames(url.host().rstrip('.')) shows the call pattern: strip trailing dot then widen, iterate with chain([None]) for global fallback",
+      "qutebrowser/config/configutils.py:232-234 -- url.host().rstrip('.') before _widened_hostnames(); comment documents the equivalence rule explicitly",
+      "qutebrowser/utils/urlmatch.py:226 -- self.host = hostname.rstrip('.') during UrlPattern construction",
+      "qutebrowser/utils/urlmatch.py:256 -- host = host.rstrip('.') inside _matches_host()",
+      "qutebrowser/config/configutils.py:234 — call site strips trailing dot then passes to _widened_hostnames, showing the expected usage pattern",
+      "qutebrowser/config/configutils.py:42-48 — private _widened_hostnames(hostname) yields hostname then strips leftmost label via partition('.')[-1]; identical semantics needed for the public version",
+      "qutebrowser/config/configutils.py:234 — call pattern: url.host().rstrip('.') passed to _widened_hostnames(); public version should expect the same pre-normalised input"
+    ],
+    "missing_elements_to_implement": [
+      "def widened_hostnames(hostname: str) -> Iterable[str]"
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "qutebrowser/components/hostblock.py:HostBlocker._is_blocked",
+      "qutebrowser/components/braveadblock.py:BraveAdBlocker._is_blocked",
+      "qutebrowser/components/utils/blockutils.py:is_whitelisted_url",
+      "qutebrowser/config/configutils.py:_widened_hostnames",
+      "qutebrowser/utils/urlutils.py — target file where widened_hostnames must be defined",
+      "qutebrowser/config/configutils.py:_widened_hostnames — existing private implementation with identical semantics"
+    ],
+    "exact_code_regions": [
+      "qutebrowser/components/hostblock.py:114-130",
+      "qutebrowser/components/braveadblock.py:136-193",
+      "qutebrowser/components/utils/blockutils.py:159-162",
+      "qutebrowser/components/hostblock.py:127-130",
+      "qutebrowser/config/configutils.py:42-48",
+      "qutebrowser/config/configutils.py:234",
+      "qutebrowser/components/hostblock.py:127",
+      "qutebrowser/components/hostblock.py:128-130",
+      "qutebrowser/components/hostblock.py:163-174",
+      "qutebrowser/components/braveadblock.py:165-169",
+      "qutebrowser/browser/webengine/interceptor.py:166",
+      "qutebrowser/browser/webengine/interceptor.py:196-200",
+      "qutebrowser/config/configutils.py:232-234",
+      "qutebrowser/utils/urlmatch.py:226",
+      "qutebrowser/utils/urlmatch.py:256",
+      "tests/unit/config/test_configutils.py:305-315",
+      "qutebrowser/utils/urlutils.py:1-601"
+    ],
+    "call_chain_context": [
+      "interceptor.RequestInterceptor.interceptRequest() -> interceptors.run() -> HostBlocker.filter_request() -> HostBlocker._is_blocked()",
+      "interceptor.RequestInterceptor.interceptRequest() -> interceptors.run() -> BraveAdBlocker.filter_request() -> BraveAdBlocker._is_blocked()",
+      "interceptor.RequestInterceptor.interceptRequest() -> interceptors.run() -> HostBlocker.filter_request() -> HostBlocker._is_blocked() -> host = request_url.host() [single lookup, no widening]",
+      "interceptor.RequestInterceptor.interceptRequest() -> interceptors.run() -> HostBlocker.filter_request() -> HostBlocker._is_blocked() -> host = request_url.host() [single lookup, no widening loop over parent domains]",
+      "browser/webengine/interceptor.py:166 (url = info.requestUrl()) -> interceptor.py:198 (request_url=url) -> HostBlocker._is_blocked(request_url) -> hostblock.py:127 (host = request_url.host()) -> plain hostname string compared against _blocked_hosts/_config_blocked_hosts at line 129",
+      "browser/webengine/interceptor.py:166 (url = info.requestUrl()) -> interceptor.py:198 (request_url=url) -> BraveAdBlocker._is_blocked(request_url) -> braveadblock.py:166 (request_url.toString()) -> adblock engine check_network_urls(full_url_str, ...)",
+      "interceptor.py -> hostblock.py:127 (host = request_url.host()) -> hostblock.py:129 (host in self._blocked_hosts) -- no trailing-dot strip at any step",
+      "hostblock.py:_is_blocked() needs widened_hostnames from urlutils.py (req-004) — the public symbol must exist in urlutils.py before hostblock.py can import it"
+    ],
+    "dataflow_relevant_uses": [
+      "first_party_url flows from interceptor.Request.first_party_url -> HostBlocker._is_blocked(first_party_url) -> config.get('content.blocking.enabled', url=first_party_url)",
+      "first_party_url flows from interceptor.Request.first_party_url -> BraveAdBlocker._is_blocked(first_party_url) -> config.get('content.blocking.enabled', url=first_party_url)",
+      "request_url flows into blockutils.is_whitelisted_url(request_url) at hostblock.py:130 — but only when host already matched a blocklist",
+      "request_url flows into blockutils.is_whitelisted_url(request_url) at braveadblock.py:187 — but only when engine matched (result.matched=True) and no exception-rule early-exit fired (result.exception is None or result.important=True)",
+      "blockutils.is_whitelisted_url: config.val.content.blocking.whitelist patterns are matched against the full QUrl at blockutils.py:161-162",
+      "request_url.host() -> host (str) -> `host in self._blocked_hosts or host in self._config_blocked_hosts` at hostblock.py:127-129 -- only exact match, no parent variants generated",
+      "request_url.host() -> host (str) -> `host in self._blocked_hosts or host in self._config_blocked_hosts` at hostblock.py:128-129 — only exact match, no parent variants generated",
+      "_widened_hostnames used at configutils.py:234 for config URL-pattern matching but never imported or called from hostblock.py",
+      "info.requestUrl() [QWebEngineUrlRequestInfo, full QUrl with scheme] -> url [QUrl] -> WebEngineRequest(request_url=url) at interceptor.py:196-200 -> HostBlocker._is_blocked(request_url) -> request_url.host() [str, bare hostname only] at hostblock.py:127 -> compared against _blocked_hosts (Set[str] of plain hostnames) at hostblock.py:129",
+      "info.requestUrl() [full QUrl] -> url -> BraveAdBlocker._is_blocked(request_url) -> request_url.toString() [full URL string] at braveadblock.py:166 -> adblock.Engine.check_network_urls(full_url_str, ...)",
+      "_read_hosts_line() at hostblock.py:163-174 stores only bare hostnames (no scheme/path) into _blocked_hosts and _config_blocked_hosts; 0.0.0.0 and .localdomain entries are explicitly excluded at line 173",
+      "request_url.host() -> host (str, may carry trailing dot) -> compared against _blocked_hosts / _config_blocked_hosts (Set[str] of plain hostnames, no trailing dots) at hostblock.py:129 -- mismatch when host ends with '.'",
+      "configutils.py:234: url.host().rstrip('.') -> _widened_hostnames() -- correct normalisation pattern, not replicated in hostblock.py",
+      "urlmatch.py:226: self.host = hostname.rstrip('.') during UrlPattern construction -- correct normalisation pattern, not replicated in hostblock.py",
+      "urlmatch.py:256: host = host.rstrip('.') inside _matches_host() -- correct normalisation pattern, not replicated in hostblock.py"
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "If widened_hostnames is added to urlutils.py -> qutebrowser/components/hostblock.py must import and call it inside _is_blocked()",
+      "If widened_hostnames is added to urlutils.py -> qutebrowser/config/configutils.py:_widened_hostnames may be replaced or delegated to the new public function to avoid duplication"
+    ],
+    "dependency_propagation": []
+  },
+  "requirements": [
+    {
+      "id": "req-001",
+      "text": "Respect the global/per-URL toggle: if content blocking is disabled for the current first-party URL, a request must not be blocked.",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:124-125",
+        "qutebrowser/components/braveadblock.py:161-163"
+      ],
+      "findings": "Both blocking implementations — HostBlocker and BraveAdBlocker — check `config.get(\"content.blocking.enabled\", url=first_party_url)` as an early guard inside `_is_blocked()`. If this call returns False (i.e., blocking is disabled globally or via a per-URL pattern for the current first-party URL), the function immediately returns False, meaning the request is not blocked. The `url=first_party_url` parameter routes the config lookup through qutebrowser's URL-pattern matching system, so per-site overrides (e.g., `content.blocking.enabled --pattern=https://example.com false`) are fully respected. This satisfies req-001: if content blocking is disabled for the current first-party URL, the request is never blocked.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-002",
+      "text": "Respect whitelist overrides first: if a request URL matches a whitelist rule, it must not be blocked regardless of any host or parent-domain matches.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:128-130",
+        "qutebrowser/components/braveadblock.py:165-193",
+        "qutebrowser/components/braveadblock.py:187-192",
+        "qutebrowser/components/utils/blockutils.py:159-162"
+      ],
+      "findings": "The whitelist check (`blockutils.is_whitelisted_url`) is NOT an early, unconditional override in either blocker. It is evaluated only after a blocklist match has already been found, making it a late-stage filter rather than a first-priority guard.\n\n**HostBlocker (`hostblock.py:128-130`):**\nThe return expression is a single boolean:\n```python\nreturn (\n    host in self._blocked_hosts or host in self._config_blocked_hosts\n) and not blockutils.is_whitelisted_url(request_url)\n```\nThe whitelist check is the right-hand operand of `and not …`. Python short-circuits: `is_whitelisted_url` is only called when the host is already found in a blocklist. This means the whitelist check is subordinate to the blocklist match — it is not evaluated first. Functionally the result is correct for the current exact-host matching, but the ordering violates the requirement's intent of \"whitelist overrides first.\"\n\n**BraveAdBlocker (`braveadblock.py:165-193`):**\nThe whitelist check at line 187 is the *third* conditional branch, evaluated only after:\n1. `result.matched` is True (line 171 — `if not result.matched: return False`), and\n2. The engine's exception rule does not cause an early exit (line 173 — `elif result.exception is not None and not result.important: return False`). The whitelist branch at 187 is reached when `result.exception is None` OR when `result.important is True`; in both sub-cases the engine has already decided to block.\n\nSo `is_whitelisted_url` is only reached when the adblock engine has already decided to block the request. This is not \"whitelist overrides first\" — it is \"whitelist overrides last (among the non-engine checks).\"\n\n**Root cause:** Neither implementation checks the whitelist before consulting the blocklist. The requirement demands that a whitelist match short-circuits the entire blocking decision unconditionally, regardless of any host or parent-domain match. The current code inverts this: a blocklist match must occur first, and only then is the whitelist consulted.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-003",
+      "text": "Treat a blocked registrable domain as covering all of its subdomains: if example.com is blocked, then example.com, sub.example.com, and a.b.example.com must all be blocked unless explicitly whitelisted.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:127-130",
+        "qutebrowser/config/configutils.py:42-48",
+        "qutebrowser/config/configutils.py:234"
+      ],
+      "findings": "The current HostBlocker._is_blocked() extracts exactly one hostname from the request URL (`host = request_url.host()`, line 127) and tests it against `self._blocked_hosts` and `self._config_blocked_hosts` with a single `in` membership check (lines 128-130). There is no loop over parent-domain variants, no call to any widening helper, and no subdomain coverage. If `example.com` is in the blocklist, a request to `sub.example.com` will extract the host `sub.example.com`, find no match, and return `False` — the request is not blocked. The requirement is therefore violated for all strict subdomain cases.\n\nBraveAdBlocker._is_blocked() delegates to the `adblock` engine's `check_network_urls()` (lines 165-169), which does perform its own internal pattern matching. However, the host-based blocklist path (HostBlocker) — which is the primary implementation for hosts-file-style blocking — has no subdomain widening at all.\n\nA private `_widened_hostnames(hostname)` generator exists in `qutebrowser/config/configutils.py` (lines 42-48) and is used at line 234 of that file for config URL-pattern matching, but it is never imported or called from `hostblock.py` or `braveadblock.py`. The public `widened_hostnames` function required by req-008 does not exist anywhere in `qutebrowser/utils/urlutils.py` (confirmed by grep: no matches).",
+      "rework_context": ""
+    },
+    {
+      "id": "req-004",
+      "text": "Determine blocking by checking the request host and each successive parent domain (left-stripping one label at a time) against both the runtime blocked set and the config-defined blocked set; the first match blocks the request.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:127-130",
+        "qutebrowser/config/configutils.py:42-48",
+        "qutebrowser/config/configutils.py:234"
+      ],
+      "findings": "The requirement demands that blocking be determined by iterating over the request host and each successive parent domain (left-stripping one label at a time) and returning blocked on the first match in either `_blocked_hosts` (runtime) or `_config_blocked_hosts` (config-defined).\n\n**What the code actually does (`hostblock.py:127-130`):**\n```python\nhost = request_url.host()\nreturn (\n    host in self._blocked_hosts or host in self._config_blocked_hosts\n) and not blockutils.is_whitelisted_url(request_url)\n```\nOnly a single hostname is extracted (`request_url.host()`). It is tested with a single `in` membership check against both sets. There is no loop, no label-stripping, and no iteration over parent-domain variants. If `example.com` is blocked and the request is for `sub.example.com`, the host extracted is `sub.example.com`, which is not in either set, so the request is not blocked.\n\n**The widening helper exists but is never used here:**\n`_widened_hostnames(hostname)` in `qutebrowser/config/configutils.py:42-48` implements exactly the required semantics (yields hostname, then strips leftmost label via `partition(\".\")[-1]`, repeating until empty). It is used at `configutils.py:234` for config URL-pattern matching, but it is never imported or called from `hostblock.py` or `braveadblock.py`.\n\n**No public `widened_hostnames` in `urlutils.py`:**\nA grep for `widened_hostnames` in `qutebrowser/utils/urlutils.py` returns no matches — the public function required by req-008 does not exist there.\n\n**Conclusion:** The blocking logic performs only an exact-host lookup. The required widening loop over parent domains against both the runtime and config blocked sets is entirely absent from `HostBlocker._is_blocked()`.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-005",
+      "text": "Work with full URLs (including scheme): a request like https://blocked.example.com/... must be evaluated based on its host and handled consistently with plain host strings.",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:127",
+        "qutebrowser/components/hostblock.py:128-130",
+        "qutebrowser/components/hostblock.py:163-174",
+        "qutebrowser/components/braveadblock.py:165-169",
+        "qutebrowser/browser/webengine/interceptor.py:166",
+        "qutebrowser/browser/webengine/interceptor.py:196-200"
+      ],
+      "findings": "req-005 is satisfied by the current code. Full URLs (with scheme, path, query, etc.) are correctly decomposed to their host component before any blocklist lookup.\n\n**HostBlocker path (hostblock.py:127):**\n`host = request_url.host()` calls Qt's `QUrl.host()`, which strips the scheme, port, path, and query and returns only the bare hostname string (e.g., `\"blocked.example.com\"` from `\"https://blocked.example.com/path?q=1\"`). This bare hostname is then compared against `_blocked_hosts` and `_config_blocked_hosts` at line 129: `host in self._blocked_hosts or host in self._config_blocked_hosts`. Both sets contain only plain hostname strings, populated by `_read_hosts_line()` at lines 163-174, which parses hosts-file format and stores bare hostnames. The types are consistent: `str` vs `Set[str]` of plain hostnames.\n\n**BraveAdBlocker path (braveadblock.py:165-169):**\n`request_url.toString()` at line 166 passes the full URL string to `self._engine.check_network_urls()`. This is the correct API for the `adblock` engine, which expects full URLs and performs its own host extraction internally.\n\n**Source of `request_url`:**\nIn `browser/webengine/interceptor.py:166`, `url = info.requestUrl()` retrieves a full `QUrl` from Qt's `QWebEngineUrlRequestInfo`. This is passed as `request_url=url` at line 198 when constructing the `WebEngineRequest`. Both blockers receive this full `QUrl` and handle it correctly.\n\n**No URL-vs-hostname mismatch exists:** there is no code path where a full URL string is compared directly against a plain hostname set. The `QUrl.host()` call is the correct and consistent bridge between the two representations. The requirement is met.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-006",
+      "text": "Handle hosts with trailing dots equivalently to their non-trailing forms during domain matching (e.g., example.com. should behave like example.com).",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/components/hostblock.py:127",
+        "qutebrowser/components/hostblock.py:128-130",
+        "qutebrowser/config/configutils.py:232-234",
+        "qutebrowser/utils/urlmatch.py:226",
+        "qutebrowser/utils/urlmatch.py:256"
+      ],
+      "findings": "The requirement demands that a host with a trailing dot (e.g., `example.com.`) be treated identically to its non-trailing form (`example.com`) during domain matching.\n\n**HostBlocker._is_blocked() — hostblock.py:127:**\n`host = request_url.host()` retrieves the raw hostname from Qt's `QUrl`. Qt preserves trailing dots for FQDN-style URLs (e.g., `https://example.com./path` yields `host() == \"example.com.\"`). This raw string is compared directly against `self._blocked_hosts` and `self._config_blocked_hosts` at line 129 with no `rstrip('.')` normalization. The sets are populated by `_read_hosts_line()` (lines 163–174), which stores raw tokens from hosts-file lines — these never carry trailing dots in practice. Therefore a request to `https://example.com./` extracts host `\"example.com.\"`, which is not in either set, and the request is not blocked even though `\"example.com\"` is present.\n\n**BraveAdBlocker._is_blocked() — braveadblock.py:165–169:**\nPasses `request_url.toString()` (the full URL string) to `self._engine.check_network_urls()`. No explicit `rstrip('.')` is applied to the host before the call; whether the underlying `adblock` engine normalises trailing dots internally is opaque from the Python layer.\n\n**The fix pattern exists elsewhere but is not applied here:**\n- `configutils.py:234` explicitly calls `url.host().rstrip('.')` before widening, with the comment: *\"Urls trailing with '.' are equivalent to non-trailing types. urlutils strips them, so in order to match we will need to as well.\"*\n- `urlmatch.py:226` stores `self.host = hostname.rstrip('.')` during `UrlPattern` construction.\n- `urlmatch.py:256` applies `host = host.rstrip('.')` inside `_matches_host()` at match time.\n\nThe trailing-dot normalisation pattern is established and documented in the codebase, but it is absent from `HostBlocker._is_blocked()`. The fix requires adding `.rstrip('.')` to the `host` extraction at `hostblock.py:127`.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-007",
+      "text": "Define hostname widening semantics:\n\n- For a multi-label hostname like a.b.c, the widening sequence is [\"a.b.c\", \"b.c\", \"c\"].\n\n- For a single-label hostname like foobarbaz, the sequence is [\"foobarbaz\"].\n\n- For an empty string, the sequence is empty.\n\n- Edge forms must be preserved/processed as strings: \".c\" should yield [\".c\", \"c\"]; \"c.\" should yield [\"c.\"]; \".c.\" should yield [\".c.\", \"c.\"].",
+      "origin": "requirements",
+      "verdict": "AS_IS_COMPLIANT",
+      "evidence_locations": [
+        "qutebrowser/config/configutils.py:42-48",
+        "tests/unit/config/test_configutils.py:305-315"
+      ],
+      "findings": "The widening semantics required by req-007 are fully and correctly implemented by the existing private function `_widened_hostnames(hostname)` in `qutebrowser/config/configutils.py:42-48`.\n\nThe implementation:\n```python\ndef _widened_hostnames(hostname: str) -> Iterable[str]:\n    while hostname:\n        yield hostname\n        hostname = hostname.partition(\".\")[-1]\n```\n\nTracing all six cases from the requirement:\n- \"a.b.c\" → successive partition steps → [\"a.b.c\", \"b.c\", \"c\"] ✓\n- \"foobarbaz\" → partition(\".\")[-1] = \"\" → loop stops after one yield → [\"foobarbaz\"] ✓\n- \"\" → while \"\" is falsy, loop never entered → [] ✓\n- \".c\" → partition(\".\")[-1] = \"c\" → [\".c\", \"c\"] ✓\n- \"c.\" → partition(\".\")[-1] = \"\" → loop stops after one yield → [\"c.\"] ✓\n- \".c.\" → partition(\".\")[-1] = \"c.\" → then \"c.\" → [\".c.\", \"c.\"] ✓\n\nThe test suite at `tests/unit/config/test_configutils.py:305-315` explicitly parametrizes and asserts every one of these cases, confirming the semantics are tested and passing.\n\nThe only gap relative to req-007 is one of naming/location: the function is private (`_widened_hostnames`) and resides in `configutils.py` rather than being a public `widened_hostnames` in `urlutils.py`. That is the concern of req-008, not req-007. The semantic specification itself is fully satisfied.",
+      "rework_context": ""
+    },
+    {
+      "id": "req-008",
+      "text": "Name: widened_hostnames\nInput: hostname: str \nOutput: Iterable[str] \nDescription: Generates parent-domain variants of a hostname by successively removing the leftmost label.\nPathfile: qutebrowser/utils/urlutils.py",
+      "origin": "new_interfaces",
+      "verdict": "TO_BE_MISSING",
+      "evidence_locations": [
+        "qutebrowser/utils/urlutils.py:1-601",
+        "qutebrowser/config/configutils.py:42-48",
+        "qutebrowser/config/configutils.py:234"
+      ],
+      "findings": "The public function `widened_hostnames(hostname: str) -> Iterable[str]` does not exist anywhere in `qutebrowser/utils/urlutils.py`. A grep for `widened_hostnames` across the entire `qutebrowser/` tree returns exactly two hits, both in `qutebrowser/config/configutils.py`: the private definition `_widened_hostnames` at line 42 and its single call site at line 234. The function is absent from `urlutils.py` entirely — a scan of all `def` statements in that file (76 functions total) confirms no `widened_hostnames` entry exists.\n\nThe semantics required by req-008 are already implemented by `_widened_hostnames` in `configutils.py:42-48`:\n```python\ndef _widened_hostnames(hostname: str) -> Iterable[str]:\n    while hostname:\n        yield hostname\n        hostname = hostname.partition(\".\")[-1]\n```\nThis private function is module-scoped to `configutils.py` and is not importable from `urlutils.py`. The required public interface — `widened_hostnames` (no leading underscore) in `qutebrowser/utils/urlutils.py` — must be created. The implementation body can mirror the existing private one verbatim.",
+      "rework_context": ""
+    }
+  ],
+  "schema_version": "v2"
+}

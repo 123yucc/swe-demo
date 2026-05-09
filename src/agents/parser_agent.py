@@ -1,10 +1,6 @@
 """
 Parser sub-agent: reads the SWE-bench Pro problem statement text and extracts
-structured EvidenceCards.
-
-Structured output is produced via the relay-compatible helper
-(src/agents/_structured.py), not the SDK's output_format — see docs/api.md
-for the relay-adaptation rationale.
+structured EvidenceCards via SDK structured output.
 """
 
 import asyncio
@@ -97,7 +93,7 @@ def _enforce_parser_field_whitelist(evidence: EvidenceCards) -> None:
         )
 
 
-async def _run_parser_async(md_contents: str) -> EvidenceCards:
+async def _run_parser_async(md_contents: str, cwd: str | None = None) -> EvidenceCards:
     evidence = await run_structured_query(
         system_prompt=PARSER_SYSTEM_PROMPT,
         user_prompt=md_contents,
@@ -106,6 +102,7 @@ async def _run_parser_async(md_contents: str) -> EvidenceCards:
         allowed_tools=[],
         max_turns=10,
         max_budget_usd=1.0,
+        cwd=cwd,
     )
     _enforce_parser_field_whitelist(evidence)
     return evidence

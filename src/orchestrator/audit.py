@@ -26,9 +26,34 @@ def _has_backtick_snippet(findings: str) -> bool:
 
 
 def _has_prescriptive(findings: str) -> bool:
-    """Return True if findings contains prescriptive fix language."""
-    lower = findings.lower()
-    return any(kw in lower for kw in _PRESCRIPTIVE_KEYWORDS)
+    """Return True if findings contains prescriptive fix language.
+
+    Uses context-aware patterns to distinguish:
+    - Observational: "code does X instead of Y" (describing current behavior)
+    - Prescriptive: "must use X instead of Y" (proposing a fix)
+    """
+    # Pattern 1: Modal verbs (must/should/need to) + action verbs
+    # Matches: "must be changed", "should use X", "need to replace", "must return"
+    pattern1 = r'\b(must|should|need to|correct is|the right)\b.{0,50}\b(be|use|change|replace|add|remove|fix|return)\b'
+
+    # Pattern 2: Comparative phrases with modal context
+    # Matches: "must return 400 instead of 404", "should be Y rather than X"
+    pattern2 = r'\b(must|should|need to|correct)\b.{0,50}\b(instead of|rather than)\b'
+
+    # Pattern 3: Explicit fix/solution language
+    # Matches: "fix: use X", "solution: change Y", "correct approach: Z"
+    pattern3 = r'\b(fix|solution|correct approach|the right way):\s*\w+'
+
+    # Pattern 4: Imperative prescriptive phrases
+    # Matches: "change to X", "replace with Y", "use X instead"
+    pattern4 = r'\b(change to|replace with|use .* instead)\b'
+
+    # Pattern 5: "correct/right X is Y" pattern
+    # Matches: "correct status code is 400", "right approach is X"
+    pattern5 = r'\b(correct|right)\b.{0,30}\b(is|should be|must be)\b'
+
+    prescriptive_patterns = [pattern1, pattern2, pattern3, pattern4, pattern5]
+    return any(re.search(pat, findings, re.IGNORECASE) for pat in prescriptive_patterns)
 
 
 def _parse_evidence_location(loc: str) -> tuple[str, int, int | None]:
@@ -72,7 +97,7 @@ def build_audit_manifest(
 
     Args:
         evidence: Current EvidenceCards state.
-        structural_warnings: I1/I3 failure messages from check_structural_invariants
+        structural_warnings: I1/I3/I4 failure messages from check_structural_invariants
             to include as warnings in the manifest.
 
     Returns:

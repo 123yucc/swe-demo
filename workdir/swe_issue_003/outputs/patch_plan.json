@@ -1,0 +1,88 @@
+{
+  "overview": "Root cause: Two files that must exist — `src/controllers/well-known.js` and `src/routes/well-known.js` — are entirely absent from the codebase. As a result, no `/.well-known/webfinger` route is reachable, and the `/.well-known/change-password` redirect is stranded inside the user-specific route module instead of a dedicated well-known router. The fix creates both missing files, wires them into the two existing registries (`src/controllers/index.js` and `src/routes/index.js`), and removes the now-orphaned inline handler from `src/routes/user.js`. All authorization infrastructure (`privileges.global.can`, `uidToSystemGroup`, `controllers.helpers.notAllowed`) is already present and requires no modification — it only needs to be called from the new controller. Edits are ordered so each dependency exists before the file that consumes it is modified.",
+  "edits": [
+    {
+      "filepath": "src/controllers/well-known.js",
+      "target_functions": [
+        "webfinger"
+      ],
+      "change_rationale": "This file is entirely absent (req-006, req-010 both verdict TO_BE_MISSING; glob of src/controllers/*.js confirms 29 files, none named well-known.js). It must be created to implement the `webfinger` async handler function. The handler must: (1) validate the `resource` query param — return 400 if missing, not prefixed with `acct:`, or the hostname portion does not match `nconf.get('url_parsed').hostname`; (2) call `privileges.global.can('view:users', req.uid)` and invoke `controllers.helpers.notAllowed` on denial (uid=0 for anonymous is automatically evaluated as Guest via `uidToSystemGroup` — no special-casing needed); (3) resolve the username slug to a UID and return 404 if not found; (4) return `res.status(200).json({ subject, aliases, links })` on success, where `subject` is the original resource string, `aliases` contains UID-based and slug-based profile URLs, and `links` contains at least one entry for the user's HTML profile page. This is the leaf dependency — all other new files depend on it.",
+      "preserved_findings": [
+        "checking for a missing resource param, enforcing the acct: prefix, validating the hostname against nconf.get('url_parsed').hostname, and returning 404 when the username cannot be resolved",
+        "`nconf.get('url_parsed').hostname`",
+        "privileges.global.can('view:users', req.uid) at src/privileges/global.js:108-117 performs the check",
+        "controllers.helpers.notAllowed at src/controllers/helpers.js:125-153 issues the 403 response",
+        "passing req.uid (which is 0 for anonymous requests) directly to privileges.global.can automatically evaluates the check under the Guest role — no special-casing is needed in the handler",
+        "The identical pattern is already used in src/middleware/user.js:138-147 (canViewUsers middleware) and src/controllers/user.js:64-66 (getUserDataByUID)",
+        "subject set to the original resource, aliases with UID- and slug-based URLs, and links including an entry for the user's HTML profile",
+        "src/controllers/index.js:322-327 -- Controllers.manifest: async function builds and returns res.status(200).json(data.manifest) — same JSON response pattern the webfinger handler must use",
+        "Output: HTTP 200 with JSON { subject, aliases, links } on success; HTTP 400 / 403 / 404 on validation/authorization/not-found cases"
+      ],
+      "co_edit_dependencies": [
+        "src/controllers/index.js",
+        "src/routes/well-known.js"
+      ]
+    },
+    {
+      "filepath": "src/controllers/index.js",
+      "target_functions": [],
+      "change_rationale": "must_co_edit_relations states: 'src/controllers/well-known.js (create) -> src/controllers/index.js must add Controllers[\"well-known\"] = require(\"./well-known\")'. The findings for req-010 confirm that lines 14-41 enumerate every registered controller module and there is currently no Controllers['well-known'] entry or require('./well-known') call anywhere in the file. Without this registration, `controllers['well-known']` will be undefined when `src/routes/well-known.js` attempts to delegate to it, causing a runtime crash.",
+      "preserved_findings": [
+        "src/controllers/well-known.js (create) -> src/controllers/index.js must add Controllers['well-known'] = require('./well-known')",
+        "Controllers/index.js (lines 14–41) enumerates every registered controller module; there is no Controllers['well-known'] entry and no require('./well-known') call anywhere in the file"
+      ],
+      "co_edit_dependencies": [
+        "src/controllers/well-known.js"
+      ]
+    },
+    {
+      "filepath": "src/routes/well-known.js",
+      "target_functions": [
+        "module.exports (route initializer function)"
+      ],
+      "change_rationale": "This file is entirely absent (req-006, req-011 both verdict TO_BE_MISSING; glob of src/routes/*.js lists exactly 9 files, none named well-known.js). It must be created exporting a function with signature `(app, middleware, controllers)` that: (1) registers `app.use('/.well-known/change-password', ...)` redirecting to `/me/edit/password` (relocated from src/routes/user.js:40-42); (2) registers `GET /.well-known/webfinger` delegating to `controllers['well-known'].webfinger`. This satisfies must_co_edit_relations: 'src/controllers/well-known.js (create) -> src/routes/well-known.js must require and delegate to it'. The module pattern must match the existing meta.js pattern (standalone module exporting function(router, middleware, controllers)).",
+      "preserved_findings": [
+        "src/routes/meta.js — pattern for a standalone route module exporting function(router, middleware, controllers) that registers static/meta routes",
+        "Mounts /.well-known/change-password: redirects to /me/edit/password, and registers GET /.well-known/webfinger, delegating to controllers['well-known'].webfinger",
+        "Input: (app, middleware, controllers) | Output: Registers routes and returns void",
+        "src/controllers/well-known.js (create) -> src/routes/well-known.js (create) must require and call controllers['well-known'].webfinger",
+        "app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })"
+      ],
+      "co_edit_dependencies": [
+        "src/controllers/well-known.js",
+        "src/controllers/index.js",
+        "src/routes/index.js",
+        "src/routes/user.js"
+      ]
+    },
+    {
+      "filepath": "src/routes/index.js",
+      "target_functions": [
+        "addCoreRoutes"
+      ],
+      "change_rationale": "must_co_edit_relations states: 'src/routes/well-known.js (create) -> src/routes/index.js must add well-known to _mounts and invoke it in addCoreRoutes' and 'src/routes/index.js:152-160 must call _mounts[\"well-known\"] once the module exists'. The findings for req-008 confirm that the `_mounts` object at lines 19-25 currently has only five keys (user, meta, api, admin, feed) and the `addCoreRoutes` function at lines 152-160 has no well-known invocation. Two changes are needed: (1) add `'well-known': require('./well-known')` to the `_mounts` object at lines 19-25; (2) add a `_mounts['well-known'](router, middleware, controllers)` call inside `addCoreRoutes` at the appropriate position (alongside the existing meta/api/feed calls at lines 153-155).",
+      "preserved_findings": [
+        "src/routes/index.js:19-25 — _mounts pattern: each module is required here then called in addCoreRoutes",
+        "src/routes/index.js:153 — _mounts.meta(router, middleware, controllers) — reference call signature for the new well-known mount",
+        "The integration point where the new module must be added is src/routes/index.js:19-25 (the _mounts object) and the corresponding call inside addCoreRoutes around lines 153–155",
+        "src/routes/index.js:19-25 _mounts object must gain a well-known key pointing to the new route module",
+        "src/routes/index.js:152-160 must call _mounts['well-known'] once the module exists"
+      ],
+      "co_edit_dependencies": [
+        "src/routes/well-known.js"
+      ]
+    },
+    {
+      "filepath": "src/routes/user.js",
+      "target_functions": [],
+      "change_rationale": "must_co_edit_relations states: 'src/routes/user.js:40-42 must have the change-password route removed once src/routes/well-known.js owns it'. The findings for req-007 confirm that lines 40-42 still contain the inline `app.use('/.well-known/change-password', ...)` handler. Once `src/routes/well-known.js` registers this route, leaving it in user.js creates a duplicate registration. The three lines (40-42) must be deleted. No other changes to this file are required.",
+      "preserved_findings": [
+        "src/routes/user.js:40-42 still contains the inline /.well-known/change-password handler (app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })). It has not been removed.",
+        "src/routes/user.js:40-42 must have the change-password route removed once src/routes/well-known.js owns it"
+      ],
+      "co_edit_dependencies": [
+        "src/routes/well-known.js"
+      ]
+    }
+  ]
+}

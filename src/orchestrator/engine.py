@@ -43,24 +43,21 @@ def _extract_req_ids(text_parts: list[str]) -> list[str]:
 def _build_per_req_audit_feedback(
     verdict: "ClosureVerdict",
     conflict_req_ids: list[str],
-    audit_results: list | None = None,
 ) -> dict[str, str]:
     """Slice the closure-checker's audit output into per-requirement feedback.
 
-    Phase 18.F differentiated feedback — routes different audit failure types
-    to different rework instruction templates.
+    Each `missing` / `suggested_tasks` entry that mentions a requirement id
+    is attributed to that requirement.  Entries mentioning several ids are
+    duplicated to every id involved (since the contradiction concerns each).
+    The closure rationale is appended to every bucket as shared context so
+    the deep-search prompt always sees the overall judgement.
 
-    Types:
-    - new_interface_cannot_be_compliant → parser marked new interface, must be TO_BE_MISSING
-    - findings_anti_hallucination → findings引用的片段在代码中不存在，必须删除或改写
-    - prescriptive_boundary_self_check → prescriptive fix 在某边界下不满足 requirement
-
-    Returns a dict keyed by requirement id.
+    Returns a dict keyed by requirement id; requirements cited by
+    ``conflict_req_ids`` but absent from any entry receive just the rationale.
     """
     rationale = (verdict.rationale or "").strip() or "(no rationale provided)"
     per_req_entries: dict[str, list[str]] = {rid: [] for rid in conflict_req_ids}
 
-    # First, collect entries from verdict.missing / suggested_tasks
     for source_label, items in (
         ("missing", list(verdict.missing)),
         ("suggested", list(verdict.suggested_tasks)),
@@ -71,95 +68,23 @@ def _build_per_req_audit_feedback(
             cited = _extract_req_ids([entry])
             targets = [rid for rid in cited if rid in per_req_entries]
             if not targets:
+                # Entry does not name a specific requirement — broadcast to
+                # every re-opened req so they all see the shared context.
                 targets = list(per_req_entries.keys())
             for rid in targets:
                 per_req_entries[rid].append(f"[{source_label}] {entry}")
 
-    # Phase 18.F: Extract per-check failure info from AuditResult
-    audit_by_req: dict[str, dict] = {}
-    if audit_results:
-        for res in audit_results:
-            audit_by_req[res.requirement_id] = {
-                "per_check": res.per_check,
-                "failures": res.failures,
-            }
-
     out: dict[str, str] = {}
     for rid, entries in per_req_entries.items():
         body = "\n".join(entries) if entries else "(no entry cited this req)"
-
-        # ── Phase 18.F: Differentiated rework instructions ────────────────
-        differentiated_instruction = ""
-        audit_info = audit_by_req.get(rid, {})
-
-        # Check for new_interface_cannot_be_compliant
-        for entry in entries:
-            if "I2_new_interface_cannot_be_compliant" in entry or "new_interface" in entry.lower():
-                differentiated_instruction = (
-                    "REWORK INSTRUCTION (new_interface): "
-                    "Parser marked this interface as NEW (to be implemented). "
-                    "AS_IS_COMPLIANT is impossible — new interfaces do not exist yet. "
-                    "Re-verify: if you found a SIMILAR function (e.g. getObjects vs mget), "
-                    "change verdict to TO_BE_MISSING. "
-                    "If exact match exists, cite the exact definition line and explain "
-                    "why parser misclassified it."
-                )
-                break
-
-        # Check for findings_anti_hallucination
-        per_check = audit_info.get("per_check", {})
-        failures_list = audit_info.get("failures", [])
-        if per_check.get("findings_anti_hallucination") == "FAIL":
-            if not differentiated_instruction:
-                for fail_desc in failures_list:
-                    if "anti_hallucination" in fail_desc.lower() or "not found" in fail_desc.lower():
-                        snippet_match = re.search(r"`([^`]+)`", fail_desc)
-                        snippet = snippet_match.group(1) if snippet_match else "<unknown snippet>"
-                        differentiated_instruction = (
-                            f"REWORK INSTRUCTION (anti_hallucination): "
-                            f"Your findings claimed code snippet `{snippet}` exists, "
-                            f"but audit could not verify it in cited file regions. "
-                            f"This round, your findings MUST ONLY reference code "
-                            f"that you Read and confirmed. "
-                            f"Delete or rephrase unverified snippets. "
-                            f"Do NOT infer or recall code from memory."
-                        )
-                        break
-                if not differentiated_instruction:
-                    differentiated_instruction = (
-                        "REWORK INSTRUCTION (anti_hallucination): "
-                        "Your findings contain unverified code snippets. "
-                        "This round, cite only code you actually Read. "
-                        "Do NOT fabricate code that isn't there."
-                    )
-
-        # Check for prescriptive_boundary_self_check
-        if per_check.get("prescriptive_boundary_self_check") == "FAIL":
-            if not differentiated_instruction:
-                for fail_desc in failures_list:
-                    if "boundary" in fail_desc.lower() or "edge" in fail_desc.lower():
-                        differentiated_instruction = (
-                            "REWORK INSTRUCTION (prescriptive_boundary): "
-                            "Your prescriptive fix fails a boundary condition. "
-                            "Before deciding verdict, enumerate ≥2 boundary cases "
-                            "(null/undefined, empty set, max value, etc.). "
-                            "For each boundary, explicitly write 'pass/fail + why'. "
-                            "If any boundary fails, reconsider your prescriptive "
-                            "and explain how to fix it."
-                        )
-                        break
-
-        if not differentiated_instruction:
-            differentiated_instruction = (
-                "Instruction: re-verify the cited code regions. "
-                "If you still reach the prior verdict, cite exact code lines "
-                "that refute the audit finding."
-            )
-
         out[rid] = (
             f"Closure-checker rationale:\n{rationale}\n\n"
             f"Audit items concerning {rid}:\n{body}\n\n"
-            f"{differentiated_instruction}"
+            "Instruction: on this rework iteration you MUST reconsider the "
+            "prior verdict. Read the cited code regions yourself, and if you "
+            "still reach the previous verdict, explicitly cite the code lines "
+            "that refute the audit item above.  Do not repeat the same "
+            "reasoning path that was driven by the prior verdict."
         )
     return out
 
@@ -171,18 +96,17 @@ from src.agents.patch_planner_agent import _run_patch_planner_async
 from src.models.context import EvidenceCards
 from src.models.evidence import RequirementItem
 from src.models.verdict import ClosureVerdict
+from src.orchestrator.audit import build_audit_manifest
 from src.orchestrator.guards import (
     DeepSearchBudget,
     check_correct_attribution,
-    check_sufficiency,
     check_structural_invariants,
+    check_sufficiency,
 )
 from src.orchestrator.states import (
     PipelineState,
     is_valid_transition,
 )
-from src.orchestrator.audit import build_audit_manifest
-from src.models.audit import AuditManifest
 from src.tools.ingestion_tools import (
     get_submitted_evidence,
     get_working_memory,
@@ -199,30 +123,95 @@ from src.tools.ingestion_tools import (
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-def _collect_git_diff(repo_dir: Path) -> str:
-    """Return `git diff` of the working tree, or empty string on failure."""
+def _run_git(repo_dir: Path, *args: str) -> tuple[int, str, str]:
+    """Run a git subcommand in *repo_dir*; return (returncode, stdout, stderr)."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_dir), "diff"],
+            ["git", "-C", str(repo_dir), *args],
             capture_output=True,
             check=False,
         )
-        stdout = result.stdout
-        if isinstance(stdout, (bytes, bytearray, memoryview)):
-            diff_text = bytes(stdout).decode("utf-8", errors="replace")
-        else:
-            diff_text = str(stdout)
     except (FileNotFoundError, OSError) as exc:
-        print(f"[orchestrator] git diff failed: {exc}", flush=True)
-        return ""
-    if result.returncode != 0:
-        stderr = result.stderr
-        if isinstance(stderr, (bytes, bytearray, memoryview)):
-            stderr_text = bytes(stderr).decode("utf-8", errors="replace")
-        else:
-            stderr_text = str(stderr)
-        print(f"[orchestrator] git diff exit={result.returncode}: {stderr_text}", flush=True)
+        print(f"[orchestrator] git {' '.join(args)} failed: {exc}", flush=True)
+        return 1, "", str(exc)
+
+    def _decode(raw: Any) -> str:
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            return bytes(raw).decode("utf-8", errors="replace")
+        return str(raw or "")
+
+    return result.returncode, _decode(result.stdout), _decode(result.stderr)
+
+
+def _collect_git_diff(repo_dir: Path, planned_files: list[str] | None = None) -> str:
+    """Return `git diff HEAD` of the working tree, including new files.
+
+    Git's plain `git diff` ignores untracked files, so any file that the
+    patch-generator *created* (not merely edited) would silently vanish
+    from the resulting patch. To capture them, we mark the planned files
+    as intent-to-add with ``git add -N`` before diffing — this surfaces
+    their full contents as additions — then reset the index afterwards so
+    the repo's staging area is unchanged.
+
+    ``planned_files`` is the list of repo-relative paths the patch-planner
+    intended to touch. We only promote existing-on-disk files; .gitignored
+    paths are force-added (``-f``) because the planner's choice is
+    authoritative over ignore rules for patch output.
+    """
+    added: list[str] = []
+    if planned_files:
+        existing = [p for p in planned_files if (repo_dir / p).is_file()]
+        if existing:
+            rc, _, err = _run_git(repo_dir, "add", "-N", "-f", "--", *existing)
+            if rc != 0:
+                print(
+                    f"[orchestrator] git add -N failed (rc={rc}): {err.strip()}",
+                    flush=True,
+                )
+            else:
+                added = existing
+
+    rc, diff_text, err = _run_git(repo_dir, "diff", "HEAD")
+    if rc != 0:
+        print(f"[orchestrator] git diff exit={rc}: {err.strip()}", flush=True)
+
+    if added:
+        rc_reset, _, err_reset = _run_git(repo_dir, "reset", "--", *added)
+        if rc_reset != 0:
+            print(
+                f"[orchestrator] git reset (post-diff) failed (rc={rc_reset}): "
+                f"{err_reset.strip()}",
+                flush=True,
+            )
+
     return diff_text or ""
+
+
+def _verify_plan_coverage(
+    diff_text: str, planned_files: list[str]
+) -> list[str]:
+    """Return the list of planned files that do NOT appear in *diff_text*.
+
+    A unified diff header looks like ``diff --git a/<path> b/<path>``. We
+    match the b-side path because that is the post-edit name (new files
+    have ``a/dev/null`` but ``b/<real-path>``). Paths are compared after
+    normalizing backslashes to forward slashes.
+    """
+    if not planned_files:
+        return []
+    diff_paths: set[str] = set()
+    for line in diff_text.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        parts = line.split(" b/", 1)
+        if len(parts) == 2:
+            diff_paths.add(parts[1].strip())
+    missing: list[str] = []
+    for path in planned_files:
+        norm = path.replace("\\", "/")
+        if norm not in diff_paths:
+            missing.append(norm)
+    return missing
 
 
 def _pick_next_requirement(evidence: EvidenceCards) -> RequirementItem | None:
@@ -391,8 +380,62 @@ async def run_pipeline(
     print(f"[orchestrator] Evidence cards saved -> {evidence_path}", flush=True)
     set_evidence_json_path(evidence_path.resolve())
 
-    # ── Step 3: Code-driven state-machine loop ─────────────────────────
-    state = PipelineState.UNDER_SPECIFIED
+    return await _run_state_machine(
+        issue_id=issue_id,
+        repo_dir=repo_dir,
+        output_dir=output_dir,
+        evidence_path=evidence_path,
+        memory=memory,
+        initial_state=PipelineState.UNDER_SPECIFIED,
+    )
+
+
+async def run_pipeline_from_evidence(
+    issue_id: str,
+    repo_dir: str | Path,
+    output_dir: str | Path,
+) -> Path:
+    """Resume the pipeline from pre-populated evidence + working memory.
+
+    Skips parser/init: the caller is responsible for having populated
+    ``ingestion_tools._working_memory`` and ``_scoped_store`` beforehand.
+    Enters the state machine in EVIDENCE_REFINING so the closure-checker
+    runs first (which is where a resume is typically useful).
+    """
+    repo_dir = Path(repo_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    memory = get_working_memory()
+    if memory is None:
+        raise RuntimeError(
+            "run_pipeline_from_evidence called before "
+            "ingestion_tools._working_memory was populated."
+        )
+
+    evidence_path = (output_dir / "evidence.json").resolve()
+    set_evidence_json_path(evidence_path)
+
+    return await _run_state_machine(
+        issue_id=issue_id,
+        repo_dir=repo_dir,
+        output_dir=output_dir,
+        evidence_path=evidence_path,
+        memory=memory,
+        initial_state=PipelineState.EVIDENCE_REFINING,
+    )
+
+
+async def _run_state_machine(
+    issue_id: str,
+    repo_dir: Path,
+    output_dir: Path,
+    evidence_path: Path,
+    memory,
+    initial_state: PipelineState,
+) -> Path:
+    """Core state-machine loop shared by run_pipeline and run_pipeline_from_evidence."""
+    state = initial_state
     budget = DeepSearchBudget(max_iterations=30)
     last_verdict: ClosureVerdict | None = None
     patch_outcome: str | None = None
@@ -555,49 +598,58 @@ async def run_pipeline(
                 state = PipelineState.UNDER_SPECIFIED
                 continue
 
-            # ── Phase 18.A: Structural invariants ────────────────────────
+            # ── Structural invariants (phase 18.A) ───────────────────────
+            # I2 violations (new_interface + AS_IS_COMPLIANT) are mechanical
+            # contradictions → reset to UNCHECKED and re-dispatch deep-search
+            # with audit feedback.  I1/I3/I4 are warnings passed into the
+            # AuditManifest for the closure-checker to consider.
             structural_failures = check_structural_invariants(current_evidence)
-            i2_hits = structural_failures.get("I2", [])
-            i1_i3_warnings = []
-            for k in ("I1", "I3"):
-                i1_i3_warnings.extend(structural_failures.get(k, []))
-
-            # I2 violations: new_interface reqs marked AS_IS_COMPLIANT must be reset.
-            if i2_hits and not budget.is_exhausted():
+            i2_failures = structural_failures.get("I2", [])
+            if i2_failures and not budget.is_exhausted():
+                i2_req_ids = _extract_req_ids(i2_failures)
                 reset_ids_i2: list[str] = []
-                for line in i2_hits:
-                    # Parse "I2_new_interface_cannot_be_compliant: req-XXX (names=...)"
-                    match = _REQ_ID_RE.search(line)
-                    if match:
-                        rid = match.group(0)
-                        audit_feedback = (
-                            "Parser marked this interface as new (to be implemented). "
-                            "AS_IS_COMPLIANT is impossible — new interfaces do not exist yet. "
-                            "Re-verify: if you found a similar but not exact function, "
-                            "change verdict to TO_BE_MISSING. If exact match, check parser."
-                        )
-                        if reset_requirement_for_rework(rid, audit_feedback=audit_feedback):
-                            reset_ids_i2.append(rid)
+                for rid in i2_req_ids:
+                    feedback = (
+                        "Closure-checker structural invariant I2 violation:\n"
+                        "This requirement's origin is 'new_interfaces', which "
+                        "means the interface does not exist in the codebase "
+                        "yet.  The previous verdict AS_IS_COMPLIANT is a "
+                        "contradiction — a nonexistent interface cannot be "
+                        "compliant.  Re-investigate and set the verdict to "
+                        "TO_BE_MISSING (or TO_BE_PARTIAL if a skeleton exists)."
+                    )
+                    if reset_requirement_for_rework(rid, audit_feedback=feedback):
+                        reset_ids_i2.append(rid)
                 if reset_ids_i2:
+                    print(
+                        f"[orchestrator] structural I2 → reset {reset_ids_i2}; "
+                        "returning to deep-search.",
+                        flush=True,
+                    )
                     memory.record_action(
                         phase="evidence-refining",
-                        outcome=f"I2_reset:{reset_ids_i2}",
-                    )
-                    print(
-                        f"[orchestrator] I2 invariant: reset {reset_ids_i2} "
-                        "to UNCHECKED for rework.",
-                        flush=True,
+                        outcome=f"I2_reset:{len(reset_ids_i2)}_reqs",
                     )
                     assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
                     state = PipelineState.UNDER_SPECIFIED
                     continue
 
-            # ── Phase 18.B: Build AuditManifest ───────────────────────────
-            manifest: AuditManifest = build_audit_manifest(
+            # I1/I3/I4 warnings flow into the manifest.
+            manifest_warnings: list[str] = []
+            for key in ("I1", "I3", "I4"):
+                manifest_warnings.extend(structural_failures.get(key, []))
+
+            manifest = build_audit_manifest(
                 current_evidence,
-                structural_warnings=i1_i3_warnings,
+                structural_warnings=manifest_warnings,
             )
-            manifest_ids = {t.requirement_id for t in manifest.tasks}
+            expected_task_ids = {t.requirement_id for t in manifest.tasks}
+            print(
+                f"[orchestrator] AuditManifest: {len(manifest.tasks)} tasks "
+                f"({sorted(expected_task_ids)}), "
+                f"{len(manifest.warnings)} warnings",
+                flush=True,
+            )
 
             # Dispatch closure-checker (LLM semantic evaluation)
             print("[orchestrator] Dispatching closure-checker...", flush=True)
@@ -661,61 +713,46 @@ async def run_pipeline(
             if forced:
                 forced_closure_done = True
 
-            # ── Phase 18.B: Validate manifest coverage ─────────────────────
+            # ── Strict manifest coverage ────────────────────────────────
+            # Every task in the manifest must have a corresponding
+            # AuditResult; a missing requirement_id means the closure-checker
+            # skipped an audit and its verdict cannot be trusted.  Force
+            # EVIDENCE_MISSING in that case so the rework path re-dispatches.
             audited_ids = {r.requirement_id for r in verdict.audited}
-            if manifest_ids != audited_ids:
-                missing_audit = list(manifest_ids - audited_ids)
-                extra_audit = list(audited_ids - manifest_ids)
+            uncovered = sorted(expected_task_ids - audited_ids)
+            if uncovered:
                 print(
-                    f"[orchestrator] Closure-checker audit coverage mismatch: "
-                    f"missing={missing_audit}, extra={extra_audit}",
+                    "[orchestrator] manifest coverage FAIL — audited missing "
+                    f"{uncovered}; downgrading verdict to EVIDENCE_MISSING.",
                     flush=True,
                 )
                 memory.record_action(
                     phase="closure-check",
                     subagent="closure-checker",
-                    outcome=f"audit_coverage_mismatch:missing={missing_audit}",
+                    outcome=f"coverage_fail:{len(uncovered)}_uncovered",
                 )
-                # Treat as EVIDENCE_MISSING — the unaudited tasks are defects.
-                if not forced and rework_rounds_used < rework_rounds_max:
-                    for rid in missing_audit:
-                        reset_requirement_for_rework(
-                            rid,
-                            audit_feedback="Closure-checker did not audit this requirement. "
-                            "Please re-verify and ensure it is in the audit output.",
-                        )
-                    rework_rounds_used += 1
-                    assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
-                    state = PipelineState.UNDER_SPECIFIED
-                    continue
-                else:
-                    patch_outcome = "EVIDENCE_INCOMPLETE"
-                    assert is_valid_transition(state, PipelineState.CLOSURE_FORCED_FAIL)
-                    state = PipelineState.CLOSURE_FORCED_FAIL
-                    continue
-
-            # ── Check for any FAIL in AuditResult.per_check ────────────────
-            any_fail = False
-            failed_req_ids: list[str] = []
-            for audit_res in verdict.audited:
-                for check_type, outcome in audit_res.per_check.items():
-                    if outcome == "FAIL":
-                        any_fail = True
-                        failed_req_ids.append(audit_res.requirement_id)
-                        # Append detailed failure to verdict.missing if not already there
-                        for fail_desc in audit_res.failures:
-                            if fail_desc not in verdict.missing:
-                                verdict.missing.append(
-                                    f"{audit_res.requirement_id}: [{check_type}] {fail_desc}"
-                                )
-
-            if any_fail and verdict.verdict == "CLOSURE_APPROVED":
-                # Force verdict to EVIDENCE_MISSING if any check failed
-                verdict.verdict = "EVIDENCE_MISSING"
-                verdict.rationale = (
-                    "At least one audit check failed. "
-                    f"Failed requirements: {failed_req_ids}"
+                coverage_msg = (
+                    f"[coverage] closure-checker did not return AuditResults "
+                    f"for {uncovered}; those requirements remain unaudited."
                 )
+                # Force-downgrade: synthesize an EVIDENCE_MISSING verdict that
+                # reuses the original rationale plus the coverage complaint,
+                # and cites the uncovered req IDs so the rework path reopens them.
+                verdict = ClosureVerdict(
+                    verdict="EVIDENCE_MISSING",
+                    rationale=(
+                        (verdict.rationale or "").strip()
+                        + ("\n\n" if verdict.rationale else "")
+                        + coverage_msg
+                    ),
+                    audited=verdict.audited,
+                    missing=list(verdict.missing) + [coverage_msg]
+                        + [f"uncovered req {rid}" for rid in uncovered],
+                    suggested_tasks=list(
+                        dict.fromkeys(list(verdict.suggested_tasks) + uncovered)
+                    ),
+                )
+                last_verdict = verdict
 
             if verdict.verdict == "CLOSURE_APPROVED":
                 print("[orchestrator] CLOSURE_APPROVED", flush=True)
@@ -756,7 +793,6 @@ async def run_pipeline(
                     if rework_rounds_used < rework_rounds_max and conflict_req_ids:
                         per_req_feedback = _build_per_req_audit_feedback(
                             verdict, conflict_req_ids,
-                            audit_results=list(verdict.audited),
                         )
                         reset_ids: list[str] = []
                         for rid in conflict_req_ids:
@@ -878,19 +914,39 @@ async def run_pipeline(
             plan_path.write_text(wm.patch_plan.model_dump_json(indent=2), encoding="utf-8")
             print(f"[orchestrator] Patch plan saved -> {plan_path}", flush=True)
 
-    # Record patch outcome
-    _write_patch_outcome(output_dir, issue_id, patch_outcome, closure_approved)
-
-    # Collect git diff
-    diff_text = _collect_git_diff(repo_dir)
+    # Collect git diff \u2014 pass planned files so newly-created files are
+    # promoted from untracked to intent-to-add and surface in the diff.
+    planned_files: list[str] = []
+    if wm.patch_plan is not None:
+        planned_files = [edit.filepath for edit in wm.patch_plan.edits]
+    diff_text = _collect_git_diff(repo_dir, planned_files=planned_files)
     if diff_text.startswith("\ufeff"):
         diff_text = diff_text.lstrip("\ufeff")
+
+    # Plan-coverage check: every planned file must appear in the diff.
+    # If the generator silently dropped an edit (e.g. SEARCH mismatch it
+    # failed to recover from), the outcome is a partial patch; downgrade
+    # PATCH_SUCCESS so downstream eval sees the real state.
+    missing_from_diff = _verify_plan_coverage(diff_text, planned_files)
+    if missing_from_diff and patch_outcome == "PATCH_SUCCESS":
+        print(
+            "[orchestrator] WARNING: planned files missing from patch.diff: "
+            f"{missing_from_diff}. Downgrading PATCH_SUCCESS -> PATCH_FAILED.",
+            flush=True,
+        )
+        patch_outcome = "PATCH_FAILED"
+        closure_approved = False
+
     patch_path = output_dir / "patch.diff"
     patch_path.write_text(diff_text, encoding="utf-8")
     if diff_text:
         print(f"[orchestrator] patch.diff saved -> {patch_path} ({len(diff_text)} bytes)", flush=True)
     else:
         print(f"[orchestrator] WARNING: empty patch.diff -> {patch_path}", flush=True)
+
+    # Now that any plan-coverage downgrade has been applied, persist the
+    # final patch outcome.
+    _write_patch_outcome(output_dir, issue_id, patch_outcome, closure_approved)
 
     # Write prediction.json for SWE-bench eval format
     prediction_path = output_dir / "prediction.json"

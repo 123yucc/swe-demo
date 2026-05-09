@@ -22,6 +22,8 @@ python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_meta
     --repo-dir workdir/swe_issue_001/repo
 ```
 
+**Repo Initialization**: The harness automatically resets the repo to a clean `base_commit` state before running (via `git reset --hard`, `git clean -fd`, `git checkout`). This ensures patches are generated against the original buggy code, not previously modified code.
+
 **Output** written to `<output-dir>/` (defaults to `workdir/<issue_name>/outputs/` in `--instance-json` mode, otherwise `workdir/<instance_id>/outputs/`):
 - `evidence.json` — structured evidence
 - `patch.diff` — git diff patch
@@ -34,10 +36,10 @@ Config is loaded from `.env` at project root (no extra deps — simple key=value
 
 ```
 ANTHROPIC_API_KEY=sk-...
-ANTHROPIC_BASE_URL=https://your-relay.example.com/v1  # optional, for proxy/relay
 ```
 
-`sdk_env()` in `src/config.py` returns these as a dict injected into every `ClaudeAgentOptions(env=...)` call so all sub-agents use the same relay.
+`src/config.py` just loads `.env` into `os.environ`; the Claude Agent SDK
+reads `ANTHROPIC_API_KEY` directly. No wrapper helpers.
 
 ## Architecture
 
@@ -76,7 +78,7 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
 |-----------|------|------|
 | CLI | `src/main.py` | Unified entry point: supports SWE-bench Pro instances, local JSON, and legacy artifacts dir |
 | Artifacts | `src/artifacts.py` | Converts SWE-bench `problem_statement` into 4 Markdown artifact files |
-| Config | `src/config.py` | Reads `.env`, exposes `sdk_env()` |
+| Config | `src/config.py` | Loads `.env` into `os.environ` for the SDK |
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration; returns `DeepSearchReport` via SDK structured output. **Phase 18.E**: two-round design — Round 1 (primary investigation) + Round 2 (self-reflection checking token traceability, boundary enumeration, verdict consistency) |
 | Closure Checker Agent | `src/agents/closure_checker_agent.py` | Manifest-driven audit gate (phase 18.B/C): receives pre-computed `AuditManifest`, executes each `AuditTask` with Grep/Read/Glob; returns `ClosureVerdict` with per-task `AuditResult`. Three semantic check types: verdict_vs_code, findings_anti_hallucination, prescriptive_boundary_self_check |
@@ -97,7 +99,7 @@ src/
     __init__.py                      # Package marker for Python imports
     main.py                          # CLI entry: loads SWE-bench Pro instance, runs full pipeline
     artifacts.py                     # Converts SWE-bench instance to 4 Markdown artifact files
-    config.py                        # Loads .env and provides sdk_env() for all agents
+    config.py                        # Loads .env into os.environ for the SDK
 
     agents/
         __init__.py                    # Subpackage marker

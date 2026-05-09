@@ -1,0 +1,62 @@
+{
+  "overview": "Root cause: `HostBlocker._is_blocked()` has three independent defects. (1) It performs only a single exact-hostname lookup with no loop over parent-domain variants, so a blocked `example.com` never matches requests to `sub.example.com` (req-003, req-004). (2) It does not strip trailing dots from the extracted host before comparing against the blocked sets, causing FQDN-style URLs like `https://example.com./` to escape blocking (req-006). (3) The whitelist check (`blockutils.is_whitelisted_url`) is the right-hand operand of a boolean `and not …` expression, meaning it is only evaluated after a blocklist match has already been found — it is not an unconditional early override (req-002).\n\nFix strategy:\n1. Add a public `widened_hostnames(hostname: str) -> Iterable[str]` function to `qutebrowser/utils/urlutils.py`, mirroring the semantics of the existing private `_widened_hostnames` in `configutils.py` (req-008).\n2. Delegate `configutils._widened_hostnames` to the new public function to eliminate duplication (must_co_edit_relations).\n3. Rewrite `HostBlocker._is_blocked()` to: (a) check `blockutils.is_whitelisted_url` first as an unconditional early-exit guard, (b) strip the trailing dot from the extracted host, and (c) iterate over `widened_hostnames(host)` checking both `_blocked_hosts` and `_config_blocked_hosts`, returning `True` on the first match.\n\nEdit order respects the dependency chain: `urlutils.py` (defines the symbol) → `configutils.py` (delegates to it) → `hostblock.py` (imports and calls it).",
+  "edits": [
+    {
+      "filepath": "qutebrowser/utils/urlutils.py",
+      "target_functions": [
+        "widened_hostnames"
+      ],
+      "change_rationale": "req-008 is TO_BE_MISSING: the public `widened_hostnames` function does not exist anywhere in this file (confirmed by grep — zero matches across all 76 `def` statements). `hostblock.py` cannot import the symbol until it is defined here. The implementation body is identical to the private `_widened_hostnames` in `configutils.py:42-48`.",
+      "preserved_findings": [
+        "`widened_hostnames(hostname: str) -> Iterable[str]`",
+        "def _widened_hostnames(hostname: str) -> Iterable[str]:\n    while hostname:\n        yield hostname\n        hostname = hostname.partition(\".\")[-1]",
+        "The implementation body can mirror the existing private one verbatim.",
+        "A grep for `widened_hostnames` across the entire `qutebrowser/` tree returns exactly two hits, both in `qutebrowser/config/configutils.py`: the private definition `_widened_hostnames` at line 42 and its single call site at line 234. The function is absent from `urlutils.py` entirely.",
+        "def widened_hostnames(hostname: str) -> Iterable[str]"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/config/configutils.py",
+        "qutebrowser/components/hostblock.py"
+      ]
+    },
+    {
+      "filepath": "qutebrowser/config/configutils.py",
+      "target_functions": [
+        "_widened_hostnames"
+      ],
+      "change_rationale": "must_co_edit_relations states: 'qutebrowser/config/configutils.py:_widened_hostnames may be replaced or delegated to the new public function to avoid duplication'. Once `widened_hostnames` exists in `urlutils.py`, the private `_widened_hostnames` at lines 42-48 should delegate to it (or be replaced by a re-export alias) so the two implementations do not diverge. The call site at line 234 (`widened_hosts = _widened_hostnames(url.host().rstrip('.'))`) continues to work unchanged because the private wrapper preserves the same signature.",
+      "preserved_findings": [
+        "qutebrowser/config/configutils.py:_widened_hostnames may be replaced or delegated to the new public function to avoid duplication",
+        "def _widened_hostnames(hostname: str) -> Iterable[str]:\n    while hostname:\n        yield hostname\n        hostname = hostname.partition(\".\")[-1]",
+        "`widened_hosts = _widened_hostnames(url.host().rstrip('.'))`",
+        "qutebrowser/config/configutils.py:234 — call pattern: url.host().rstrip('.') passed to _widened_hostnames(); public version should expect the same pre-normalised input"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/utils/urlutils.py"
+      ]
+    },
+    {
+      "filepath": "qutebrowser/components/hostblock.py",
+      "target_functions": [
+        "HostBlocker._is_blocked"
+      ],
+      "change_rationale": "Three violations converge here. (1) req-002: the whitelist check is subordinate to the blocklist match — `is_whitelisted_url` is only called when `host in self._blocked_hosts or host in self._config_blocked_hosts` is already True; it must become an unconditional early-exit guard evaluated before any blocklist lookup. (2) req-006: `host = request_url.host()` at line 127 does not strip trailing dots; the sets contain plain hostnames without trailing dots, so FQDN-style requests escape blocking. (3) req-003/req-004: only a single exact-hostname lookup is performed; the fix requires iterating over `widened_hostnames(host)` and returning True on the first match in either blocked set. The import of `widened_hostnames` from `urlutils` must also be added.",
+      "preserved_findings": [
+        "return (\n    host in self._blocked_hosts or host in self._config_blocked_hosts\n) and not blockutils.is_whitelisted_url(request_url)",
+        "The whitelist check is the right-hand operand of `and not …`. Python short-circuits: `is_whitelisted_url` is only called when the host is already found in a blocklist.",
+        "`host = request_url.host()`",
+        "`host in self._blocked_hosts or host in self._config_blocked_hosts`",
+        "`url.host().rstrip('.')`",
+        "`self.host = hostname.rstrip('.')`",
+        "`host = host.rstrip('.')`",
+        "`widened_hosts = _widened_hostnames(url.host().rstrip('.'))`",
+        "hostblock.py:_is_blocked() needs widened_hostnames from urlutils.py (req-004) — the public symbol must exist in urlutils.py before hostblock.py can import it",
+        "request_url.host() -> host (str, may carry trailing dot) -> compared against _blocked_hosts / _config_blocked_hosts (Set[str] of plain hostnames, no trailing dots) at hostblock.py:129 -- mismatch when host ends with '.'",
+        "configutils.py:234: url.host().rstrip('.') -> _widened_hostnames() -- correct normalisation pattern, not replicated in hostblock.py"
+      ],
+      "co_edit_dependencies": [
+        "qutebrowser/utils/urlutils.py"
+      ]
+    }
+  ]
+}

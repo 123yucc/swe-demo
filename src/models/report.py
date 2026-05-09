@@ -7,7 +7,9 @@ Eliminates format drift and all _extract_* parsing functions.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator
 
 from src.models.evidence import RequirementVerdict
 
@@ -43,7 +45,20 @@ class DeepSearchReport(BaseModel):
         default="",
         description=(
             "Concrete on-site verification summary for target_requirement_id. "
-            "What does the current code actually do w.r.t. this requirement?"
+            "What does the current code actually do w.r.t. this requirement? "
+            "IMPORTANT: Include ONLY verified defects and observations from actual code. "
+            "Do NOT include hypothetical boundary speculation or 'OPEN ISSUE' notes here."
+        ),
+    )
+    boundary_analysis: str = Field(
+        default="",
+        description=(
+            "Edge case enumeration for prescriptive fixes (phase 18.E reflection). "
+            "If requirement_findings contains a prescriptive fix, enumerate ≥2 boundary "
+            "cases here (null/undefined, empty set, max value, etc.) and verify each "
+            "against actual code behavior. This field is informational only and NOT "
+            "used for closure-checker validation. Keep hypothetical risks and 'OPEN ISSUE' "
+            "notes here, not in requirement_findings."
         ),
     )
     requirement_evidence_locations: list[str] = Field(
@@ -126,3 +141,25 @@ class DeepSearchReport(BaseModel):
         default_factory=list,
         description="Remaining open questions."
     )
+
+    @field_validator("requirement_evidence_locations")
+    @classmethod
+    def validate_evidence_location_format(cls, v: list[str]) -> list[str]:
+        """Validate that all evidence locations match 'file.py:LINE' or 'file.py:LINE-LINE' format.
+
+        This prevents the infinite loop bug where deep-search returns bare file paths
+        without line numbers, causing correct-attribution checks to fail repeatedly.
+        """
+        pattern = re.compile(r"^\S+?:\d+(?:-\d+)?$")
+        invalid_locations = [loc for loc in v if not pattern.match(loc)]
+
+        if invalid_locations:
+            raise ValueError(
+                f"Invalid evidence_location format. All locations must be 'file.py:LINE' "
+                f"or 'file.py:LINE-LINE'. Invalid entries: {invalid_locations}. "
+                f"For files that don't exist yet, reference the integration points "
+                f"(e.g., 'src/routes/index.js:25' for where the new module will be mounted). "
+                f"For whole-file references, use a line range (e.g., 'file.py:1-100')."
+            )
+
+        return v

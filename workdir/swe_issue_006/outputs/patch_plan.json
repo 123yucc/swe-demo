@@ -1,0 +1,94 @@
+{
+  "overview": "The root cause is that `Request.open` in `lib/ansible/module_utils/urls.py` unconditionally consults `.netrc` credentials whenever no explicit username/password is provided (lines 1487–1497). There is no controlling flag anywhere in the call chain, so a user-supplied `Authorization: Bearer` header is silently overwritten by Basic auth credentials sourced from `.netrc`, producing a 401.\n\nThe fix threads a new `use_netrc` parameter (defaulting to `True` for full backward compatibility) through every layer of the call chain:\n1. `Request.__init__` stores it as an instance attribute.\n2. `Request.open` accepts it as a per-call override, resolves it via the existing `_fallback` pattern, and guards the `netrc.netrc()` block with `if use_netrc:`.\n3. `open_url` adds `use_netrc=True` to its signature and forwards it to `Request.__init__` and `Request.open`.\n4. `fetch_url` adds `use_netrc=True` and forwards it to `open_url`.\n5. `get_url.url_get` adds `use_netrc=True` and forwards it to `fetch_url`; `get_url.main` adds `use_netrc` to `argument_spec`, reads it from `module.params`, and passes it to both `url_get` call sites.\n6. `uri.uri` adds `use_netrc=True` and forwards it to `fetch_url`; `uri.main` adds `use_netrc` to `argument_spec`, reads it from `module.params`, and passes it to `uri()`.\n7. The `url` lookup plugin adds a `use_netrc` option to `DOCUMENTATION` and forwards `self.get_option('use_netrc')` to `open_url`.\n\nAll defaults are `True`, preserving existing `.netrc` behaviour for every caller that does not set the flag.",
+  "edits": [
+    {
+      "filepath": "lib/ansible/module_utils/urls.py",
+      "target_functions": [
+        "Request.__init__",
+        "Request.open",
+        "open_url",
+        "fetch_url"
+      ],
+      "change_rationale": "Four functions in this file must be modified (req-001 through req-004). (1) `Request.__init__` (lines 1307–1351) must gain a `use_netrc=True` parameter and store it as `self.use_netrc`. (2) `Request.open` (lines 1358–1497) must add `use_netrc=None` to its signature, resolve it via `self._fallback(use_netrc, self.use_netrc)` in the fallback block (lines 1416–1432), and wrap the `netrc.netrc()` block (lines 1487–1497) in `if use_netrc:`. (3) `open_url` (lines 1649–1668) must add `use_netrc=True` to its signature and forward it to both `Request()` constructor and `Request.open`. (4) `fetch_url` (lines 1818–1905) must add `use_netrc=True` to its signature and forward it in the `open_url` call at lines 1898–1905. All co-edit targets in get_url.py, uri.py, and url.py depend on these changes being present first.",
+      "preserved_findings": [
+        "`Request.__init__` method (lib/ansible/module_utils/urls.py:1307-1310) accepts 16 parameters but none of them is a `use_netrc` (or equivalent) parameter.",
+        "No netrc-related instance attribute is stored anywhere in `__init__` (lines 1329-1351).",
+        "The fallback block (lines 1416–1432) applies `self._fallback(value, self.attr)` for every other per-call override — `use_proxy`, `validate_certs`, `force_basic_auth`, etc. — but there is no corresponding `use_netrc` local variable resolved from a call-site argument or an instance attribute.",
+        "No fallback resolution (`self._fallback(use_netrc, self.use_netrc)`) that would apply the instance default when the call-site omits the argument (lines 1416–1432).",
+        "No conditional guard around the `netrc.netrc()` call that would skip it when the flag is `False` (lines 1487–1497).",
+        "lib/ansible/module_utils/urls.py:1416-1432 -- _fallback pattern: each open() parameter resolves to call-site value or instance default; use_netrc should follow the same pattern once added to __init__ (req-001) and open()",
+        "lib/ansible/module_utils/urls.py:1649-1655 -- every other Request.open parameter (use_proxy, validate_certs, force_basic_auth, use_gssapi, etc.) has a matching parameter in open_url with the same default; use_netrc should follow the same pattern with default True",
+        "lib/ansible/module_utils/urls.py:1649-1655 -- open_url signature lists every other forwarded parameter (use_proxy, validate_certs, force_basic_auth, use_gssapi, etc.) with matching defaults; use_netrc should follow the same pattern with default True",
+        "lib/ansible/module_utils/urls.py:1818-1821 -- fetch_url mirrors open_url's parameter list; use_netrc should be added here with default True and forwarded at lines 1898-1905",
+        "No `use_netrc` parameter in the signature — the function signature (lines 1649–1655) lists 23 parameters (`url`, `data`, `headers`, `method`, `use_proxy`, `force`, `last_mod_time`, `timeout`, `validate_certs`, `url_username`, `url_password`, `http_agent`, `force_basic_auth`, `follow_redirects`, `client_cert`, `client_key`, `cookies`, `use_gssapi`, `unix_socket`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`) but `use_netrc` is not among them.",
+        "No default value — because the parameter does not exist, there is no `use_netrc=True` default.",
+        "No forwarding to `Request.open` — `Request()` is instantiated with no constructor arguments at line 1662, and the subsequent `.open(...)` call (lines 1662–1668) passes all 23 other keyword arguments explicitly but omits `use_netrc` entirely.",
+        "The `fetch_url` function (lib/ansible/module_utils/urls.py:1818–1821) accepts 16 parameters but `use_netrc` is entirely absent from the signature.",
+        "The single `open_url` call inside `fetch_url` (lines 1898–1905) forwards 23 keyword arguments explicitly — `data`, `headers`, `method`, `use_proxy`, `force`, `last_mod_time`, `timeout`, `validate_certs`, `url_username`, `url_password`, `http_agent`, `force_basic_auth`, `follow_redirects`, `client_cert`, `client_key`, `cookies`, `use_gssapi`, `unix_socket`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers` — but `use_netrc` is not among them."
+      ],
+      "co_edit_dependencies": [
+        "lib/ansible/modules/get_url.py",
+        "lib/ansible/modules/uri.py",
+        "lib/ansible/plugins/lookup/url.py"
+      ]
+    },
+    {
+      "filepath": "lib/ansible/modules/get_url.py",
+      "target_functions": [
+        "url_get",
+        "main"
+      ],
+      "change_rationale": "Two functions must be modified (req-005 and req-006). (1) `url_get` (lines 382–392) must add `use_netrc=True` to its 13-parameter signature and forward `use_netrc=use_netrc` in the `fetch_url` call at lines 391–392, mirroring how every other parameter (use_proxy, force, timeout, etc.) is forwarded. (2) `main` must add a `use_netrc` key to `argument_spec.update()` (lines 468–479), read `use_netrc = module.params['use_netrc']` in the param-extraction block (lines 488–499) following the same pattern as `use_proxy` at line 493, and forward `use_netrc=use_netrc` at both `url_get` call sites: the checksum retrieval (lines 523–524) and the primary download (lines 601–602).",
+      "preserved_findings": [
+        "The `url_get` function signature at get_url.py:382-383 was read and confirmed. It accepts exactly 13 parameters: `module`, `url`, `dest`, `use_proxy`, `last_mod_time`, `force`, `timeout`, `headers`, `tmp_dest`, `method`, `unredirected_headers`, `decompress`, `ciphers`. No `use_netrc` parameter is present.",
+        "The single `fetch_url` call at lines 391-392 was read and confirmed. It forwards: `use_proxy`, `force`, `last_mod_time`, `timeout`, `headers`, `method`, `unredirected_headers`, `decompress`, `ciphers`. No `use_netrc` keyword argument is forwarded.",
+        "lib/ansible/modules/get_url.py:382-383 -- every other forwarded parameter (use_proxy, force, last_mod_time, timeout, headers, method, unredirected_headers, decompress, ciphers) has a matching parameter in url_get and is forwarded to fetch_url; use_netrc should follow the same pattern with default True",
+        "lib/ansible/modules/get_url.py:493 -- use_proxy is retrieved from module.params and forwarded to both url_get calls; use_netrc should follow the same pattern",
+        "No `use_netrc` in the argument spec — `main()` builds its argument spec via `url_argument_spec()` and then `argument_spec.update(...)` (lines 468–479). The update block adds `url`, `dest`, `backup`, `checksum`, `timeout`, `headers`, `tmp_dest`, `unredirected_headers`, `decompress`, and `ciphers`, but no `use_netrc` key.",
+        "No retrieval from `module.params` — The param-extraction block (lines 488–499) reads `url`, `dest`, `backup`, `force`, `checksum`, `use_proxy`, `timeout`, `headers`, `tmp_dest`, `unredirected_headers`, `decompress`, and `ciphers`. There is no `use_netrc = module.params['use_netrc']` line anywhere in `main()`.",
+        "Not forwarded to either `url_get` call — There are exactly two calls to `url_get` in `main()`: Checksum retrieval at lines 523–524: forwards `use_proxy`, `last_mod_time`, `force`, `timeout`, `headers`, `tmp_dest`, `unredirected_headers`, `ciphers` — no `use_netrc`. Primary download at lines 601–602: forwards `use_proxy`, `last_mod_time`, `force`, `timeout`, `headers`, `tmp_dest`, `method`, `unredirected_headers`, `decompress` — no `use_netrc`."
+      ],
+      "co_edit_dependencies": [
+        "lib/ansible/module_utils/urls.py"
+      ]
+    },
+    {
+      "filepath": "lib/ansible/modules/uri.py",
+      "target_functions": [
+        "uri",
+        "main"
+      ],
+      "change_rationale": "Two functions must be modified (req-007 and req-008). (1) `uri` (lines 547–573) must add `use_netrc=True` as a 13th parameter and forward `use_netrc=use_netrc` in the `fetch_url` call at lines 569–573, following the same pattern as `use_proxy` which is read from `module.params` inline at the call site. (2) `main` must add a `use_netrc` key to `argument_spec.update()` (lines 587–608), read `use_netrc` from `module.params` in the extraction block (lines 616–630), and forward it in the `uri()` call at lines 672–674 (expanding from 12 to 13 positional arguments, or switching to keyword argument style).",
+      "preserved_findings": [
+        "The `uri` function at lib/ansible/modules/uri.py:547-548 accepts exactly 12 parameters: `module`, `url`, `dest`, `body`, `body_format`, `method`, `headers`, `socket_timeout`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`. No `use_netrc` parameter (or any equivalent) is present.",
+        "The single `fetch_url` call inside `uri` (lines 569-573) forwards: `data`, `headers`, `method`, `timeout`, `unix_socket`, `ca_path`, `unredirected_headers`, `use_proxy`, `decompress`, `ciphers`, and an optional `last_mod_time` via `**kwargs`. `use_netrc` is not among the forwarded arguments.",
+        "lib/ansible/modules/uri.py:572 -- use_proxy is read from module.params inline at the fetch_url call site; use_netrc should follow the same pattern",
+        "No `use_netrc` in `argument_spec` — `argument_spec.update()` at lines 587–608 adds 20 keys (`dest`, `url_username`, `url_password`, `body`, `body_format`, `src`, `method`, `return_content`, `follow_redirects`, `creates`, `removes`, `status_code`, `timeout`, `headers`, `unix_socket`, `remote_src`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`). `use_netrc` is not among them.",
+        "No retrieval from `module.params` — The param-extraction block (lines 616–630) reads `url`, `body`, `body_format`, `method`, `dest`, `return_content`, `creates`, `removes`, `status_code`, `timeout`, `ca_path`, `headers`, `unredirected_headers`, `decompress`, `ciphers`. There is no `use_netrc = module.params['use_netrc']` line.",
+        "Not forwarded to `uri()` — The call to `uri()` at lines 672–674 passes exactly 12 positional arguments: `module`, `url`, `dest`, `body`, `body_format`, `method`, `dict_headers`, `socket_timeout`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`. `use_netrc` is not among them, and the `uri()` function itself also lacks the parameter."
+      ],
+      "co_edit_dependencies": [
+        "lib/ansible/module_utils/urls.py"
+      ]
+    },
+    {
+      "filepath": "lib/ansible/plugins/lookup/url.py",
+      "target_functions": [
+        "DOCUMENTATION",
+        "LookupModule.run"
+      ],
+      "change_rationale": "The `url` lookup plugin must be modified (req-009). (1) `DOCUMENTATION` (lines 7–167) must gain a `use_netrc` option entry (type bool, default True) alongside the existing 17 options so that playbook authors can set `use_netrc: false`. (2) `LookupModule.run` (lines 209–248) must read `self.get_option('use_netrc')` and pass it as `use_netrc=` to the `open_url` call at lines 218–232, following the identical pattern used for every other option (`validate_certs`, `use_proxy`, `force_basic_auth`, `use_gssapi`, etc.).",
+      "preserved_findings": [
+        "DOCUMENTATION / option spec (lines 7-167): Defines 17 options (`validate_certs`, `split_lines`, `use_proxy`, `username`, `password`, `headers`, `force`, `timeout`, `http_agent`, `force_basic_auth`, `follow_redirects`, `use_gssapi`, `unix_socket`, `ca_path`, `unredirected_headers`, `ciphers`, `_terms`). `use_netrc` is not among them, so no caller can configure it.",
+        "`run` method body (lines 209-248): Calls `open_url` with 15 explicit keyword arguments (lines 218-232). Every option from DOCUMENTATION is forwarded, but `use_netrc` is absent — there is no `self.get_option('use_netrc')` call and no `use_netrc=...` kwarg passed to `open_url`. Confirmed by direct read and zero-match grep.",
+        "lib/ansible/plugins/lookup/url.py:218-232 — every other option (validate_certs, use_proxy, force_basic_auth, use_gssapi, etc.) follows the pattern self.get_option('X') forwarded as X= to open_url; use_netrc should follow the same pattern",
+        "urls.py:1487-1497: netrc.netrc() called unconditionally in Request.open else-branch; no controlling flag reachable from url lookup plugin",
+        "urls.py:1649-1655: open_url signature confirmed by direct read — use_netrc absent",
+        "urls.py:1358-1364: Request.open signature confirmed by direct read — use_netrc absent"
+      ],
+      "co_edit_dependencies": [
+        "lib/ansible/module_utils/urls.py"
+      ]
+    }
+  ]
+}

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -59,6 +60,54 @@ def load_instance_from_dataset(
 
     print(f"Loaded instance: {instance.get('instance_id', '<unknown>')}")
     return dict(instance)
+
+
+def prepare_repo(repo_dir: Path, base_commit: str) -> None:
+    """Ensure repo is at clean base_commit state.
+
+    This prevents the system from generating patches based on previously
+    modified code by resetting the working directory to a clean state.
+
+    Args:
+        repo_dir: Path to the repository root.
+        base_commit: Git commit hash to reset to.
+    """
+    print(f"[repo-init] Resetting repo to clean state at {base_commit[:8]}...")
+
+    # Reset to base_commit (discards any uncommitted changes)
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "reset", "--hard", base_commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"WARNING: git reset failed: {result.stderr}")
+        print("Continuing anyway...")
+
+    # Clean untracked files and directories
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "clean", "-fd"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"WARNING: git clean failed: {result.stderr}")
+        print("Continuing anyway...")
+
+    # Ensure we're on the base_commit (detached HEAD is fine)
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "checkout", base_commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(f"WARNING: git checkout failed: {result.stderr}")
+        print("Continuing anyway...")
+
+    print(f"[repo-init] Repo prepared at {base_commit[:8]}")
 
 
 def write_prediction(
@@ -132,10 +181,18 @@ def main() -> None:
         sys.exit(1)
 
     instance_id = instance["instance_id"]
+    base_commit = instance.get("base_commit", "")
     repo_dir = Path(args.repo_dir)
     if not repo_dir.exists():
         print(f"ERROR: repo_dir not found: {repo_dir}")
         sys.exit(1)
+
+    # --- Prepare repo: reset to clean base_commit state ---
+    if base_commit:
+        prepare_repo(repo_dir, base_commit)
+    else:
+        print("WARNING: No base_commit found in instance metadata.")
+        print("         Repo will not be reset. This may cause incorrect patches.")
 
     # --- Output directory ---
     if args.output_dir:

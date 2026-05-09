@@ -9,8 +9,6 @@ Three semantic check types (18.C):
   verdict_vs_code        — does the cited code actually support the verdict?
   findings_anti_hallucination — are backtick code snippets in findings verified?
   prescriptive_boundary_self_check — does the prescriptive fix survive edge cases?
-
-Structured output is produced via src/agents/_structured.py.
 """
 
 import asyncio
@@ -60,8 +58,16 @@ CHECK TYPES
    (e.g. null vs non-null input, empty vs non-empty set, boundary values).
    Substitute the prescriptive fix into each edge case and check whether
    all results satisfy the requirement's original description.
-   If any edge case violates the requirement → FAIL, describe the edge case
-   and why the prescriptive fix fails it.
+
+   Phase 22 ESCAPE HATCH: If any edge case violates the requirement:
+     - If the edge case requires a SEPARATE feature not mentioned in the
+       requirement (e.g., cleanup logic, validation middleware, error handling
+       for a different scenario) → PASS with caveat, note the missing feature
+       in explanation. The core defect is correctly identified even if related
+       features are missing.
+     - If the edge case contradicts the prescriptive fix itself (the fix
+       directly causes the violation) → FAIL, describe the edge case and why
+       the prescriptive fix fails it.
    If all edge cases pass → PASS.
 
 ────────────────────────────────────────────────────────────────────────
@@ -112,7 +118,6 @@ async def _run_closure_checker_async(
         allowed_tools=["Grep", "Read", "Glob", "TodoWrite"],
         max_turns=30,
         max_budget_usd=2.5,
-        max_validation_retries=1,
         cwd=str(repo_dir) if repo_dir is not None else None,
     )
 

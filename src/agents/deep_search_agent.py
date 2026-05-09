@@ -6,8 +6,6 @@ Grep / Read / Glob tools and returns a structured DeepSearchReport.
 Phase 18.E adds a self-reflection round after the first structured output:
 the agent verifies its own findings for hallucination and boundary issues
 before returning the final report.
-
-Structured output is produced via src/agents/_structured.py.
 """
 
 import asyncio
@@ -32,6 +30,13 @@ Your job, for that single requirement:
    unless the verdict is AS_IS_COMPLIANT.
 4. Also fill any AS-IS observations (localization.*, structural.*, similar
    implementation patterns) you uncovered along the way.
+
+CRITICAL: requirement_evidence_locations MUST use format 'file.py:LINE' or
+'file.py:LINE-LINE'. NEVER use bare file paths without line numbers.
+- For files that don't exist yet, reference the integration points where they
+  will be mounted or imported (e.g., 'src/routes/index.js:25').
+- For whole-file references, use a line range (e.g., 'src/file.py:1-100').
+- Every location must include a colon and line number(s).
 
 Paths are relative to repo root. Do NOT modify files. Do NOT fabricate code
 that isn't there.
@@ -59,9 +64,14 @@ SELF-REFLECTION CHECKS:
      - empty collection vs non-empty collection
      - boundary values (e.g. exactly at max, just over max)
    Substitute your prescriptive fix into each case.  If any case fails
-   the requirement description, record this as an open issue in findings
-   ("boundary case X: fix does not satisfy requirement").  Do NOT hide
-   contradictions.
+   the requirement description, record this as an open issue.
+
+   IMPORTANT (Phase 22): Write boundary enumeration results to the
+   `boundary_analysis` field, NOT in `requirement_findings`. The findings
+   field should contain ONLY verified code defects and observations from
+   actual code. Keep hypothetical edge case speculation, "OPEN ISSUE" notes,
+   and "what if X is undefined" analysis in boundary_analysis. This separation
+   ensures closure-checker validates actual defects, not hypothetical risks.
 
 3. VERDICT CONSISTENCY — If findings mention overlapping code with other
    requirements, ensure your verdict is consistent with the code's
@@ -97,7 +107,6 @@ async def _run_deep_search_async(
         allowed_tools=["Grep", "Read", "Glob", "TodoWrite"],
         max_turns=30,
         max_budget_usd=1.0,
-        max_validation_retries=2,
         cwd=str(repo_dir) if repo_dir is not None else None,
     )
 
@@ -120,7 +129,6 @@ async def _run_deep_search_async(
             allowed_tools=["Grep", "Read", "Glob"],
             max_turns=10,
             max_budget_usd=0.5,
-            max_validation_retries=0,
             cwd=str(repo_dir) if repo_dir is not None else None,
         )
         # Use reflected report if it came back with valid data

@@ -198,7 +198,7 @@ def check_structural_invariants(evidence: EvidenceCards) -> dict[str, list[str]]
     """Check structural invariants across evidence cards.
 
     Returns a dict keyed by invariant name; each value is a list of failure
-    descriptions.  Keys with empty lists passed.  The three invariants are:
+    descriptions.  Keys with empty lists passed.  The four invariants are:
 
     I1 — new_interface ↔ missing_elements bidirectional mapping:
       - Every req with origin==new_interfaces must have its interface name
@@ -215,7 +215,19 @@ def check_structural_invariants(evidence: EvidenceCards) -> dict[str, list[str]]
       - Each symptom.observable_failure should share >= 2 non-stopword
         tokens with at least one requirements-origin req text.
 
-    I2 violations trigger immediate UNCHECKED reset (rework); I1/I3 are
+    I4 — declared-new-file co-edit completeness:
+      - Any file path declared as NEW (keywords: "absent", "must be
+        created", "does not exist", "missing", "new") in
+        missing_elements_to_implement or suspect_entities must be
+        mentioned at least once inside must_co_edit_relations or
+        dependency_propagation.  A new file with no co-edit declaration
+        means deep-search has not identified the file's integration
+        points (callers, registries, mounts, imports); the planner will
+        have nothing to backfill and the resulting patch will leave
+        the new file unreachable.  Framework-agnostic — no assumption
+        about directory layout, language, or registry conventions.
+
+    I2 violations trigger immediate UNCHECKED reset (rework); I1/I3/I4 are
     warnings that flow into the closure-checker audit.
     """
     if evidence is None:
@@ -225,6 +237,7 @@ def check_structural_invariants(evidence: EvidenceCards) -> dict[str, list[str]]
         "I1": [],
         "I2": [],
         "I3": [],
+        "I4": [],
     }
 
     # ── Build name sets ──────────────────────────────────────────────────
@@ -278,5 +291,50 @@ def check_structural_invariants(evidence: EvidenceCards) -> dict[str, list[str]]
         )
         if not matched:
             failures["I3"].append(f"I3_orphan_symptom: {failure!r:.80}")
+
+    # ── I4 check (declared-new-file co-edit completeness) ─────────────
+    # Framework-agnostic: any file path declared as NEW in
+    # missing_elements_to_implement or suspect_entities ("absent", "must
+    # be created", "does not exist", "new") should have at least one
+    # sentence in must_co_edit_relations or dependency_propagation that
+    # mentions its path — otherwise deep-search has not identified the
+    # integration/registration points the new file depends on, and
+    # downstream planning will be incomplete.
+    file_path_re = re.compile(
+        r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6})\b"
+    )
+    new_keywords = ("absent", "must be created", "does not exist", "missing", " new ")
+
+    # Corpus where new files are declared
+    declared_sources: list[str] = (
+        list(evidence.constraint.missing_elements_to_implement)
+        + list(evidence.localization.suspect_entities)
+    )
+    # Corpus where co-edit dependencies are expected to appear
+    coedit_corpus = "\n".join(
+        list(evidence.structural.must_co_edit_relations)
+        + list(evidence.structural.dependency_propagation)
+    )
+
+    seen_paths: set[str] = set()
+    for sentence in declared_sources:
+        # Only flag files that the sentence itself identifies as NEW.
+        sentence_lower = " " + sentence.lower() + " "
+        if not any(kw in sentence_lower for kw in new_keywords):
+            continue
+        for m in file_path_re.finditer(sentence):
+            path = m.group(1).strip()
+            if "/" not in path:
+                continue
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            if path not in coedit_corpus:
+                failures["I4"].append(
+                    f"I4_orphan_new_file: new file {path!r} declared but no "
+                    f"sentence in must_co_edit_relations or "
+                    f"dependency_propagation references it; integration "
+                    f"points are likely missing"
+                )
 
     return failures
