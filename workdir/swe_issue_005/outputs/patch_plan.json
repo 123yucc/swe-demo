@@ -1,22 +1,23 @@
 {
-  "overview": "Root cause: `is_valid_collection_name` in `_collection_finder.py` delegates entirely to the regex `VALID_COLLECTION_NAME_RE` (`^\\w+\\.\\w+$`), which (a) allows leading digits because `\\w` is not equivalent to a Python identifier start character, and (b) never calls `iskeyword`, so reserved words like `def` and `return` pass validation. A parallel but private implementation (`_is_fqcn` + `_is_py_id`) in `dataclasses.py` already performs the correct checks but was never wired to `is_valid_collection_name`.\n\nFix strategy:\n1. Introduce a public `is_python_identifier` helper in `_collection_finder.py` (wrapping `str.isidentifier`) and add an `iskeyword` import there.\n2. Rewrite `is_valid_collection_name` to split on `.`, then for each captured segment call `is_python_identifier` AND reject if `iskeyword` returns True — mirroring the correct pattern already present in `_is_fqcn`.\n3. In `dataclasses.py`, remove the now-redundant `_is_py_id` (and its Python 2/3 compat try/except block), remove `_is_fqcn`, remove the `iskeyword` import that existed solely for `_is_fqcn`, and update the single call site in `from_requirement_dict` to delegate to `AnsibleCollectionRef.is_valid_collection_name` instead.\n\nThis is the minimal change set: two files, no new modules, no interface changes, boolean return contract preserved (req-004 already compliant).",
+  "overview": "Root cause: Two separate but related deficiencies share a common fix. (1) `AnsibleCollectionRef.is_valid_collection_name` in `_collection_finder.py` delegates entirely to `VALID_COLLECTION_NAME_RE` whose `\\w+` pattern neither enforces proper Python identifier rules (segments may start with a digit) nor rejects Python reserved keywords — the FIXME on line 685 directly acknowledges this gap, and the FIXME on dataclasses.py line 129 explicitly cross-references it as the intended fix target. (2) The legacy helpers `_is_py_id` and `_is_fqcn` in `dataclasses.py` duplicate identifier/keyword validation with Python 2/3 compatibility scaffolding that is now dead code; the requirement is to remove them and introduce a clean `is_python_identifier` helper that wraps `str.isidentifier` with a None/non-string guard.\n\nStrategy: Fix `is_valid_collection_name` first (it is the shared replacement target for line 239 in dataclasses.py). Import `iskeyword` into `_collection_finder.py` and rewrite the method body to split on `.`, then test each segment with `str.isidentifier()` and `not iskeyword()`. Then, in `dataclasses.py`, introduce the `is_python_identifier` public helper, remove `_is_py_id` / `_is_fqcn` and all Python 2/3 compat code, drop the now-unused `iskeyword` import, and replace the `_is_fqcn(...)` call at line 239 with `AnsibleCollectionRef.is_valid_collection_name(...)` (already fixed). The boolean-return contract (req-004) is preserved throughout — no exceptions are raised by any of these check functions; `AnsibleCollectionRef.__init__` remains the sole converter of `False` into `ValueError`.",
   "edits": [
     {
       "filepath": "lib/ansible/utils/collection_loader/_collection_finder.py",
       "target_functions": [
-        "is_python_identifier (new module-level or static helper)",
-        "AnsibleCollectionRef.is_valid_collection_name"
+        "is_valid_collection_name",
+        "VALID_COLLECTION_NAME_RE (annotation only — FIXME comment must be resolved)"
       ],
-      "change_rationale": "req-003 (AS_IS_VIOLATED): VALID_COLLECTION_NAME_RE uses \\w+ which accepts leading digits and Python reserved keywords. The FIXME at line 685 explicitly acknowledges this. The method is_valid_collection_name at line 855 must be rewritten to perform per-segment identifier and keyword checks. req-002 (TO_BE_MISSING): is_python_identifier does not exist anywhere; it must be introduced here as the canonical public helper. must_co_edit_relations item 4 ('If VALID_COLLECTION_NAME_RE is tightened -> is_valid_collection_name may need to add iskeyword checks') and item 5 ('If is_valid_collection_name is rewritten to call is_python_identifier -> req-002 must be implemented first') both target this file.",
+      "change_rationale": "req-003 (AS_IS_VIOLATED): `is_valid_collection_name` relies solely on `VALID_COLLECTION_NAME_RE` whose `\\w+` pattern does not reject Python keywords (e.g. `def.collection` passes) and does not enforce that segments begin with a letter/underscore. The FIXME at line 685 explicitly acknowledges the gap; the FIXME at dataclasses.py:129 explicitly targets this method as the destination for the ported logic. Fix: import `iskeyword` from the `keyword` stdlib module; rewrite `is_valid_collection_name` to split the input on `.`, verify the split yields exactly two non-empty segments, and test each with `s.isidentifier() and not iskeyword(s)`. This ports the combined check already present in `_is_fqcn` (dataclasses.py:133-137) as the FIXMEs direct. `VALID_COLLECTION_NAME_RE` may be retained for backward-compatible callers but `is_valid_collection_name` must no longer rely on it alone. The method must continue to return a plain bool with no exceptions (req-004 already compliant).",
       "preserved_findings": [
-        "No keyword rejection. The regex `\\w+` accepts Python reserved keywords (`def`, `return`, `import`, `assert`, etc.) as valid namespace or name segments. There is no `iskeyword` call anywhere in `is_valid_collection_name` or in `VALID_COLLECTION_NAME_RE`. A name like `def.collection` or `return.module` passes the check.",
-        "`\\w` is not equivalent to a Python identifier. `\\w` matches `[a-zA-Z0-9_]` but also matches Unicode word characters and, critically, allows a leading digit (e.g., `123.collection` would match `\\w+`). Python identifiers must start with a letter or underscore (`[a-zA-Z_]\\w*`).",
-        "The FIXME comment on line 685 explicitly acknowledges this gap: `# FIXME: tighten this up to match Python identifier reqs, etc`",
-        "The FIXME comment inside `_is_fqcn` at line 129 (`# FIXME: port this to AnsibleCollectionRef.is_valid_collection_name`) explicitly acknowledges this gap.",
-        "`_is_fqcn` performs both `_is_py_id` (identifier check) and `iskeyword` checks per segment; this is the correct pattern that `is_valid_collection_name` should follow",
-        "`_is_py_id = str.isidentifier` (Python 3 path) is the direct equivalent of the identifier check that VALID_COLLECTION_NAME_RE currently approximates incorrectly",
-        "is_valid_collection_name returns bool(re.match(AnsibleCollectionRef.VALID_COLLECTION_NAME_RE, collection_name)) at line 855 — no exception path inside the method",
-        "Caller at line 704 checks the boolean with `if not ...` and raises ValueError — exception lives in the caller, not the check"
+        "re.compile(to_text(r'^(\\w+)\\.(\\w+)$'))",
+        "\\w+ pattern matches any sequence of word characters [a-zA-Z0-9_] — it has no concept of reserved Python keywords",
+        "\\w+ accepts segments that start with a digit (e.g. 1abc.foo), whereas a valid Python identifier must begin with a letter or underscore",
+        "# FIXME: tighten this up to match Python identifier reqs, etc",
+        "# FIXME: port this to AnsibleCollectionRef.is_valid_collection_name",
+        "not iskeyword(ns_or_name) and _is_py_id(ns_or_name)",
+        "_is_fqcn correctly combines not iskeyword(ns_or_name) and _is_py_id(ns_or_name) for both segments; line 129 FIXME explicitly states this logic should be ported to AnsibleCollectionRef.is_valid_collection_name",
+        "return bool(re.match(AnsibleCollectionRef.VALID_COLLECTION_NAME_RE, collection_name))",
+        ":return: True if the collection name passed is well-formed, False otherwise"
       ],
       "co_edit_dependencies": [
         "lib/ansible/galaxy/dependency_resolution/dataclasses.py"
@@ -25,21 +26,26 @@
     {
       "filepath": "lib/ansible/galaxy/dependency_resolution/dataclasses.py",
       "target_functions": [
-        "_is_py_id (remove — lines 42-54 including try/except block)",
-        "_is_fqcn (remove — lines 128-137)",
-        "_ComputedReqKindsMixin.from_requirement_dict (update call site at line 239)"
+        "_is_py_id (remove)",
+        "_is_fqcn (remove)",
+        "is_python_identifier (introduce)",
+        "_ComputedReqKindsMixin.from_requirement_dict (update call at line 239)"
       ],
-      "change_rationale": "req-001 (AS_IS_VIOLATED): _is_py_id (lines 42-54, including the Python 2/3 try/except compat block), _is_fqcn (lines 128-137), and the iskeyword import (line 14) all remain and must be removed. must_co_edit_relations items 1-3 are hard dependencies triggered by removing these helpers: (1) from_requirement_dict at line 239 must be updated to call the replacement (AnsibleCollectionRef.is_valid_collection_name), (2) the iskeyword import at line 14 must be removed since it exists solely for _is_fqcn, (3) the try/except AttributeError block at lines 42-54 must be removed entirely when _is_py_id is removed.",
+      "change_rationale": "req-001 (AS_IS_VIOLATED) + req-002 (TO_BE_MISSING) + must_co_edit_relations: Three co-edit obligations must be satisfied together in this file. (1) Introduce `is_python_identifier(name)` — a public helper that wraps `str.isidentifier` with a None/non-string guard (req-002); this replaces the private `_is_py_id` it supersedes. (2) Remove `_is_py_id` (lines 42-54, the Python 2/3 try/except AttributeError block) and `_is_fqcn` (lines 128-137) and all related Python 2 compatibility scaffolding: `from __future__ import (absolute_import, division, print_function)` (line 7), `__metaclass__ = type` (line 8), the `try/except ImportError` guard around `from typing import TYPE_CHECKING` (lines 16-19), and `from ansible.module_utils.six import raise_from` (line 38) (req-001). (3) Per must_co_edit_relations: the `iskeyword` import at line 14 becomes unused once `_is_fqcn` is removed and must be deleted; and the call at line 239 inside `from_requirement_dict` that currently calls `_is_fqcn(...)` must be replaced with `AnsibleCollectionRef.is_valid_collection_name(...)` (now correctly implemented in the co-edited file).",
       "preserved_findings": [
-        "Line 14: `from keyword import iskeyword  # used in _is_fqcn` — import exists solely to support the legacy function.",
-        "Lines 42–54: A `try/except AttributeError` block assigns `str.isidentifier` to `_is_py_id` on Python 3 (line 45), and on `AttributeError` (Python 2 fallback) imports `re.match` as `_match_pattern` and `tokenize.Name` as `_VALID_IDENTIFIER_REGEX`, then defines a regex-based `_is_py_id` function (lines 48–54). This is the exact Python 2/3 compat code the requirement says must be removed.",
-        "Lines 128–137: `_is_fqcn` is defined and calls both `iskeyword` (line 135) and `_is_py_id` (line 135) inside an `all(...)` comprehension.",
-        "Line 239: `_is_fqcn(req_name)` is called inside `from_requirement_dict` to classify `req_type` as `'galaxy'`.",
-        "`_is_py_id = str.isidentifier` (Python 3 path) is the direct equivalent of what `is_python_identifier` should do",
-        "`_is_fqcn` (line 128) -> `_is_py_id` (line 135) — the only current consumer of the private helper",
-        "If _is_py_id and _is_fqcn are removed -> from_requirement_dict (line 239) must be updated to call the replacement helper",
-        "If _is_fqcn is removed -> iskeyword import (line 14) must also be removed or relocated",
-        "If _is_py_id is removed -> the try/except AttributeError block (lines 42-54) must be removed entirely"
+        "Both `_is_py_id` and `_is_fqcn` are still present in the file and have NOT been removed.",
+        "`_is_py_id` is defined via a Python 2/3 compatibility try/except block (lines 42–54): the py3 path assigns `str.isidentifier`, while the `except AttributeError` branch (Python 2 fallback) imports `re.match` and `tokenize.Name` and defines a regex-based function. This entire block remains intact.",
+        "`_is_fqcn` is defined at lines 128–137 and actively called at line 239 inside `from_requirement_dict`. It uses both `iskeyword` (imported at line 14 specifically for it) and `_is_py_id`.",
+        "Line 7: `from __future__ import (absolute_import, division, print_function)`",
+        "Line 8: `__metaclass__ = type`",
+        "Lines 16–19: `try/except ImportError` guard around `from typing import TYPE_CHECKING`",
+        "Line 38: `from ansible.module_utils.six import raise_from`",
+        "Lines 42–54: the `try/except AttributeError` block for `_is_py_id`",
+        "The function `is_python_identifier` does not exist anywhere in the codebase. A repo-wide search for the symbol returned zero matches.",
+        "str.isidentifier (Python 3 path of _is_py_id) is the canonical one-liner that is_python_identifier should wrap or expose publicly, with an added None/non-string guard",
+        "If _is_py_id try/except block is removed -> iskeyword import on line 14 becomes unused and must also be removed (or moved to wherever the replacement helper lives)",
+        "If _is_fqcn is removed -> line 239 call site in from_requirement_dict must be updated to use a replacement (e.g., is_python_identifier / is_valid_collection_name)",
+        "When is_python_identifier is introduced it must replace the _is_py_id reference inside _is_fqcn (or its replacement) at approximately lib/ansible/galaxy/dependency_resolution/dataclasses.py:135"
       ],
       "co_edit_dependencies": [
         "lib/ansible/utils/collection_loader/_collection_finder.py"

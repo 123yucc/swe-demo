@@ -1,98 +1,98 @@
 diff --git a/src/controllers/index.js b/src/controllers/index.js
-index 253df71..f567f9a 100644
+index 253df71..54c18e3 100644
 --- a/src/controllers/index.js
 +++ b/src/controllers/index.js
-@@ -39,6 +39,7 @@ Controllers.errors = require('./errors');
+@@ -35,6 +35,7 @@ Controllers.mods = require('./mods');
+ Controllers.sitemap = require('./sitemap');
+ Controllers.osd = require('./osd');
+ Controllers['404'] = require('./404');
++Controllers['well-known'] = require('./well-known');
+ Controllers.errors = require('./errors');
  Controllers.composer = require('./composer');
  
- Controllers.write = require('./write');
-+Controllers['well-known'] = require('./well-known');
- 
- Controllers.reset = async function (req, res) {
- 	if (meta.config['password:disableEdit']) {
 diff --git a/src/controllers/well-known.js b/src/controllers/well-known.js
 new file mode 100644
-index 0000000..8844503
+index 0000000..33e5369
 --- /dev/null
 +++ b/src/controllers/well-known.js
 @@ -0,0 +1,57 @@
 +'use strict';
 +
 +const nconf = require('nconf');
++
 +const user = require('../user');
 +const privileges = require('../privileges');
-+const helpers = require('./helpers');
++const controllers = {
++	helpers: require('./helpers'),
++};
 +
-+const wellKnownController = module.exports;
++// Handles GET /.well-known/webfinger (RFC 7033).
++// Validates the `resource` query param, gates on view:users privilege,
++// resolves the username slug to a UID, and returns a WebFinger JSON payload.
++module.exports.webfinger = async function (req, res) {
++	const { resource } = req.query;
 +
-+wellKnownController.webfinger = async function (req, res) {
-+	const resource = req.query.resource;
-+
-+	if (!resource || !resource.startsWith('acct:')) {
-+		return res.status(400).json({ error: 'Bad Request' });
++	if (!resource) {
++		return res.status(400).json({ error: 'missing resource parameter' });
 +	}
 +
-+	const acctPart = resource.slice('acct:'.length);
-+	const atIndex = acctPart.lastIndexOf('@');
-+	if (atIndex === -1) {
-+		return res.status(400).json({ error: 'Bad Request' });
++	if (!resource.startsWith('acct:')) {
++		return res.status(400).json({ error: 'resource must use acct: URI scheme' });
 +	}
 +
-+	const hostname = acctPart.slice(atIndex + 1);
-+	const expectedHostname = nconf.get('url_parsed').hostname;
-+	if (hostname !== expectedHostname) {
-+		return res.status(400).json({ error: 'Bad Request' });
++	const hostname = nconf.get('url_parsed').hostname;
++	if (!resource.endsWith(`@${hostname}`)) {
++		return res.status(400).json({ error: 'resource hostname mismatch' });
 +	}
 +
-+	const canView = await privileges.global.can('view:users', req.uid);
++	const canView = await privileges.global.can('view:users', req.uid || 0);
 +	if (!canView) {
-+		return helpers.notAllowed(req, res);
++		return controllers.helpers.notAllowed(req, res);
 +	}
 +
-+	const username = acctPart.slice(0, atIndex);
-+	const uid = await user.getUidByUserslug(username);
++	const slug = resource.slice('acct:'.length, resource.lastIndexOf('@'));
++	const uid = await user.getUidByUserslug(slug);
 +	if (!uid) {
-+		return res.status(404).json({ error: 'Not Found' });
++		return res.status(404).json({ error: 'user not found' });
 +	}
 +
 +	const baseUrl = nconf.get('url');
-+	const userslug = await user.getUserField(uid, 'userslug');
++	const subject = resource;
++	const uidUrl = `${baseUrl}/uid/${uid}`;
++	const slugUrl = `${baseUrl}/user/${slug}`;
 +
-+	return res.status(200).json({
-+		subject: resource,
-+		aliases: [
-+			`${baseUrl}/uid/${uid}`,
-+			`${baseUrl}/user/${userslug}`,
-+		],
++	return res.json({
++		subject,
++		aliases: [uidUrl, slugUrl],
 +		links: [
 +			{
 +				rel: 'http://webfinger.net/rel/profile-page',
 +				type: 'text/html',
-+				href: `${baseUrl}/user/${userslug}`,
++				href: `${baseUrl}/user/${slug}`,
 +			},
 +		],
 +	});
 +};
 diff --git a/src/routes/index.js b/src/routes/index.js
-index 4008f15..6e85986 100644
+index 4008f15..527649f 100644
 --- a/src/routes/index.js
 +++ b/src/routes/index.js
 @@ -22,6 +22,7 @@ const _mounts = {
  	api: require('./api'),
  	admin: require('./admin'),
  	feed: require('./feeds'),
-+	'well-known': require('./well-known'),
++	wellKnown: require('./well-known'),
  };
  
  _mounts.main = (app, middleware, controllers) => {
-@@ -150,6 +151,7 @@ module.exports = async function (app, middleware) {
- };
- 
- function addCoreRoutes(app, router, middleware, mounts) {
-+	_mounts['well-known'](router, middleware, controllers);
+@@ -153,6 +154,7 @@ function addCoreRoutes(app, router, middleware, mounts) {
  	_mounts.meta(router, middleware, controllers);
  	_mounts.api(router, middleware, controllers);
  	_mounts.feed(router, middleware, controllers);
++	_mounts.wellKnown(router, middleware, controllers);
+ 
+ 	_mounts.main(router, middleware, controllers);
+ 	_mounts.mod(router, middleware, controllers);
 diff --git a/src/routes/user.js b/src/routes/user.js
 index 49f551d..131e794 100644
 --- a/src/routes/user.js

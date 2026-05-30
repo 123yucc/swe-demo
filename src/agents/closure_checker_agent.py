@@ -77,6 +77,13 @@ STRUCTURAL WARNINGS
 If the manifest includes warnings (from structural invariant checks I1/I3),
 note them in your reasoning but do NOT fail on them — they are informational.
 
+Lines starting with ``anchor:`` are deep-search-declared consistency
+anchors. A code gate has already mechanically verified that both endpoints
+of each anchor resolve in the repository, so you do NOT need to re-check
+them. Only flag an anchor in ``audited[].failures`` if, while auditing
+some other check, you read code that directly contradicts the anchor's
+claim (e.g. the two endpoints exist but represent different concepts).
+
 ────────────────────────────────────────────────────────────────────────
 OUTPUT
 ────────────────────────────────────────────────────────────────────────

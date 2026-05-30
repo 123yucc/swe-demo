@@ -162,5 +162,26 @@ def build_audit_manifest(
 
     return AuditManifest(
         tasks=tasks,
-        warnings=list(structural_warnings) if structural_warnings else [],
+        warnings=_build_warnings(evidence, structural_warnings),
     )
+
+
+def _build_warnings(
+    evidence: EvidenceCards,
+    structural_warnings: list[str] | None,
+) -> list[str]:
+    """Compose the manifest warnings list.
+
+    Includes I1/I3/I4 structural-invariant failures (informational for the
+    closure-checker) and one ``anchor:`` line per declared consistency anchor.
+    Anchors are *not* re-checked by the closure-checker — they are enforced
+    by the consistency code gate in ``src/orchestrator/consistency_checks.py``.
+    Surfacing them here lets the LLM cross-reference its reading against the
+    declared invariants and flag any contradiction it spots while auditing
+    other checks.
+    """
+    out: list[str] = list(structural_warnings) if structural_warnings else []
+    for raw in evidence.structural.consistency_anchors:
+        if raw.strip():
+            out.append(f"anchor: {raw.strip()}")
+    return out

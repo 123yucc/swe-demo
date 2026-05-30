@@ -29,6 +29,7 @@ python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_meta
 - `patch.diff` — git diff patch
 - `prediction.json` — SWE-bench eval format (`{instance_id, model_patch}`)
 - `patch_outcome.json` — closure-checker approval status and patch result (for long-term memory)
+- `build_verification.json` — per-round post-patch build gate results (Phase 19): build system, command, new (patch-induced) errors
 
 ## API Credentials
 
@@ -63,14 +64,34 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
                   no            yes            PatchPlanning
                   |              |                    |
                 loop           ClosureForcedFail  (patch-generator)
-                                (terminal)         /            \
-                                            PatchSuccess    PatchFailed
+                                (terminal)             |
+                                                  PatchVerifying
+                                          (code build gate: go build/vet,
+                                           pytest --collect-only; baseline diff)
+                                            /         |          \
+                                  new build errors  ok / only   new errors +
+                                  + budget left    pre-existing  budget gone
+                                       |               |             |
+                              Closed (repatch)   PatchSuccess    PatchFailed
+                              (feed errors back                  (patch_outcome
+                               to patch-planner)                  = BUILD_FAILED)
 ```
 
 - The closure-checker remains the sole approver of `EvidenceRefining -> Closed`.
 - `ClosureForcedFail` is the budget-exhaustion escape hatch (no patch phase;
   `patch_outcome = EVIDENCE_INCOMPLETE`).
 - No patch generation is allowed before `Closed`.
+- `PatchVerifying` is a deterministic code-only gate (no LLM): after the
+  generator applies edits, it compiles/collects the patched tree in `repo_dir`
+  (Go: `go build ./...` + `go vet ./...`; Python: `pytest --collect-only`) to
+  catch incomplete refactors that *apply* cleanly but don't *compile* (renamed
+  symbol left stale in a sibling file, a type referenced but never defined). A
+  lazy baseline at `base_commit` (via `git stash`) subtracts pre-existing
+  failures so only patch-induced errors count. New errors feed back to the
+  patch-planner via `memory.build_error_feedback` for up to
+  `patch_verify_rounds_max = 2` repatch rounds. **It never runs
+  `before_repo_set_cmd` / pulls in gold test files** — only patched production
+  code plus base_commit tests are compiled.
 
 ### Components
 
@@ -82,9 +103,11 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration; returns `DeepSearchReport` via SDK structured output. **Phase 18.E**: two-round design — Round 1 (primary investigation) + Round 2 (self-reflection checking token traceability, boundary enumeration, verdict consistency) |
 | Closure Checker Agent | `src/agents/closure_checker_agent.py` | Manifest-driven audit gate (phase 18.B/C): receives pre-computed `AuditManifest`, executes each `AuditTask` with Grep/Read/Glob; returns `ClosureVerdict` with per-task `AuditResult`. Three semantic check types: verdict_vs_code, findings_anti_hallucination, prescriptive_boundary_self_check |
-| Orchestrator | `src/orchestrator/engine.py` | Code-driven while-loop pipeline; calls sub-agents directly at semantic nodes; enforces state transitions via `PipelineState` enum. **Phase 18**: integrates `check_structural_invariants`, `build_audit_manifest`, validates manifest coverage, differentiated rework feedback |
-| State Machine | `src/orchestrator/states.py` | `PipelineState` enum (including terminal `CLOSURE_FORCED_FAIL`), `ALLOWED_TRANSITIONS` table, `STATE_ACTIONS` per-state allowed subagent types |
-| Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). `DeepSearchBudget` iteration limiter. |
+| Orchestrator | `src/orchestrator/engine.py` | Code-driven while-loop pipeline; calls sub-agents directly at semantic nodes; enforces state transitions via `PipelineState` enum. **Phase 18**: integrates `check_structural_invariants`, `build_audit_manifest`, validates manifest coverage, differentiated rework feedback. **Phase 19**: `PatchVerifying` build gate + build-error-feedback repatch loop. **Phase 23**: anchor-format/factual gates before closure-checker; rename-residue gate folded into PatchVerifying so old-symbol leftovers feed the same repatch loop as build errors |
+| State Machine | `src/orchestrator/states.py` | `PipelineState` enum (including terminal `CLOSURE_FORCED_FAIL` and the `PATCH_VERIFYING` build gate), `ALLOWED_TRANSITIONS` table, `STATE_ACTIONS` per-state allowed subagent types |
+| Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). **Phase 23**: `check_consistency_anchors_format`. `DeepSearchBudget` iteration limiter. |
+| Build Verifier | `src/orchestrator/build_verify.py` | **Phase 19**: deterministic post-patch build gate. `detect_build_system`, `run_build_check` (go build/vet, pytest --collect-only), `parse_go_errors`/`parse_python_errors`, `diff_new_errors` (baseline subtraction). No LLM. |
+| Consistency Gates | `src/orchestrator/consistency_checks.py` | **Phase 23**: `check_consistency_anchors` (verifies each anchor's two endpoints exist as line ranges or grep-visible symbols) at closure stage; `check_rename_residue` (extracts `(old, new)` pairs from working-tree diff, greps for surviving old refs in unmodified files) at PatchVerifying stage. Failures feed the existing rework / repatch loops. No LLM. |
 | Audit Builder | `src/orchestrator/audit.py` | **Phase 18.B**: `build_audit_manifest()` produces deterministic `AuditManifest` from evidence. All audit scope decisions are code-driven. |
 | Patch Planner Agent | `src/agents/patch_planner_agent.py` | Reads evidence cards, returns `PatchPlan` via SDK structured output. **Phase 18.D**: populates `preserved_findings` per file — verbatim prescriptive snippets from findings that are hard constraints for patch-generator. |
 | Patch Generator Agent | `src/agents/patch_generator_agent.py` | Reads PatchPlan and target files, applies SEARCH/REPLACE edits via MCP tool. **Phase 18.D**: respects `preserved_findings` as hard constraints, receives original requirements text in prompt. |
@@ -123,8 +146,10 @@ src/
         __init__.py                    # Subpackage marker
         engine.py                      # Code-driven while-loop pipeline with direct sub-agent calls
         states.py                      # PipelineState enum, ALLOWED_TRANSITIONS, STATE_ACTIONS
-        guards.py                      # Mechanical pre-checks (sufficiency, attribution, structural invariants I1/I2/I3)
+        guards.py                      # Mechanical pre-checks (sufficiency, attribution, anchor-format, structural invariants I1/I2/I3)
         audit.py                       # build_audit_manifest() for deterministic audit scope (phase 18.B)
+        build_verify.py                # Post-patch build gate: go build/vet, pytest --collect-only, baseline diff (phase 19)
+        consistency_checks.py          # Anchor factual gate + rename-residue gate (phase 23)
 
     tools/
         __init__.py                    # Subpackage marker
@@ -139,7 +164,7 @@ src/
 - **SymptomCard** — `observable_failures`, `repair_targets`, `regression_expectations`
 - **ConstraintCard** — `semantic_boundaries`, `behavioral_constraints`, `backward_compatibility`, `similar_implementation_patterns`, `missing_elements_to_implement`
 - **LocalizationCard** — `suspect_entities`, `exact_code_regions` (format: `path/to/file.py:LINE` or `path/to/file.py:LINE-LINE`), `call_chain_context`, `dataflow_relevant_uses`
-- **StructuralCard** — `must_co_edit_relations`, `dependency_propagation`
+- **StructuralCard** — `must_co_edit_relations`, `dependency_propagation`, `consistency_anchors` (phase 23: `<path:locator> <-> <path:locator>` pairs whose endpoints must jointly resolve)
 - **requirements: list[RequirementItem]** — the task-driving unit. Each item has `id`, `text`, `origin`, `verdict` (`UNCHECKED | AS_IS_COMPLIANT | AS_IS_VIOLATED | TO_BE_MISSING | TO_BE_PARTIAL`), `evidence_locations`, `findings`.
 
 Phase 16 removed the `TO-BE:` prefix convention: TO-BE requirements are first-class `RequirementItem`s, verdict-tracked.
@@ -181,6 +206,10 @@ The orchestrator drives a 7-state machine (`UnderSpecified`, `EvidenceRefining`,
    - I1: new_interface ↔ missing_elements bidirectional mapping — every `origin=="new_interfaces"` req must have its interface name in `constraint.missing_elements_to_implement`, and every missing_element must correspond to a new_interface req.
    - I2: new_interface cannot be AS_IS_COMPLIANT — by definition a new interface does not exist; any such verdict is deep-search hallucination, reset to UNCHECKED for rework.
    - I3: symptom → requirements coverage — each `symptom.observable_failures` must share ≥2 non-stopword tokens with at least one `requirements`-origin req.
+
+3.5. **Consistency anchors** (code, phase 23): `structural.consistency_anchors` declares pairs of code points that must stay jointly consistent. Two gates enforce them:
+   - `check_consistency_anchors_format` (guards.py): each anchor must split on `<->` into two `path:locator` halves; format failures bounce back to UNDER_SPECIFIED.
+   - `check_consistency_anchors` (consistency_checks.py): each endpoint must resolve in the working tree — symbol locators verified by word-boundary grep in the cited file, line locators verified against file length. Unresolved endpoints reset the owning requirement (matched by LHS path → evidence_locations) into rework with the failure list as audit feedback. Pure file/grep, no LLM.
 
 4. **AuditManifest** (code-driven scope, phase 18.B): `build_audit_manifest()` computes which requirements to audit and what checks each needs. Rules:
    - Non-compliant reqs → full checks (verdict_vs_code + findings_anti_hallucination + prescriptive_boundary_self_check if findings contain prescriptive language)

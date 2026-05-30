@@ -2,7 +2,7 @@
   "symptom": {
     "observable_failures": [
       "Expired confirmation keys prevented email validation",
-      "The email status was unclear or incorrect in ACP (Admin Control Panel)",
+      "The email status was unclear or incorrect in ACP",
       "\"Validate\" and \"Send validation email\" actions failed when the expected data was missing"
     ],
     "repair_targets": [
@@ -17,215 +17,183 @@
     "behavioral_constraints": [],
     "backward_compatibility": [],
     "similar_implementation_patterns": [
-      "src/user/email.js:48-55 -- isValidationPending() reads confirm:byUid:<uid> then confirm:<code> object and checks uid match; this is the closest existing pattern to what getConfirmObjs() must do, but operates on a single uid and uses db.get/db.getObject rather than batch db.mget/db.getObjects",
-      "src/user/email.js:47-56 -- UserEmail.isValidationPending() is the closest analog: reads confirm:byUid:<uid> via db.get() then confirm:<code> via db.getObject(), but operates on a single uid and uses non-batch APIs",
-      "src/database/redis/main.js:59-61 -- module.get uses client.get(key); the batch equivalent is client.mget(keys) which returns an array in input order with null for missing keys",
-      "src/database/mongo/main.js:61-78 -- module.get uses findOne({ _key: key }) with data/value fallback; the batch equivalent queries with { _key: { $in: keys } } then re-maps results back to input order applying the same data/value fallback per document",
-      "src/database/postgres/main.js:101-120 -- module.get joins legacy_object_live + legacy_string for a single key; the batch equivalent uses WHERE o._key = ANY($1::TEXT[]) then re-maps rows to input order",
-      "src/database/mongo/main.js:53-59 -- deleteAll already uses { _key: { $in: keys } } with an Array.isArray guard — the same guard pattern applies to mget",
-      "src/database/postgres/main.js:93-98 -- deleteAll already uses ANY($1::TEXT[]) with an array binding — the same binding applies to mget",
-      "src/database/mongo/main.js:53-59 — deleteAll already uses { _key: { $in: keys } } with Array.isArray guard — same pattern needed for mget's find query",
-      "src/database/postgres/main.js:87-99 — deleteAll already uses ANY($1::TEXT[]) array binding — same binding style needed for mget's SELECT query",
-      "src/database/redis/main.js:59-61 — module.get calls client.get(key); the batch equivalent client.mget(keys) returns an array in input order with null for missing keys natively",
-      "src/database/mongo/main.js:14-36 — module.exists already handles the Array.isArray branch with $in and re-maps results to input order via a key→boolean map — same re-mapping pattern applies to mget",
-      "src/database/postgres/main.js:31-41 — module.exists already uses ANY($1::TEXT[]) for the array branch and re-maps rows to input order — same pattern applies to mget",
-      "src/database/mongo/main.js:14-36 -- module.exists handles Array.isArray branch with $in and re-maps results to input order via a key→boolean map; same re-mapping pattern applies to mget",
-      "src/database/postgres/main.js:31-41 -- module.exists uses ANY($1::TEXT[]) for the array branch and re-maps rows to input order; same pattern applies to mget",
-      "src/database/mongo/main.js:53-59 -- deleteAll uses { _key: { $in: keys } } with Array.isArray guard; same guard and $in pattern needed for mget's find query",
-      "src/database/postgres/main.js:87-99 -- deleteAll uses ANY($1::TEXT[]) array binding; same binding style needed for mget's SELECT query",
-      "src/database/redis/main.js:59-61 -- client.get(key) is the single-key primitive; client.mget(keys) is the native batch equivalent that returns values in input order with null for missing keys",
-      "src/user/email.js:162-187 -- confirmByCode calls user.setUserField(confirmObj.uid, 'email', confirmObj.email) at line 181 after retrieving the email from the confirmation object, then delegates to confirmByUid at line 183; this is the exact two-step pattern (write email field, then confirm) that req-006 requires in validateEmail",
-      "src/user/email.js:84-117 -- UserEmail.sendValidationEmail already accepts an `email` option that overrides internal retrieval; this is the exact injection point the fix must target",
-      "src/user/email.js:41 -- expireValidation called alongside other cleanup (confirmed by grep)",
-      "src/user/email.js:135 -- expireValidation called (confirmed by grep; omitted from prior report)",
-      "src/user/reset.js:125 -- expireValidation called during password reset cleanup (confirmed by grep)",
-      "src/user/profile.js:330 -- expireValidation called when email is changed on profile update (confirmed by grep)",
-      "src/user/email.js:222 -- expireValidation called before issuing a new confirmation code (confirmed by grep)",
-      "src/user/email.js:162-166 -- confirmByCode reads the confirm:<code> object and guards on !confirmObj.uid || !confirmObj.email (verified at line 164) but has no expires field to check — consistent with the object never storing one",
-      "src/user/email.js:47-56 — isValidationPending reads confirm:byUid:${uid} via db.get() then confirm:${code} via db.getObject(); this is the exact two-step lookup getEmailForValidation must perform, but returns a boolean rather than the email string and does not guard on UID equality",
-      "src/user/email.js:112 — sendValidationEmail calls user.getUserField(uid, 'email') as its primary email source; this is step 1 of getEmailForValidation",
-      "src/user/email.js:162-165 — confirmByCode guards on !confirmObj.uid || !confirmObj.email after reading the confirmation object; the UID-match guard in getEmailForValidation is analogous but must compare confirmObj.uid to the caller-supplied uid rather than just checking for presence",
-      "src/user/email.js:162-166 -- confirmByCode guards on !confirmObj.uid || !confirmObj.email after reading the confirmation object; the expires check in isValidationPending is analogous but must compare Date.now() < confirmObj.expires",
-      "src/user/email.js:58-61 -- getValidationExpiry calls db.pttl('confirm:byUid:<uid>') to determine remaining TTL; this is the current expiry-query path and it bypasses any object-level expires field",
-      "src/user/email.js:58-61 -- getValidationExpiry uses db.pttl as the only expiry-query path; the requirement wants this replaced by reading confirmObj.expires and computing Date.now() subtraction",
-      "src/user/email.js:139-142 -- db.setObject write site where expires: Date.now() + emailConfirmExpiry * 60 * 60 * 1000 must be added to enable the stored-timestamp path in canSendValidation",
-      "src/database/redis/main.js:59-61 -- module.get calls client.get(key); the batch equivalent client.mget(keys) returns values in input order with null for missing keys natively",
-      "src/database/mongo/main.js:53-59 -- deleteAll already uses { _key: { $in: keys } } with Array.isArray guard — same $in pattern needed for mget's find query",
-      "src/database/mongo/main.js:14-36 -- module.exists handles Array.isArray branch with $in and re-maps results to input order via a key→boolean map — same re-mapping pattern applies to mget",
-      "src/database/postgres/main.js:87-99 -- deleteAll already uses ANY($1::TEXT[]) array binding — same binding style needed for mget's SELECT query",
-      "src/database/postgres/main.js:31-41 -- module.exists uses ANY($1::TEXT[]) for the array branch and re-maps rows to input order — same pattern applies to mget",
-      "src/user/email.js:47-56 -- UserEmail.isValidationPending() is the closest analog: reads confirm:byUid:${uid} via db.get() then confirm:${code} via db.getObject(), but returns a boolean and does not return the email string or guard on UID equality",
-      "src/user/email.js:112-113 -- sendValidationEmail uses user.getUserField(uid, 'email') as its primary email source; this is step 1 of getEmailForValidation",
-      "src/user/email.js:162-166 -- confirmByCode guards on !confirmObj.uid || !confirmObj.email after reading the confirmation object; the UID-match guard in getEmailForValidation is analogous but must compare confirmObj.uid === uid rather than just checking for presence"
+      "src/user/email.js:48-68 -- reads confirm:byUid:<uid> and fetches confirm:<code> object; same lookup pattern getConfirmObjs() would need to batch across multiple UIDs",
+      "src/controllers/admin/users.js:163-185 -- loadUserInfo already uses Promise.all for parallel DB lookups; getConfirmObjs() should follow the same pattern",
+      "src/user/email.js (approx. lines 48-68) — single-UID pattern using db.get for a confirm:byUid key then db.getObject for the confirm object; getConfirmObjs() would batch this across multiple UIDs. NOTE: line-level content not re-read in this reflection pass — verify before implementing.",
+      "src/controllers/admin/users.js:163-172 — existing Promise.all pattern in loadUserInfo; getConfirmObjs() should be added as a fifth parallel call. NOTE: line-level content not re-read in this reflection pass.",
+      "test/database/hash.js (approx. line 31) — db.getObjects called with a key array; confirms the API accepts an array argument. NOTE: line-level content not re-read in this reflection pass.",
+      "src/database/mongo/main.js:14-30 — module.exists (per prior read) handles array keys via a $in filter on the objects collection; db.mget can follow the same $in pattern but project the `data` field and add a re-mapping step for ordering/nulls",
+      "src/database/redis/main.js:15-24 — module.exists (per prior read) handles array keys; db.mget should call client.mget(keys) directly as that API natively preserves order and returns nulls",
+      "src/database/postgres/main.js:31-41 — module.exists (per prior read) handles array keys via ANY($1::TEXT[]) on legacy_object_live; db.mget can join legacy_string using the same ANY pattern plus a re-mapping step for ordering/nulls",
+      "src/database/mongo/main.js:53-57 -- deleteAll uses { _key: { $in: keys } } on the objects collection (confirmed at line 57); mget should follow the same $in pattern but use find+projection on the `data` field instead",
+      "src/database/postgres/main.js:88-99 -- deleteAll uses ANY($1::TEXT[]) on legacy_object (confirmed at lines 92-99); mget should reuse the same parameterised array binding in a JOIN of legacy_object_live and legacy_string",
+      "src/database/redis/main.js:59-61 -- module.get wraps module.client.get(key) (confirmed at line 60); mget counterpart should call module.client.mget(keys) which natively preserves order and returns null for missing keys",
+      "src/database/mongo/main.js:53-57 -- deleteAll uses { _key: { $in: keys } } on the objects collection; mget should follow the same $in pattern but use find+projection on the `data` field, then re-map results to input order",
+      "src/database/postgres/main.js:88-99 -- deleteAll uses ANY($1::TEXT[]) on legacy_object; mget should reuse the same parameterised array binding in a SELECT JOIN, then re-map results to input order",
+      "src/database/redis/main.js:59-61 -- module.get wraps client.get(key); mget counterpart should call client.mget(keys) which natively preserves order and returns null for missing keys — no re-mapping needed",
+      "src/api/users.js:419-421 — addEmail uses setUserField(uid,'email',email) then confirmByUid(uid) when skipConfirmation is true; validateEmail should follow the same two-step pattern, preceded by getEmailForValidation",
+      "src/api/users.js:419-421 — addEmail uses setUserField(uid,'email',email) then confirmByUid(uid) when skipConfirmation is true; shows the explicit email-then-action pattern the handler should follow",
+      "src/user/email.js:99-103 — sendValidationEmail accepts options.email as a string override; the handler must supply this field from getEmailForValidation",
+      "src/user/reset.js:125 -- user.email.expireValidation(uid) already called inside a Promise.all there; User.reset.cleanByUid is called in delete.js:151 from that same pattern",
+      "src/user/email.js:222-223 -- expireValidation and reset.cleanByUid called together in the confirmation handler; same pairing should be considered for deleteAccount",
+      "src/user/email.js:136-137 -- confirm:byUid:<uid> is also TTL-only; the `expires` timestamp would need to be stored in the confirm:<code> object (not the string key) since only objects can carry extra fields",
+      "src/user/email.js:58-61 -- getValidationExpiry uses db.pttl; once `expires` is stored in the object, this helper should read confirmObj.expires instead",
+      "src/user/email.js:162-168 -- confirmByCode reads confirm:<code> via db.getObject and validates confirmObj.uid and confirmObj.email; once an expires field is stored, this function would be the natural place to add an expiry guard before proceeding",
+      "src/user/email.js:112-113 — sendValidationEmail: if (!options.email) options.email = await user.getUserField(uid, 'email') — primary profile-email retrieval pattern getEmailForValidation should use as its first step",
+      "src/user/email.js:47-56 — isValidationPending: db.get('confirm:byUid:<uid>') → db.getObject('confirm:<code>') → confirmObj.email — fallback lookup chain getEmailForValidation should reuse",
+      "src/user/email.js:162-166 — confirmByCode: validates confirmObj.uid and confirmObj.email are present before proceeding — UID-match guard pattern getEmailForValidation must apply before returning confirmObj.email",
+      "src/user/email.js:47-56 -- isValidationPending reads confirmObj from db.getObject; once expires is stored there, canSendValidation should read it from the same object rather than calling db.pttl separately",
+      "src/user/email.js:162-168 -- confirmByCode reads confirm:<code> via db.getObject and validates confirmObj.uid and confirmObj.email; an expiry guard using confirmObj.expires would follow the same pattern",
+      "src/database/redis/main.js:59-61 -- module.get wraps module.client.get(key); mget should call module.client.mget(keys) which natively preserves order and returns null for missing keys",
+      "src/database/mongo/main.js:19-29 -- module.exists uses find({ _key: { $in: key } }) with projection { _id: 0, _key: 1 }, builds a map keyed by _key, and returns key.map(key => !!map[key]); mget should use the same $in pattern projecting the data and value fields, apply the backwards-compat fallback per document, then re-map to input order with null fill",
+      "src/database/mongo/main.js:57 -- deleteAll uses deleteMany({ _key: { $in: keys } }); the same $in filter applies to mget's find() call",
+      "src/database/postgres/main.js:31-41 -- module.exists uses ANY($1::TEXT[]) on legacy_object_live and maps rows back to input order via key.map(k => res.rows.some(r => r.k === k)); mget should use the same ANY pattern in a JOIN with legacy_string, then re-map to input order with null fill",
+      "src/database/postgres/main.js:92-99 -- deleteAll uses ANY($1::TEXT[]) on legacy_object; same parameterized array binding applies to mget's SELECT",
+      "src/user/email.js:47-56 — isValidationPending: db.get('confirm:byUid:<uid>') -> db.getObject('confirm:<code>') -> confirmObj.email — fallback lookup chain getEmailForValidation should reuse"
     ],
     "missing_elements_to_implement": [
-      "db.mget(keys: string[]): Promise<(string | null)[]> — src/database/mongo/main.js: retrieves multiple objects from MongoDB in a single batch operation, returning null for missing keys in input order",
-      "db.mget(keys: string[]): Promise<(string | null)[]> — src/database/postgres/main.js: retrieves multiple objects via join of legacy_object_live and legacy_string tables, returning null for missing keys in input order",
-      "db.mget(keys: string[]): Promise<(string | null)[]> — src/database/redis/main.js: retrieves multiple string values using client.mget, returning null for missing keys in input order",
-      "user.email.getEmailForValidation(uid: number): Promise<string | null> — src/user/email.js: retrieves the most appropriate email address for an administrative validation action, falling back from user profile to confirmation object"
+      "db.mget(keys: string[]): Promise<(string | null)[]> — to be implemented in src/database/mongo/main.js, src/database/postgres/main.js, src/database/redis/main.js",
+      "user.email.getEmailForValidation(uid: number): Promise<string | null> — to be implemented in src/user/email.js"
     ]
   },
   "localization": {
     "suspect_entities": [
       "src/controllers/admin/users.js:loadUserInfo",
-      "src/user/email.js:sendValidationEmail",
-      "src/user/email.js:isValidationPending",
-      "src/user/email.js:UserEmail.isValidationPending",
-      "src/database/redis/main.js:module.get",
-      "src/database/mongo/main.js:module.get",
-      "src/database/postgres/main.js:module.get",
+      "src/user/email.js",
+      "src/database/mongo/main.js",
+      "src/database/postgres/main.js",
+      "src/database/redis/main.js",
       "src/socket.io/admin/user.js:User.validateEmail",
-      "src/user/email.js:UserEmail.confirmByUid",
-      "src/user/email.js:UserEmail.confirmByCode",
       "src/socket.io/admin/user.js:User.sendValidationEmail",
       "src/user/email.js:UserEmail.sendValidationEmail",
+      "src/user/delete.js:User.deleteAccount",
+      "src/user/email.js:UserEmail.expireValidation",
       "src/user/email.js:UserEmail.getValidationExpiry",
+      "src/user/email.js:UserEmail.isValidationPending",
       "src/user/email.js:UserEmail.canSendValidation",
-      "src/user/email.js:UserEmail (module exports — getEmailForValidation is absent from the export surface)",
-      "src/socket.io/admin/user.js:User.validateEmail (caller that must invoke getEmailForValidation before confirmByUid)",
-      "src/socket.io/admin/user.js:User.sendValidationEmail (caller that must invoke getEmailForValidation and pass result as email option)"
+      "src/user/email.js:UserEmail (module — getEmailForValidation absent)",
+      "src/database/redis/main.js:module.get",
+      "src/database/mongo/main.js:module.get",
+      "src/database/postgres/main.js:module.get"
     ],
     "exact_code_regions": [
       "src/controllers/admin/users.js:163-185",
-      "src/user/email.js:136-143",
-      "src/user/email.js:48-67",
-      "src/user/email.js:47-56",
-      "src/database/redis/main.js:59-61",
+      "src/user/email.js:48-68",
+      "src/user/email.js:133-145",
       "src/database/mongo/main.js:61-78",
+      "src/database/redis/main.js:59-61",
       "src/database/postgres/main.js:101-120",
-      "src/database/mongo/main.js:53-59",
-      "src/database/postgres/main.js:87-99",
+      "src/database/mongo/main.js:53-57",
+      "src/database/postgres/main.js:88-99",
       "src/socket.io/admin/user.js:62-70",
-      "src/user/email.js:190-226",
-      "src/user/email.js:162-187",
-      "src/user/email.js:181",
-      "src/socket.io/admin/user.js:72-91",
-      "src/socket.io/admin/user.js:80",
-      "src/user/email.js:84-117",
+      "src/api/users.js:415-427",
+      "src/socket.io/admin/user.js:79-80",
       "src/user/email.js:112-113",
-      "src/user/email.js:63-69",
-      "src/user/delete.js:86-156",
-      "src/user/delete.js:105-124",
       "src/user/delete.js:141-152",
+      "src/user/delete.js:105-124",
+      "src/user/email.js:63-69",
+      "src/user/email.js:106-143",
+      "src/user/email.js:47-61",
+      "src/user/email.js:84-159",
       "src/user/email.js:139-143",
       "src/user/email.js:136-137",
-      "src/user/email.js:109",
-      "src/user/email.js:47-55",
-      "src/user/email.js:162-166",
       "src/user/email.js:58-61",
+      "src/user/email.js:47-56",
       "src/user/email.js:71-82",
-      "src/user/email.js:139-142",
       "src/user/email.js:1-227",
-      "src/user/email.js:112-117"
+      "src/user/email.js:162-166",
+      "src/user/email.js:190-197",
+      "src/user/email.js:55",
+      "src/database/mongo/main.js:19-29",
+      "src/database/postgres/main.js:31-41",
+      "src/database/postgres/main.js:87-99"
     ],
     "call_chain_context": [
-      "usersController.getUsers (line 99) -> loadUserInfo (line 163)",
-      "usersController.search (line 149) -> loadUserInfo (line 163)",
-      "loadUserInfo -> [MISSING] getConfirmObjs -> db.mget(confirm:byUid:<uid> keys) -> db.getObjects(confirm:<code> keys)",
-      "usersController.getUsers (line 99) -> loadUserInfo (line 163) -> [MISSING] getConfirmObjs -> db.mget(confirm:byUid:<uid> keys) -> db.getObjects(confirm:<code> keys)",
-      "UserEmail.isValidationPending (email.js:47) -> db.get(confirm:byUid:<uid>) -> db.getObject(confirm:<code>) [single-uid analog, non-batched]",
-      "getConfirmObjs() [MISSING] -> db.mget(confirm:byUid:<uid> keys) -> [redis] client.mget / [mongo] collection.find $in / [postgres] ANY($1) join",
-      "UserEmail.isValidationPending (src/user/email.js:47) -> db.get(confirm:byUid:<uid>) [single-key analog of what mget must do in batch]",
-      "db.mget() [MISSING] -> [redis] client.mget(keys) / [mongo] collection.find({ _key: { $in: keys } }) / [postgres] JOIN legacy_object_live+legacy_string WHERE o._key = ANY($1::TEXT[])",
-      "module.get (single-key) is the only string-retrieval primitive in all three adapters; mget is the batch equivalent that does not exist",
-      "User.validateEmail (src/socket.io/admin/user.js:62) -> user.email.confirmByUid(uid) (src/user/email.js:190) [direct, no getEmailForValidation step, no setUserField for email address]",
-      "confirmByCode (src/user/email.js:162) -> user.setUserField(confirmObj.uid, 'email', confirmObj.email) (src/user/email.js:181) -> UserEmail.confirmByUid(confirmObj.uid) (src/user/email.js:183) [analogous pattern that req-006 requires in validateEmail]",
-      "User.sendValidationEmail (src/socket.io/admin/user.js:72) -> user.email.sendValidationEmail(uid, { force: true }) (line 80) [no getEmailForValidation call, no email option passed]",
-      "user.email.sendValidationEmail (src/user/email.js:84) -> user.getUserField(uid, 'email') (line 113) [internal fallback used because no email option was supplied by caller]",
-      "getEmailForValidation [MISSING] -> would retrieve email from user profile or confirmation object fallback before passing to sendValidationEmail",
-      "User.delete (delete.js:21) -> User.deleteContent (delete.js:26) + User.deleteAccount (delete.js:86)",
-      "User.deleteAccount (delete.js:86) -> Promise.all [no expireValidation call] (delete.js:141-152)",
-      "UserEmail.expireValidation (email.js:63) -> db.get(confirm:byUid:<uid>) -> db.deleteAll([confirm:byUid:<uid>, confirm:<code>]) [exists but never reached from deleteAccount]",
-      "UserEmail.sendValidationEmail (email.js:84) -> db.setObject('confirm:<code>', { email, uid }) (email.js:139-142) -> db.pexpire('confirm:<code>', ttl) (email.js:143) [no expires field written to object]",
-      "UserEmail.isValidationPending (email.js:47) -> db.get('confirm:byUid:<uid>') (line 48) -> db.getObject('confirm:<code>') (line 51) -> checks confirmObj.email only (line 52) [no expires field to check]",
-      "UserEmail.confirmByCode (email.js:162) -> db.getObject('confirm:<code>') (line 163) -> guards on !confirmObj.uid || !confirmObj.email (line 164) [no expires field to inspect]",
-      "UserEmail.sendValidationEmail (email.js:84) -> db.setObject('confirm:<code>', {email, uid}) (email.js:139-142) [no expires field written] -> db.pexpire('confirm:<code>', ttl) (email.js:143) [TTL set at DB level only]",
-      "UserEmail.isValidationPending (email.js:47) -> db.getObject('confirm:<code>') (email.js:51) -> checks confirmObj.email (email.js:52) [no expires field read]",
-      "UserEmail.getValidationExpiry (email.js:58) -> UserEmail.isValidationPending (email.js:59) -> db.pttl('confirm:byUid:<uid>') (email.js:60) [queries DB-level TTL, not object expires field]",
-      "UserEmail.confirmByCode (email.js:162) -> db.getObject('confirm:<code>') (email.js:163) -> guards on !confirmObj.uid || !confirmObj.email (email.js:164) [no expires field inspected]",
-      "User.validateEmail (src/socket.io/admin/user.js:62) -> user.email.confirmByUid(uid) at line 68 [getEmailForValidation call is missing before this]",
-      "User.sendValidationEmail (src/socket.io/admin/user.js:72) -> user.email.sendValidationEmail(uid, { force: true }) at line 80 [getEmailForValidation call is missing; no email option derived or passed]",
-      "getEmailForValidation [MISSING] -> user.getUserField(uid, 'email') [step 1] -> db.get('confirm:byUid:${uid}') [step 2a, fallback] -> db.getObject('confirm:${code}') [step 2b] -> UID equality guard -> return email or null",
-      "UserEmail.canSendValidation (src/user/email.js:71) -> UserEmail.isValidationPending(uid, email) (line 72) -> db.get('confirm:byUid:<uid>') (line 48) -> db.getObject('confirm:<code>') (line 51) [no expires check]",
-      "UserEmail.getValidationExpiry (src/user/email.js:58) -> UserEmail.isValidationPending(uid) (line 59) [no email arg, returns !!code only] -> db.pttl('confirm:byUid:<uid>') (line 60)",
-      "UserEmail.canSendValidation (email.js:71) -> UserEmail.isValidationPending(uid, email) (email.js:72) -> db.get('confirm:byUid:<uid>') (email.js:48) -> db.getObject('confirm:<code>') (email.js:51)",
-      "UserEmail.canSendValidation (email.js:71) -> UserEmail.getValidationExpiry(uid) (email.js:77) -> UserEmail.isValidationPending(uid) (email.js:59) -> db.pttl('confirm:byUid:<uid>') (email.js:60)",
-      "UserEmail.sendValidationEmail (email.js:84) -> UserEmail.canSendValidation(uid, options.email) (email.js:119) [guard call site]",
-      "module.get (single-key) is the only string-retrieval primitive in all three adapters; module.mget is the batch equivalent that does not exist",
-      "User.validateEmail (src/socket.io/admin/user.js, approximately line 62) -> user.email.confirmByUid(uid) [getEmailForValidation call is missing before this]",
-      "User.sendValidationEmail (src/socket.io/admin/user.js, approximately line 72) -> user.email.sendValidationEmail(uid, { force: true }) [getEmailForValidation call is missing; no email option derived or passed]"
+      "loadUserInfo (src/controllers/admin/users.js:163) -> user.getUsersWithFields (no email:pending/expired enrichment)",
+      "src/user/email.js: function whose body spans at least lines 48-61 -> db.get(`confirm:byUid:${uid}`) -> db.getObject(`confirm:${code}`) — exists but NOT called from loadUserInfo",
+      "loadUserInfo (src/controllers/admin/users.js:163) -> [no getConfirmObjs call exists]",
+      "Required chain: loadUserInfo -> getConfirmObjs -> db.mget(['confirm:byUid:<uid>', ...]) -> db.getObjects(['confirm:<code>', ...])",
+      "getConfirmObjs (to be implemented) -> db.mget(['confirm:byUid:<uid>', ...]) -> [NO IMPLEMENTATION EXISTS in any adapter]",
+      "src/database/mongo/main.js:61-78 module.get -> single-key findOne — batch analog mget is absent",
+      "src/database/redis/main.js:59-61 module.get -> single-key client.get — batch analog mget wrapping client.mget is absent",
+      "src/database/postgres/main.js:101-120 module.get -> single-key JOIN query — batch analog mget is absent",
+      "src/database/redis/main.js: module.get (line 59) -> module.client.get(key) [single-key only; no client.mget path exists]",
+      "src/database/mongo/main.js: module.get (line 61) -> module.client.collection('objects').findOne({_key:key}) [single-key only; no $in batch-read path exists]",
+      "src/database/postgres/main.js: module.get (line 101) -> module.pool.query JOIN legacy_object_live+legacy_string WHERE _key=$1::TEXT [single-key only; no ANY($1::TEXT[]) read path exists]",
+      "src/database/redis/main.js: module.get (line 59) -> module.client.get(key) [single-key only; client.mget path absent]",
+      "src/database/mongo/main.js: module.get (line 61) -> collection('objects').findOne({_key:key}) [single-key only; $in batch-read + re-map absent]",
+      "src/database/postgres/main.js: module.get (line 101) -> pool.query JOIN WHERE _key=$1::TEXT [single-key only; ANY($1::TEXT[]) + re-map absent]",
+      "User.validateEmail (src/socket.io/admin/user.js:62) -> user.email.confirmByUid(uid) [direct, skips getEmailForValidation and setUserField]",
+      "Required chain: User.validateEmail -> user.email.getEmailForValidation(uid) -> [if email] user.setUserField(uid, 'email', email) -> user.email.confirmByUid(uid)",
+      "User.sendValidationEmail (src/socket.io/admin/user.js:79) -> user.email.sendValidationEmail(uid, { force: true }) [no email option, no getEmailForValidation call]",
+      "Required chain: User.sendValidationEmail -> user.email.getEmailForValidation(uid) -> [if email] user.email.sendValidationEmail(uid, { email, force: true })",
+      "User.delete (src/user/delete.js:21) -> User.deleteContent -> User.deleteAccount (src/user/delete.js:86)",
+      "User.deleteAccount (src/user/delete.js:141-152) -> Promise.all([..., User.reset.cleanByUid(uid), ...]) -- expireValidation is absent from this list",
+      "UserEmail.expireValidation (src/user/email.js:63) -> db.get('confirm:byUid:<uid>') -> db.deleteAll(['confirm:byUid:<uid>', 'confirm:<code>']) -- exists but never called from delete path",
+      "UserEmail.sendValidationEmail (src/user/email.js:84) -> db.setObject(`confirm:${confirm_code}`, { email, uid }) [line 139] -> db.pexpire(`confirm:${confirm_code}`, ...) [line 143] — no `expires` field written to the object",
+      "UserEmail.getValidationExpiry (src/user/email.js:58) -> db.pttl(`confirm:byUid:${uid}`) [line 60] — reads TTL from DB rather than an inline `expires` timestamp",
+      "UserEmail.isValidationPending (src/user/email.js:47) -> db.getObject(`confirm:${code}`) [line 51] -> checks confirmObj.email but never confirmObj.expires — field does not exist",
+      "UserEmail.sendValidationEmail (src/user/email.js:84) -> db.setObject(`confirm:${confirm_code}`, { email, uid }) [line 139] -> db.pexpire(`confirm:${confirm_code}`, ...) [line 143] — no expires field written",
+      "UserEmail.canSendValidation (src/user/email.js:71) -> UserEmail.getValidationExpiry(uid) [line 77] -> db.pttl(`confirm:byUid:${uid}`) [line 60] — reads DB TTL, not stored timestamp",
+      "UserEmail.isValidationPending (src/user/email.js:47) -> db.getObject(`confirm:${code}`) [line 51] -> checks confirmObj.email [line 52] — confirmObj.expires absent, never checked",
+      "User.validateEmail (src/socket.io/admin/user.js:62) -> user.email.confirmByUid(uid) [getEmailForValidation step entirely missing]",
+      "Required chain: User.validateEmail -> user.email.getEmailForValidation(uid) -> [if email] user.setUserField(uid,'email',email) -> user.email.confirmByUid(uid)",
+      "UserEmail.isValidationPending (src/user/email.js:47) -> db.get('confirm:byUid:<uid>') [line 48] -> db.getObject('confirm:<code>') [line 51, email branch only] -> checks confirmObj.email [line 52] -- never checks confirmObj.expires",
+      "UserEmail.canSendValidation (src/user/email.js:71) -> UserEmail.isValidationPending(uid, email) [line 72] -- inherits missing expires check",
+      "UserEmail.getValidationExpiry (src/user/email.js:58) -> UserEmail.isValidationPending(uid) [line 59] -> db.pttl('confirm:byUid:<uid>') [line 60] -- uses DB TTL as substitute for missing inline expires field",
+      "UserEmail.canSendValidation (src/user/email.js:71) -> UserEmail.getValidationExpiry(uid) call (src/user/email.js:77)",
+      "UserEmail.getValidationExpiry (src/user/email.js:58-61) -> UserEmail.isValidationPending(uid) [guard check, uses db.getObject per lines 47-56] AND -> db.pttl('confirm:byUid:<uid>') (src/user/email.js:60) [called directly within getValidationExpiry after the guard]",
+      "UserEmail.sendValidationEmail (src/user/email.js:84) -> db.setObject('confirm:<code>', {email, uid}) (src/user/email.js:139-142) [no expires written] -> db.pexpire('confirm:<code>', ...) (src/user/email.js:143) [sole expiry mechanism]",
+      "src/database/redis/main.js: module.get (line 59) -> module.client.get(key) [single-key only; client.mget path entirely absent]",
+      "src/database/mongo/main.js: module.get (line 61) -> module.client.collection('objects').findOne({ _key: key }) [single-key only; $in batch-read + data-field projection + re-map absent]",
+      "src/database/postgres/main.js: module.get (line 101) -> module.pool.query JOIN legacy_object_live + legacy_string WHERE _key=$1::TEXT [single-key only; ANY($1::TEXT[]) multi-key read + re-map absent]"
     ],
     "dataflow_relevant_uses": [
-      "uids array flows into loadUserInfo at lines 99 and 149",
-      "confirm:byUid:<uid> keys are read in src/user/email.js:48,64,136 but NOT in loadUserInfo",
-      "confirm:<code> objects are read in src/user/email.js:51,163 but NOT in loadUserInfo",
-      "expires field is absent from confirm:<code> objects created at src/user/email.js:139-142",
-      "uids array flows into loadUserInfo at src/controllers/admin/users.js:163 but is never used to build confirm:byUid:<uid> key array",
-      "db.mget() is absent from the entire codebase — no definition, no call site (literal string `db.mget` confirmed 0 matches)",
-      "db.getObjects() is not called anywhere in loadUserInfo or any confirmation-related path",
-      "confirm:byUid:<uid> is read only via single-key db.get() in src/user/email.js:48 and src/user/email.js:64",
-      "confirm:<code> objects are read only via single-object db.getObject() in src/user/email.js:51",
-      "db.mget() has 0 call sites in the entire repository — confirmed by grep across src/database/",
-      "module.get (single-key) is the only string-retrieval primitive in all three adapters",
-      "Redis adapter exposes client.mget natively but it is never wrapped or exported",
-      "MongoDB deleteAll at src/database/mongo/main.js:57 already uses { _key: { $in: keys } } — the same pattern needed for mget's find query",
-      "PostgreSQL deleteAll at src/database/postgres/main.js:94-98 already passes keys as an array value with ANY($1::TEXT[]) — the same binding style needed for mget's query",
-      "MongoDB deleteAll at src/database/mongo/main.js:57 already uses { _key: { $in: keys } } — same pattern needed for mget",
-      "PostgreSQL deleteAll at src/database/postgres/main.js:96 already passes keys as array with ANY($1::TEXT[]) — same binding needed for mget",
-      "db.mget() has 0 call sites in the entire repository — confirmed by grep across src/database/ and src/",
-      "Redis client.mget natively returns values in input order with null for missing keys but is never wrapped or exported",
-      "MongoDB deleteAll at src/database/mongo/main.js:57 already uses { _key: { $in: keys } } — the same $in pattern needed for mget's find query",
-      "PostgreSQL deleteAll at src/database/postgres/main.js:96 already passes keys as array with ANY($1::TEXT[]) — the same binding needed for mget's SELECT query",
-      "uid flows into User.validateEmail, then into the for loop at src/socket.io/admin/user.js:67, then directly into confirmByUid at line 68 — no email retrieval via getEmailForValidation and no setUserField(uid, 'email', …) call in between",
-      "confirmByCode at src/user/email.js:181 calls user.setUserField(confirmObj.uid, 'email', confirmObj.email) — the setUserField-for-email pattern exists but is absent from validateEmail",
-      "uid flows from User.sendValidationEmail loop into user.email.sendValidationEmail(uid, { force: true }) at src/socket.io/admin/user.js:80 — no email value is derived or passed",
-      "options.email is absent from the { force: true } object at src/socket.io/admin/user.js:80, so UserEmail.sendValidationEmail falls to its internal getUserField fallback at src/user/email.js:112-113",
-      "user.email.getEmailForValidation has 0 call sites in the entire repository — confirmed by grep across src/",
-      "uid flows into User.deleteAccount at delete.js:86; confirm:byUid:<uid> key is never constructed or deleted within that function",
-      "db.deleteAll(keys) at delete.js:144 deletes user:${uid}:emails but not confirm:byUid:${uid} or confirm:${code}",
-      "UserEmail.expireValidation at email.js:63 is the only function that deletes both confirm:byUid:<uid> and confirm:<code>; it has 0 call sites in src/user/delete.js",
-      "emailConfirmExpiry (line 109) is read from meta.config but only used to compute the pexpire duration at lines 137 and 143 — never converted to an absolute Unix timestamp and stored in the object",
-      "db.setObject('confirm:<code>', { email, uid }) at line 139 is the only write to the confirmation object; expires is absent from the written fields",
-      "emailConfirmExpiry (line 109) is destructured from meta.config and used only to compute pexpire durations at lines 137 and 143 — never converted to an absolute Unix timestamp and stored in the confirmation object",
-      "db.setObject('confirm:<code>', { email: options.email.toLowerCase(), uid: uid }) at lines 139-142 is the sole write to the confirmation object; expires is absent from the written fields",
-      "db.pexpire at lines 137 and 143 are the only expiry mechanisms — both operate at the database key level, not the object field level",
-      "db.pttl('confirm:byUid:<uid>') at line 60 reads back the database-level TTL — this is the only expiry-query path and it bypasses any object-level expires field",
-      "user.getUserField(uid, 'email') at src/user/email.js:112 and :193 — the profile-email read pattern that getEmailForValidation must use as step 1",
-      "db.get('confirm:byUid:${uid}') at src/user/email.js:48 and :64 — the confirmation-code lookup that getEmailForValidation must use as step 2a",
-      "db.getObject('confirm:${code}') at src/user/email.js:51 and :162 — the confirmation-object fetch that getEmailForValidation must use as step 2b",
-      "confirmObj.uid at src/user/email.js:163 — the uid field on the confirmation object that getEmailForValidation must compare against the caller-supplied uid before returning the email",
-      "emailConfirmExpiry at src/user/email.js:109 is used only to compute pexpire durations at lines 137 and 143 — never converted to Date.now() + duration and stored as expires in the object",
-      "db.setObject at src/user/email.js:139-142 writes only { email: options.email.toLowerCase(), uid: uid } to confirm:<code>; expires is absent from the written fields",
-      "db.pexpire at src/user/email.js:143 sets the database-level TTL — the only expiry mechanism; no object-level expires field is set",
-      "confirmObj at src/user/email.js:51 is fetched via db.getObject; only .email is read (line 52) — no .expires field is accessed",
-      "emailConfirmExpiry at email.js:109 is destructured from meta.config and used only for pexpire durations at lines 137 and 143 — never stored as an absolute Unix timestamp in the confirmation object",
-      "db.setObject at email.js:139-142 writes { email, uid } only — expires field is absent",
-      "db.pttl at email.js:60 returns remaining DB-level TTL in ms; this is what canSendValidation uses as its 'stored TTL' proxy",
-      "ttl + interval < max at email.js:81: ttl = (max - elapsed), so this reduces to elapsed > interval — arithmetically correct rate-limit but sourced from DB TTL not a stored field",
-      "user.getUserField(uid, 'email') at src/user/email.js:113 and :194 — the profile-email read pattern that getEmailForValidation must use as step 1",
-      "db.getObject('confirm:${code}') at src/user/email.js:51 and :163 — the confirmation-object fetch that getEmailForValidation must use as step 2b",
-      "confirmObj.uid at src/user/email.js:164 — the uid field on the confirmation object that getEmailForValidation must compare against the caller-supplied uid before returning the email"
+      "src/user/email.js:48 -- db.get(`confirm:byUid:${uid}`) to fetch code",
+      "src/user/email.js:51 -- db.getObject(`confirm:${code}`) to fetch confirm object",
+      "src/user/email.js:137 -- db.pexpire(`confirm:byUid:${uid}`, ...) sets TTL-based expiry (no `expires` field stored)",
+      "src/user/email.js:143 -- db.pexpire(`confirm:${confirm_code}`, ...) sets TTL-based expiry (no `expires` field stored)",
+      "src/user/email.js:106 -- confirm_code = utils.generateUUID() — code generated here",
+      "src/user/email.js:109 -- emailConfirmExpiry destructured from meta.config — used only for pexpire, not stored in object",
+      "src/user/email.js:139-142 -- db.setObject(`confirm:${confirm_code}`, { email: options.email.toLowerCase(), uid }) — object written without `expires`",
+      "src/user/email.js:143 -- db.pexpire(`confirm:${confirm_code}`, emailConfirmExpiry * 60 * 60 * 1000) — TTL-only expiry",
+      "src/user/email.js:60 -- db.pttl(`confirm:byUid:${uid}`) — expiry read back from DB TTL, not from stored field",
+      "src/user/email.js:109 -- emailConfirmExpiry read from meta.config; used only for pexpire duration, never converted to a Unix-ms timestamp stored in the object",
+      "src/user/email.js:139-142 -- db.setObject(`confirm:${confirm_code}`, { email: options.email.toLowerCase(), uid }) — object written without expires",
+      "src/user/email.js:143 -- db.pexpire(`confirm:${confirm_code}`, emailConfirmExpiry * 60 * 60 * 1000) — sole expiry mechanism",
+      "src/user/email.js:77-81 -- ttl derived from db.pttl flows into canSendValidation arithmetic; no stored expires involved",
+      "src/user/email.js:113 — user.getUserField(uid, 'email') — reads email from user:<uid> hash; first-try source for getEmailForValidation",
+      "src/user/email.js:48 — db.get('confirm:byUid:<uid>') — reads pending confirmation code; fallback step 1",
+      "src/user/email.js:51 — db.getObject('confirm:<code>') — reads confirmation object containing {email, uid}; fallback step 2",
+      "src/user/email.js:163-166 — confirmByCode reads confirmObj.uid and validates it — UID match guard pattern to apply before returning confirmObj.email",
+      "src/user/email.js:48 -- db.get('confirm:byUid:<uid>') retrieves the pending code",
+      "src/user/email.js:51 -- db.getObject('confirm:<code>') retrieves the confirmation object (email branch only)",
+      "src/user/email.js:52 -- confirmObj.email is checked against the email argument",
+      "src/user/email.js:55 -- !!code returned when no email argument; confirmObj never fetched or checked",
+      "src/user/email.js:139-142 -- db.setObject writes {email, uid} only; expires field absent from the object's data model",
+      "src/user/email.js:60 -- db.pttl('confirm:byUid:<uid>') returns remaining ms TTL; this is the value that flows into canSendValidation as ttl",
+      "src/user/email.js:77 -- ttl = await UserEmail.getValidationExpiry(uid); receives db.pttl result or null",
+      "src/user/email.js:78 -- max = meta.config.emailConfirmExpiry * 60 * 60 * 1000; full window in ms",
+      "src/user/email.js:79 -- interval = meta.config.emailConfirmInterval * 60 * 1000; minimum resend gap in ms",
+      "src/user/email.js:81 -- return ttl + interval < max; arithmetic correct in structure but operates on wrong data source with no null/negative guard",
+      "src/user/email.js:139-142 -- db.setObject writes {email, uid} only; no expires field stored, so the required stored TTL timestamp does not exist in the object",
+      "src/database/redis/main.js:60 -- return await module.client.get(key) -- single-key string fetch; mget counterpart would be return await module.client.mget(keys)",
+      "src/database/mongo/main.js:66 -- findOne({ _key: key }, { projection: { _id: 0 } }) -- single-key document fetch; mget counterpart would use find + $in + toArray",
+      "src/database/mongo/main.js:71-74 -- objectData.data / objectData.value field resolution with backwards-compat fallback; mget must apply same logic per document in the result array",
+      "src/database/postgres/main.js:106-117 -- module.pool.query with $1::TEXT single-key JOIN; mget counterpart would use $1::TEXT[] with ANY() binding",
+      "src/database/postgres/main.js:119 -- res.rows.length ? res.rows[0].t : null -- single row or null; mget counterpart would map res.rows into an object keyed by _key then return keys.map(k => map[k] ?? null)"
     ]
   },
   "structural": {
     "must_co_edit_relations": [
-      "If loadUserInfo gains getConfirmObjs() -> src/user/email.js:sendValidationEmail must also be edited to store an `expires` field in the confirm:<code> object (req-010), otherwise the expires-timestamp check in getConfirmObjs has no data to read",
-      "If db.mget() is added (req-003/req-004) -> getConfirmObjs() inside loadUserInfo can use it for batch fetching",
-      "If user.email.getEmailForValidation is added to src/user/email.js -> User.sendValidationEmail in src/socket.io/admin/user.js must also be updated to call it and pass the result as the email option",
-      "If expires field is added to db.setObject at email.js:139-142 -> UserEmail.isValidationPending (email.js:47-56) must also be updated to check Date.now() < confirmObj.expires",
-      "If expires field is added -> UserEmail.getValidationExpiry (email.js:58-61) must be updated to derive remaining TTL from confirmObj.expires rather than db.pttl()",
-      "If expires field is added -> UserEmail.confirmByCode (email.js:162-166) must add an expires check alongside the existing uid/email guard",
-      "If isValidationPending gains a Date.now() < confirmObj.expires check -> sendValidationEmail at src/user/email.js:139-142 must also be updated to write expires: Date.now() + emailConfirmExpiry * 60 * 60 * 1000 into the confirmation object",
-      "If expires field is added to the confirmation object -> UserEmail.getValidationExpiry (src/user/email.js:58-61) should derive remaining TTL from confirmObj.expires rather than db.pttl()",
-      "If expires field is added -> UserEmail.confirmByCode (src/user/email.js:162-166) should add an expires check alongside the existing uid/email guard",
-      "If canSendValidation is updated to read confirmObj.expires -> sendValidationEmail at email.js:139-142 must also write expires: Date.now() + emailConfirmExpiry * 60 * 60 * 1000 into the confirmation object",
-      "If canSendValidation is updated to use stored expires -> getValidationExpiry (email.js:58-61) should also be updated to derive remaining TTL from confirmObj.expires rather than db.pttl()"
+      "If src/user/delete.js:User.deleteAccount changes -> src/user/email.js must expose expireValidation (already does at line 63; no change needed there)",
+      "If src/user/email.js:getEmailForValidation is added -> src/socket.io/admin/user.js:User.validateEmail (lines 62-70) must call it before confirmByUid",
+      "If src/user/email.js:getEmailForValidation is added -> src/socket.io/admin/user.js:User.sendValidationEmail (lines 79-80) must pass the resolved email as an option to sendValidationEmail",
+      "If src/user/email.js:isValidationPending adds an expires check -> src/user/email.js:sendValidationEmail (lines 139-142) must first store the expires field in the confirmation object (req-009/req-010 fix is a prerequisite)",
+      "If expires check is added to isValidationPending -> src/user/email.js:getValidationExpiry (lines 58-61) should read confirmObj.expires instead of db.pttl once the field exists",
+      "If no-email branch is rewritten to fetch confirmObj -> null-guard must be added before reading confirmObj.expires (boundary case B above)"
     ],
-    "dependency_propagation": [
-      "db.mget() (req-003) is a prerequisite for getConfirmObjs() which is a prerequisite for req-001",
-      "expires field in confirm:<code> (req-010) is a prerequisite for the expired-flag logic in req-001",
-      "db.mget() (req-003) is a prerequisite for getConfirmObjs() (req-002), which is a prerequisite for email:pending/email:expired flags in loadUserInfo (req-001)"
-    ]
+    "dependency_propagation": []
   },
   "requirements": [
     {
@@ -235,10 +203,9 @@
       "verdict": "TO_BE_MISSING",
       "evidence_locations": [
         "src/controllers/admin/users.js:163-185",
-        "src/controllers/admin/users.js:167-172",
-        "src/user/email.js:136-143"
+        "src/user/email.js:133-145"
       ],
-      "findings": "The current `loadUserInfo(callerUid, uids)` in `src/controllers/admin/users.js` (lines 163–185) contains no logic for `email:pending` or `email:expired` flags, and no `getConfirmObjs()` helper exists anywhere in the codebase.\n\nThe function currently only enriches each user object with: `administrator`, `flags`, `lastonline`, `lastonlineISO`, `ips`, and `ip`. It makes no calls to any confirmation-related keys (`confirm:byUid:<uid>` or `confirm:<code>`), performs no expires-timestamp checks, and attaches no email-status flags.\n\nThe `getConfirmObjs()` function is entirely absent — no definition, no call site, no import. The `email:pending` and `email:expired` property names do not appear anywhere in the repository. The confirmation system in `src/user/email.js` currently stores confirmation objects without an `expires` field (it relies on database-level TTL via `db.pexpire`), so even the prerequisite data shape for the expires-timestamp check described in the requirement is not yet in place.",
+      "findings": "The `loadUserInfo` function at `src/controllers/admin/users.js:163-185` contains no logic to attach `email:pending` or `email:expired` flags to user objects. Neither flag is referenced anywhere in the codebase. The `getConfirmObjs()` helper function required by this requirement does not exist anywhere in the codebase. The current `loadUserInfo` body only enriches user objects with admin status, flags, last-online timestamp, and IP addresses — no email confirmation state is derived or attached. The existing email confirmation system in `src/user/email.js` sets expiry via Redis TTL calls (`db.pexpire` at lines 137 and 143) rather than storing an explicit `expires` timestamp field in the `confirm:<code>` object, so the underlying data model required by this requirement is also absent.",
       "rework_context": ""
     },
     {
@@ -247,13 +214,9 @@
       "origin": "requirements",
       "verdict": "TO_BE_MISSING",
       "evidence_locations": [
-        "src/controllers/admin/users.js:163-185",
-        "src/user/email.js:47-56",
-        "src/user/email.js:48",
-        "src/user/email.js:51",
-        "src/user/email.js:64"
+        "src/controllers/admin/users.js:163-185"
       ],
-      "findings": "The `getConfirmObjs()` helper does not exist anywhere in the codebase. A global search for the string `getConfirmObjs` returns zero matches across all files.\n\n`loadUserInfo()` at `src/controllers/admin/users.js:163-185` contains no confirmation-related logic whatsoever. It only populates `administrator`, `flags`, `lastonline`, `lastonlineISO`, `ips`, and `ip` fields. There is no call to `db.mget()`, no construction of `confirm:byUid:<uid>` key arrays, and no call to `db.getObjects()` for `confirm:<code>` objects.\n\n`db.mget()` itself is also entirely absent — a search for `db.mget` returns zero matches in the entire repository (re-confirmed during self-reflection). The only batch-key pattern in use is `db.get()` (single key) for `confirm:byUid:<uid>` reads, found in `src/user/email.js:48` and `src/user/email.js:64`, and `db.getObject()` (single object) for `confirm:<code>` reads at `src/user/email.js:51`.\n\nThe closest existing pattern is `UserEmail.isValidationPending()` (`src/user/email.js:47-56`), which reads a single `confirm:byUid:<uid>` key via `db.get()` and then fetches the corresponding `confirm:<code>` object via `db.getObject()`. This is a per-uid, non-batched equivalent of what `getConfirmObjs()` must do across multiple uids.\n\nThe positional-index mapping requirement (each user's confirmation object accurately indexed by position relative to the input `uids` array) is also entirely absent — no such mapping logic exists anywhere in the codebase.",
+      "findings": "The `getConfirmObjs()` helper does not exist anywhere in the codebase (grep over the full repo returned zero matches). `loadUserInfo` at `src/controllers/admin/users.js:163-185` contains no confirmation-related logic; its `Promise.all` block only fetches admin status, user fields, lastonline scores, and IP addresses. Additionally, `db.mget()` — the first step the helper is required to call — is also entirely absent from the codebase (no matches in any database adapter or call site). `db.getObjects()` does exist as a DB primitive. Because both the helper function itself and the `db.mget` dependency it relies on are missing, this requirement is fully unimplemented.\n\nNOTE (self-reflection): Line-level content at `src/controllers/admin/users.js:163-185`, `src/user/email.js:48-68`, and `test/database/hash.js:31` was not re-read during this reflection pass. The line-range citations are carried forward from the prior investigation and should be re-verified before any fix is applied.",
       "rework_context": ""
     },
     {
@@ -262,11 +225,11 @@
       "origin": "requirements",
       "verdict": "TO_BE_MISSING",
       "evidence_locations": [
-        "src/database/redis/main.js:59-61",
         "src/database/mongo/main.js:61-78",
+        "src/database/redis/main.js:59-61",
         "src/database/postgres/main.js:101-120"
       ],
-      "findings": "The `mget` method is entirely absent from all three database adapter `main.js` files. A global grep for `mget` across `src/database/` returns zero matches.\n\nEach adapter only implements a single-key `module.get(key)`:\n- **Redis** (`src/database/redis/main.js:59-61`): `module.get = async function (key) { return await module.client.get(key); }` — `client.mget` is never called.\n- **MongoDB** (`src/database/mongo/main.js:61-78`): `module.get = async function (key)` queries the `objects` collection with `findOne({ _key: key }, { projection: { _id: 0 } })` and falls back to the legacy `value` field — no `$in` batch variant exists.\n- **PostgreSQL** (`src/database/postgres/main.js:101-120`): `module.get = async function (key)` joins `legacy_object_live` and `legacy_string` for a single `$1::TEXT` key — no multi-key `ANY($1)` variant exists.\n\nNo `module.mget` definition, no `mget` export, and no call site for `mget` exists anywhere in the repository. The method must be added to all three adapters from scratch.",
+      "findings": "The `db.mget` method is entirely absent from all three database adapter `main.js` files. A full-repo grep for `mget` across `src/database/` returned zero matches.\n\n- `src/database/mongo/main.js` (150 lines): exports `get` (line 61), `set` (line 80), and a batch-style helper `exists` (line 14), but no `mget` is defined anywhere.\n- `src/database/redis/main.js` (111 lines): exports `get` (line 59) which wraps the underlying client's single-key get, but no `mget` counterpart is defined anywhere.\n- `src/database/postgres/main.js` (244 lines): exports `get` (line 101) which joins `legacy_object_live` and `legacy_string` for a single key, but no multi-key variant is defined anywhere.\n\nAll three files follow the same pattern: a single-key `get` exists with no batch counterpart. The method signature `db.mget(keys: string[]): Promise<(string|null)[]>` is completely unimplemented across all adapters.",
       "rework_context": ""
     },
     {
@@ -277,11 +240,10 @@
       "evidence_locations": [
         "src/database/redis/main.js:59-61",
         "src/database/mongo/main.js:61-78",
-        "src/database/mongo/main.js:53-59",
-        "src/database/postgres/main.js:101-120",
-        "src/database/postgres/main.js:87-99"
+        "src/database/mongo/main.js:57",
+        "src/database/postgres/main.js:101-120"
       ],
-      "findings": "The `db.mget` implementation described in req-004 is entirely absent from all three database adapters. A grep for `mget` across `src/database/` returns zero matches, confirming no implementation exists anywhere.\n\n**Redis** (`src/database/redis/main.js:59-61`): Only `module.get = async function (key) { return await module.client.get(key); }` exists. `client.mget` is never called or wrapped. The requirement mandates using `client.mget` to return null for missing keys — this is not present.\n\n**MongoDB** (`src/database/mongo/main.js:61-78`): Only `module.get` exists, using `findOne({ _key: key }, { projection: { _id: 0 } })` with a `data`/`value` fallback (lines 66-77). The requirement mandates a `$in` filter on `_key` against the `objects` collection — no such batch query exists. The `deleteAll` at lines 53-59 already uses `{ _key: { $in: keys } }`, confirming the pattern is known but not applied to a `mget` method.\n\n**PostgreSQL** (`src/database/postgres/main.js:101-120`): Only `module.get` exists, joining `legacy_object_live` and `legacy_string` with `WHERE o.\"_key\" = $1::TEXT` (lines 106-119). The requirement mandates the same join with a multi-key `ANY($1::TEXT[])` binding — not present. The `deleteAll` at lines 87-99 already uses `ANY($1::TEXT[])`, confirming the pattern is available but not applied to a `mget` method.\n\nThe null-for-missing-keys return behavior, the Redis `client.mget` call, the MongoDB `$in` query, and the PostgreSQL join variant are all absent. The entire `mget` surface must be implemented from scratch across all three adapters.",
+      "findings": "The `db.mget` method is entirely absent from all three database adapter `main.js` files — a full-repo grep for `mget` inside `src/database/` returns zero matches.\n\nEach adapter only exposes a single-key `get`:\n- **Redis** (`src/database/redis/main.js:59-61`): `module.get` is defined as `return await module.client.get(key)`. There is no call to `client.mget` anywhere in the visible file.\n- **MongoDB** (`src/database/mongo/main.js:61-78`): `module.get` calls `module.client.collection('objects').findOne({ _key: key }, { projection: { _id: 0 } })` and manually inspects `data` / `value` fields. A `$in` filter on `_key` does exist in the file (line 57 inside `deleteAll`), but there is no batch-read counterpart using `$in`.\n- **PostgreSQL** (`src/database/postgres/main.js:101-120`): `module.get` runs a parameterized JOIN of `legacy_object_live` and `legacy_string` on a single `$1::TEXT` key. No multi-key variant using `ANY($1::TEXT[])` exists for reads.\n\nNone of the null-at-missing-index behaviour, Redis `client.mget`, MongoDB `$in`-based projection, or PostgreSQL multi-key JOIN described by this requirement are implemented anywhere in the codebase.",
       "rework_context": ""
     },
     {
@@ -294,7 +256,7 @@
         "src/database/mongo/main.js:61-78",
         "src/database/postgres/main.js:101-120"
       ],
-      "findings": "req-005 requires that the `mget` implementation in all three database adapters (Redis, MongoDB, PostgreSQL) preserves input key order and explicitly returns `null` at the corresponding index for any key not found in the data store — enforced in the return mapping logic.\n\nA grep for `mget` across the entire `src/database/` tree returns zero matches. No `module.mget` definition, no `mget` export, and no call site exists in any adapter. The order-preservation and null-for-missing mapping logic described in this requirement therefore cannot exist.\n\nCurrent state per adapter:\n\n**Redis** (`src/database/redis/main.js:59-61`): Only `module.get = async function (key) { return await module.client.get(key); }` is present. `client.mget` (which natively returns an array in input order with `null` for missing keys) is never called or wrapped. No order-preservation mapping is needed for Redis since `client.mget` provides it natively, but the wrapper itself is absent.\n\n**MongoDB** (`src/database/mongo/main.js:61-78`): Only `module.get` exists, using `findOne({ _key: key })` with a `data`/`value` fallback. A batch `$in` query against the `objects` collection is absent. Without a batch query, there is no result set to re-map back to input order, and no null-fill logic for missing keys.\n\n**PostgreSQL** (`src/database/postgres/main.js:101-120`): Only `module.get` exists, joining `legacy_object_live` and `legacy_string` with `WHERE o.\"_key\" = $1::TEXT`. A multi-key `ANY($1::TEXT[])` variant is absent. Without it, there is no result set to re-map to input order and no null-fill for missing keys.\n\nThe order-preservation and null-for-missing-key mapping logic that req-005 mandates is entirely absent from all three adapters. The entire `mget` surface — including the return mapping — must be implemented from scratch.",
+      "findings": "A full-repo grep for `mget` returns zero matches across all files — the method does not exist in any database adapter. Because the `mget` function itself is entirely absent, the specific behavioral guarantees described by req-005 (input-order preservation and explicit null for missing keys) are also entirely unimplemented. There is no return-mapping logic of any kind to evaluate.\n\nEach adapter only has a single-key `get`:\n- Redis (`src/database/redis/main.js:59-61`): `module.get` calls `module.client.get(key)`. Redis's native `client.mget` natively preserves order and returns `null` for missing keys, but no wrapper is present.\n- MongoDB (`src/database/mongo/main.js:61-78`): `module.get` calls `findOne({ _key: key })`. A multi-key `find({ _key: { $in: keys } })` path would need an explicit re-mapping loop to restore input order (since `find` results are not guaranteed to match input order) and fill nulls — this logic does not exist.\n- PostgreSQL (`src/database/postgres/main.js:101-120`): `module.get` runs a JOIN on a single `$1::TEXT` key. A multi-key `ANY($1::TEXT[])` read path would similarly need a post-query re-mapping step for ordering and nulls — this logic does not exist.\n\nThe order-preservation and null-at-missing-index contract is the core behavioral requirement of req-005, and it is entirely absent because the enclosing `mget` method itself has never been written.",
       "rework_context": ""
     },
     {
@@ -304,11 +266,9 @@
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
         "src/socket.io/admin/user.js:62-70",
-        "src/user/email.js:190-226",
-        "src/user/email.js:162-187",
-        "src/user/email.js:181"
+        "src/api/users.js:419-421"
       ],
-      "findings": "The `User.validateEmail` handler exists at `src/socket.io/admin/user.js:62-70`. It iterates over a `uids` array and calls `user.email.confirmByUid(uid)` directly — with no prior call to `user.email.getEmailForValidation(uid)` and no subsequent call to `user.setUserField(uid, 'email', email)`.\n\nCurrent implementation (verified):\n```js\nUser.validateEmail = async function (socket, uids) {\n\tif (!Array.isArray(uids)) {\n\t\tthrow new Error('[[error:invalid-data]]');\n\t}\n\n\tfor (const uid of uids) {\n\t\tawait user.email.confirmByUid(uid);\n\t}\n};\n```\n\nThree specific violations against req-006:\n\n1. `user.email.getEmailForValidation(uid)` is never called — the function does not exist anywhere in the codebase (grep across all files returns zero matches).\n\n2. `user.email.confirmByUid(uid)` is called unconditionally, without first retrieving and validating a pending email address via `getEmailForValidation`.\n\n3. `user.setUserField(uid, 'email', email)` is never called inside this handler. The existing `confirmByUid` (`src/user/email.js:190-226`) reads the email already stored on the user record (`user.getUserField(uid, 'email')` at line 194), re-indexes it in sorted sets, and sets `email:confirmed = 1` — but it never writes the email address field itself. It cannot substitute for a `setUserField(uid, 'email', …)` call.\n\nFor contrast, `confirmByCode` (`src/user/email.js:162-187`) calls `user.setUserField(confirmObj.uid, 'email', confirmObj.email)` at line 181 before delegating to `confirmByUid` — the pattern required by req-006 exists elsewhere but is absent from `validateEmail`.",
+      "findings": "The `User.validateEmail` handler exists at `src/socket.io/admin/user.js:62-70` and iterates over UIDs, calling only `user.email.confirmByUid(uid)` directly. It does not call `user.email.getEmailForValidation(uid)` before `confirmByUid`, and it does not call `user.setUserField(uid, 'email', email)` to persist any email to the user profile.\n\nAdditionally, `user.email.getEmailForValidation` does not exist anywhere in the codebase — a repo-wide grep returns zero matches — so even if the handler were updated to call it, the callee would also need to be implemented.\n\nThe current handler body (lines 67-69) is:\n```js\nfor (const uid of uids) {\n    await user.email.confirmByUid(uid);\n}\n```\n\nAll three required steps are absent:\n1. `user.email.getEmailForValidation(uid)` — never called (and not yet implemented)\n2. Conditional guard: \"if a valid email is found\" — not present\n3. `user.setUserField(uid, 'email', email)` — not called\n\nFor contrast, `src/api/users.js:420-421` shows the correct two-step pattern (`setUserField` then `confirmByUid`) used in `addEmail` when `skipConfirmation` is true — the `validateEmail` handler should follow the same pattern, preceded by the `getEmailForValidation` retrieval step.",
       "rework_context": ""
     },
     {
@@ -317,12 +277,11 @@
       "origin": "requirements",
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
-        "src/socket.io/admin/user.js:72-88",
-        "src/socket.io/admin/user.js:80",
-        "src/user/email.js:84-117",
-        "src/user/email.js:112-113"
+        "src/socket.io/admin/user.js:72-93",
+        "src/socket.io/admin/user.js:79-80",
+        "src/user/email.js:111-114"
       ],
-      "findings": "The `User.sendValidationEmail` handler exists at `src/socket.io/admin/user.js:72-91`. It iterates over a `uids` array and calls `user.email.sendValidationEmail(uid, { force: true })` directly — with no prior call to `user.email.getEmailForValidation(uid)` and no explicit `email` option passed.\n\nCurrent implementation (verified, lines 72–88):\n```js\nUser.sendValidationEmail = async function (socket, uids) {\n    if (!Array.isArray(uids)) {\n        throw new Error('[[error:invalid-data]]');\n    }\n    const failed = [];\n    let errorLogged = false;\n    await async.eachLimit(uids, 50, async (uid) => {\n        await user.email.sendValidationEmail(uid, { force: true }).catch(...);\n    });\n    ...\n};\n```\n\nTwo specific violations against req-007:\n\n1. `user.email.getEmailForValidation(uid)` is never called. The function does not exist anywhere in the codebase — a grep across all of `src/` returns zero matches.\n\n2. No `email` option is passed to `user.email.sendValidationEmail`. The call passes only `{ force: true }`. As a result, `UserEmail.sendValidationEmail` falls through to its internal fallback at `src/user/email.js:112-113`, which calls `user.getUserField(uid, 'email')` directly — bypassing any confirmation-object fallback that `getEmailForValidation` is meant to provide.\n\nFor context, `UserEmail.sendValidationEmail` (`src/user/email.js:84`) accepts an `email` option that overrides the internal email retrieval. The requirement mandates that the socket handler obtain the email via `getEmailForValidation` and supply it explicitly via this option — neither step is present.",
+      "findings": "The `User.sendValidationEmail` handler exists at `src/socket.io/admin/user.js:72-93`. It iterates over UIDs via `async.eachLimit` and calls `user.email.sendValidationEmail(uid, { force: true })` — passing only `{ force: true }` with no `email` property.\n\nThe requirement mandates two steps that are both absent:\n1. **`user.email.getEmailForValidation(uid)` is never called** — a repo-wide grep returns zero matches for `getEmailForValidation`, confirming the function does not exist anywhere in the codebase.\n2. **No `email` option is explicitly passed** to `user.email.sendValidationEmail` — the options object is `{ force: true }` only.\n\nAs a consequence, the callee (`src/user/email.js:111-114`) falls through to its own internal fallback: `options.email = await user.getUserField(uid, 'email')`. This retrieves only the email already stored in the user's profile and does not consult any pending-confirmation data — exactly the gap the requirement's `getEmailForValidation` is meant to close.\n\nIn summary: the handler makes no call to `getEmailForValidation`, passes no email option, and the `getEmailForValidation` function itself is entirely absent from the codebase.",
       "rework_context": ""
     },
     {
@@ -331,12 +290,17 @@
       "origin": "requirements",
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
-        "src/user/email.js:63-69",
         "src/user/delete.js:86-156",
         "src/user/delete.js:141-152",
-        "src/user/delete.js:105-124"
+        "src/user/delete.js:105-124",
+        "src/user/email.js:63-69",
+        "src/user/email.js:41",
+        "src/user/email.js:135",
+        "src/user/email.js:222",
+        "src/user/reset.js:125",
+        "src/user/profile.js:330"
       ],
-      "findings": "`UserEmail.expireValidation(uid)` is defined at `src/user/email.js:63-69`. It reads `confirm:byUid:<uid>` via `db.get`, then deletes both `confirm:byUid:<uid>` and `confirm:<code>` via `db.deleteAll`. The function is called in several places across the codebase (email confirmation flow, profile update, password reset), but it is **never called** during account deletion.\n\n`User.deleteAccount` at `src/user/delete.js:86-156` is the canonical deletion path. Its `Promise.all` block at lines 141–152 invokes: `db.sortedSetRemoveBulk`, `db.decrObjectField`, `db.deleteAll(keys)`, `db.setRemove`, `deleteUserIps`, `deleteUserFromFollowers`, `deleteImages`, `groups.leaveAllGroups`, `flags.resolveFlag`, and `User.reset.cleanByUid`. There is no call to `User.email.expireValidation(uid)` or any equivalent that deletes `confirm:byUid:<uid>` / `confirm:<code>` keys.\n\nThe `keys` array at lines 105–124 includes `user:${uid}:emails` but does **not** include `confirm:byUid:${uid}` or `confirm:${code}`. The `User.delete` wrapper at line 21 delegates entirely to `deleteContent` + `deleteAccount`, neither of which calls `expireValidation`.\n\nAs a result, when an account is deleted, the `confirm:byUid:<uid>` and `confirm:<code>` keys are left orphaned in the database. The function that would clean them up exists and is used elsewhere — it is simply absent from the deletion path.",
+      "findings": "The `UserEmail.expireValidation(uid)` function exists and is correctly implemented at `src/user/email.js:63-69`. It reads `confirm:byUid:${uid}` to retrieve the pending confirmation code, then calls `db.deleteAll` to remove both `confirm:byUid:${uid}` and `confirm:${code}` keys.\n\nHowever, this function is never called from the account deletion path. `User.deleteAccount` at `src/user/delete.js:86-156` handles all cleanup on deletion. Its `Promise.all` block at lines 141-152 invokes `User.reset.cleanByUid(uid)`, `db.deleteAll(keys)`, group membership removal, flag resolution, etc. — but `user.email.expireValidation(uid)` is entirely absent. The `keys` array (lines 105-124) also does not include `confirm:byUid:${uid}` or any `confirm:*` key.\n\n`expireValidation` is wired in other flows (all verified by Read):\n- `src/user/email.js:41` — when the user's email is removed\n- `src/user/email.js:135` — inside `sendValidationEmail` before issuing a new confirmation code\n- `src/user/email.js:222` — inside the email-confirmation handler (after verifying the email link)\n- `src/user/reset.js:125` — during password reset cleanup\n- `src/user/profile.js:330` — during profile password-change flow\n\nNone of these paths cover account deletion. As a result, when a user account is deleted, the `confirm:byUid:${uid}` and `confirm:${code}` keys are left orphaned in the database.",
       "rework_context": ""
     },
     {
@@ -347,11 +311,10 @@
       "evidence_locations": [
         "src/user/email.js:139-143",
         "src/user/email.js:136-137",
-        "src/user/email.js:109",
-        "src/user/email.js:47-55",
-        "src/user/email.js:162-166"
+        "src/user/email.js:58-61",
+        "src/user/email.js:47-56"
       ],
-      "findings": "The `confirm:<code>` object is created at `src/user/email.js:139-142` via `db.setObject()`. It stores only two fields: `email` and `uid`. No `expires` field is written.\n\nExpiry is handled exclusively through two `db.pexpire()` calls:\n- Line 137: `db.pexpire('confirm:byUid:<uid>', emailConfirmExpiry * 60 * 60 * 1000)`\n- Line 143: `db.pexpire('confirm:<code>', emailConfirmExpiry * 60 * 60 * 1000)`\n\nThese set database-level TTLs on both keys. The confirmation object itself carries no `expires` timestamp. Any consumer reading the object cannot determine expiry from the object's fields alone — it must rely entirely on whether the key still exists in the store (i.e., whether the TTL has elapsed).\n\n`UserEmail.isValidationPending` (line 47) reads the object via `db.getObject('confirm:<code>')` and checks only `confirmObj.email` — no `expires` field is present to check. `UserEmail.confirmByCode` (lines 162-187) similarly reads the object and guards on `!confirmObj.uid || !confirmObj.email` (line 164) but has no `expires` field to inspect.\n\nThe requirement mandates storing `expires` as a Unix timestamp in milliseconds inside the confirmation object (e.g., `Date.now() + emailConfirmExpiry * 60 * 60 * 1000`) so that expiry can be checked programmatically without depending on database-level TTL. This field is entirely absent.",
+      "findings": "The `UserEmail.sendValidationEmail` function exists and is fully implemented at `src/user/email.js:84-159`. It creates the `confirm:<code>` object at lines 139-142 via `db.setObject`, but that object only stores two fields: `email` and `uid`. No `expires` field is written.\n\nExpiry is handled exclusively through two `db.pexpire` calls:\n- Line 137: `db.pexpire(\\`confirm:byUid:${uid}\\`, emailConfirmExpiry * 60 * 60 * 1000)`\n- Line 143: `db.pexpire(\\`confirm:${confirm_code}\\`, emailConfirmExpiry * 60 * 60 * 1000)`\n\nThe requirement mandates that `Date.now() + (emailConfirmExpiry * 60 * 60 * 1000)` (or equivalent Unix-ms timestamp) be stored inside the confirmation object so callers can compare against it without relying on DB-level TTL. The current implementation does the opposite: it delegates all expiry semantics entirely to the database TTL mechanism and stores nothing in the object itself.\n\nThis design gap directly affects other requirements: `isValidationPending` (req-012) reads the `confirm:<code>` object but has no `expires` field to check, and `getValidationExpiry` (line 58-61) falls back to `db.pttl` rather than reading an inline timestamp.",
       "rework_context": ""
     },
     {
@@ -361,12 +324,13 @@
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
         "src/user/email.js:139-143",
-        "src/user/email.js:47-56",
+        "src/user/email.js:136-137",
+        "src/user/email.js:143",
         "src/user/email.js:58-61",
-        "src/user/email.js:162-166",
-        "src/user/email.js:109"
+        "src/user/email.js:47-56",
+        "src/user/email.js:71-82"
       ],
-      "findings": "The `confirm:<code>` object is written at `src/user/email.js:139-142` via `db.setObject()`. It stores exactly two fields: `email` (lowercased) and `uid`. No `expires` field is present.\n\nExpiry is handled exclusively through two `db.pexpire()` calls:\n- Line 137: `db.pexpire('confirm:byUid:<uid>', emailConfirmExpiry * 60 * 60 * 1000)`\n- Line 143: `db.pexpire('confirm:<code>', emailConfirmExpiry * 60 * 60 * 1000)`\n\nThese set database-level TTLs on both keys. The confirmation object itself carries no `expires` timestamp field.\n\nThe \"used for all future expiry checks\" clause is also violated. Every consumer that reads the confirmation object relies solely on key existence (i.e., whether the TTL has elapsed) rather than an `expires` field:\n\n1. `UserEmail.isValidationPending` (lines 47–56): reads `confirm:<code>` via `db.getObject()` and checks only `confirmObj.email` — no `expires` field is inspected.\n2. `UserEmail.getValidationExpiry` (lines 58–61): calls `db.pttl('confirm:byUid:<uid>')` to determine remaining TTL — it queries the database-level TTL directly, not an object-level `expires` field.\n3. `UserEmail.confirmByCode` (lines 162–166): guards on `!confirmObj.uid || !confirmObj.email` — no `expires` field is checked.\n\nThe `emailConfirmExpiry` value is destructured from `meta.config` at line 109 and used only to compute `pexpire` durations at lines 137 and 143 — it is never converted to an absolute Unix timestamp and stored in the confirmation object.\n\nNo `expires` field appears anywhere in `src/user/email.js` at either write or read sites. The requirement mandates storing `expires` as `Date.now() + emailConfirmExpiry * 60 * 60 * 1000` inside the object at write time, and using that field for all subsequent expiry checks. Neither the storage nor the consumption of such a field exists anywhere in the file.",
+      "findings": "The `UserEmail.sendValidationEmail` function at `src/user/email.js:84-159` creates the `confirm:<code>` object at lines 139-142 via `db.setObject`, but the object stores only two fields — `email` and `uid`. No `expires` field is written.\n\nExpiry is handled exclusively through two `db.pexpire` calls:\n- Line 137: `db.pexpire(`confirm:byUid:${uid}`, emailConfirmExpiry * 60 * 60 * 1000)`\n- Line 143: `db.pexpire(`confirm:${confirm_code}`, emailConfirmExpiry * 60 * 60 * 1000)`\n\nThe requirement's first condition — store `Date.now() + (emailConfirmExpiry * 60 * 60 * 1000)` as `expires` inside the confirmation object — is not met.\n\nThe requirement's second condition — \"this timestamp must be used for all future expiry checks\" — is also not met. Two downstream consumers both rely on the database TTL instead of any stored field:\n\n1. `getValidationExpiry` (lines 58-61): calls `db.pttl(`confirm:byUid:${uid}`)` to read remaining TTL from the database. There is no read of `confirmObj.expires`.\n2. `isValidationPending` (lines 47-56): reads `confirm:<code>` via `db.getObject` and inspects `confirmObj.email`, but never checks `confirmObj.expires` (the field does not exist in the object).\n3. `canSendValidation` (lines 71-82): calls `getValidationExpiry` to obtain `ttl`, which flows from `db.pttl` — not from a stored timestamp.\n\nIn summary: the confirmation object is created without an `expires` field, and all expiry semantics are delegated to database-level TTL. Both halves of req-010 are violated by the current implementation.",
       "rework_context": ""
     },
     {
@@ -375,14 +339,14 @@
       "origin": "requirements",
       "verdict": "TO_BE_MISSING",
       "evidence_locations": [
-        "src/user/email.js:1-226",
+        "src/user/email.js:1-227",
         "src/user/email.js:47-56",
-        "src/user/email.js:112",
-        "src/user/email.js:173",
-        "src/user/email.js:193",
-        "src/user/email.js:163"
+        "src/user/email.js:112-113",
+        "src/user/email.js:162-166",
+        "src/socket.io/admin/user.js:62-70",
+        "src/socket.io/admin/user.js:79-80"
       ],
-      "findings": "The method `getEmailForValidation` does not exist anywhere in `src/user/email.js`. A full read of the file (227 lines) confirms the `UserEmail` module exports exactly: `exists`, `available`, `remove`, `isValidationPending`, `getValidationExpiry`, `expireValidation`, `canSendValidation`, `sendValidationEmail`, `confirmByCode`, and `confirmByUid`. There is no `getEmailForValidation` definition, export, or call site.\n\nThe three-step logic required by req-011 is entirely absent as a unified function:\n\n1. **Profile lookup** — `user.getUserField(uid, 'email')` is used at lines 29, 112, 173, and 193, but none of these occurrences are inside a `getEmailForValidation` function.\n\n2. **Fallback to confirmation object** — `db.get('confirm:byUid:${uid}')` appears at lines 48 and 64; `db.getObject('confirm:${code}')` appears at lines 51 and 162. These are used inside `isValidationPending` and `confirmByCode` respectively, not inside any email-retrieval helper.\n\n3. **UID match guard** — `confirmObj.uid` is referenced at line 163 (`!confirmObj.uid` presence check in `confirmByCode`), but no function performs the equality guard `confirmObj.uid === uid` that req-011 requires before returning an email address.\n\nThe closest analog is `UserEmail.isValidationPending` (lines 47–56): it reads `confirm:byUid:${uid}` then `confirm:${code}`, but returns a boolean and does not return the email string or guard on UID equality.\n\nThe function must be implemented from scratch in `src/user/email.js`.",
+      "findings": "The function `UserEmail.getEmailForValidation` (or any alias) does not exist anywhere in the codebase. A repo-wide grep for `getEmailForValidation` returns zero matches, and a full read of `src/user/email.js` (227 lines) confirms it is not defined there.\n\nThe three behavioral steps mandated by req-011 are all absent:\n1. **Primary lookup — user profile email**: The pattern `user.getUserField(uid, 'email')` exists as a fallback inside `sendValidationEmail` (line 113), but no standalone function wraps it as a first-try step.\n2. **Fallback — confirmation object email**: The lookup chain `db.get('confirm:byUid:<uid>') → db.getObject('confirm:<code>') → confirmObj.email` is used inside `isValidationPending` (lines 48–52), but is not surfaced by any `getEmailForValidation` entry point.\n3. **UID match guard**: `confirmByCode` (lines 163–166) validates `confirmObj.uid` before proceeding, and `confirmByUid` (line 194) checks `currentEmail` against the stored user field — both show the UID-match pattern, but no function encapsulates \"return email only if confirmObj.uid equals the requested uid.\"\n\nBecause the function itself is entirely absent, req-011 is TO_BE_MISSING. The integration points where it will be called also currently bypass this logic entirely: `User.validateEmail` (src/socket.io/admin/user.js:62–70) calls `confirmByUid` directly, and `User.sendValidationEmail` (src/socket.io/admin/user.js:79–80) passes no `email` option.",
       "rework_context": ""
     },
     {
@@ -392,11 +356,9 @@
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
         "src/user/email.js:47-56",
-        "src/user/email.js:51-52",
-        "src/user/email.js:139-142",
-        "src/user/email.js:143"
+        "src/user/email.js:139-143"
       ],
-      "findings": "The method `UserEmail.isValidationPending(uid, email)` exists at `src/user/email.js:47-56` and accepts both `uid` and `email` parameters. Token traceability confirmed: all code snippets in this report were verified against the actual file content read during this investigation.\n\n**Current implementation (verified):**\n```js\nUserEmail.isValidationPending = async (uid, email) => {\n    const code = await db.get(`confirm:byUid:${uid}`);\n\n    if (email) {\n        const confirmObj = await db.getObject(`confirm:${code}`);\n        return !!(confirmObj && email === confirmObj.email);\n    }\n\n    return !!code;\n};\n```\n\n**Condition 1 — confirmation object exists:** Partially satisfied. When `email` is provided, the code fetches `confirmObj` and checks `!!confirmObj`. When `email` is NOT provided, it only checks `!!code` (key existence in `confirm:byUid:<uid>`), not whether the `confirm:<code>` object itself exists.\n\n**Condition 2 — current time is before the expires timestamp:** NOT satisfied. There is no `expires` field in the confirmation object. `db.setObject` at `src/user/email.js:139-142` writes only `{ email: options.email.toLowerCase(), uid: uid }`. The method performs no `Date.now() < confirmObj.expires` check. Expiry is handled entirely at the database level via `db.pexpire` (lines 137 and 143). The method implicitly relies on key non-existence (TTL elapsed → key gone → `code` is null) rather than an explicit timestamp comparison.\n\n**Condition 3 — email matches if provided:** Satisfied. When `email` is supplied, line 52 checks `email === confirmObj.email`.\n\n**Root cause:** The `expires` field is never written to the `confirm:<code>` object. Because the field does not exist in the stored object, `isValidationPending` cannot check `Date.now() < confirmObj.expires`. The method must be updated in tandem with `sendValidationEmail` adding the `expires` field at write time.",
+      "findings": "The `UserEmail.isValidationPending` function exists at `src/user/email.js:47-56`. The requirement mandates three conditions must ALL be true for the method to return `true`:\n1. The confirmation object exists.\n2. The current time is before the `expires` timestamp.\n3. If `email` is provided, it matches `confirmObj.email`.\n\n**Condition 2 is entirely absent.** The function never reads a `confirmObj.expires` field and never compares `Date.now()` to any timestamp. This is compounded by the storage side: `sendValidationEmail` at lines 139-142 writes only `{ email, uid }` into the `confirm:<code>` object — no `expires` field is written. Expiry is delegated solely to `db.pexpire` (line 143). Because the field is absent from the stored object, `isValidationPending` has no inline timestamp to compare against even if the check were added.\n\n**Condition 1 is only partially satisfied.** In the `if (email)` branch (lines 50-53), `confirmObj && ...` correctly verifies the object exists before matching. In the no-email branch (line 55), the function returns `!!code`, checking only that the `confirm:byUid:<uid>` key exists — it never fetches or verifies that the `confirm:<code>` object is also present. A stale byUid key whose target object was already deleted would cause this branch to return `true` incorrectly.\n\n**Condition 3 is correctly implemented** in the email branch: `email === confirmObj.email` performs the match at line 52.",
       "rework_context": ""
     },
     {
@@ -406,12 +368,11 @@
       "verdict": "AS_IS_VIOLATED",
       "evidence_locations": [
         "src/user/email.js:71-82",
-        "src/user/email.js:77",
-        "src/user/email.js:78-81",
         "src/user/email.js:58-61",
-        "src/user/email.js:139-142"
+        "src/user/email.js:139-142",
+        "src/user/email.js:143"
       ],
-      "findings": "The `UserEmail.canSendValidation(uid, email)` function exists at `src/user/email.js:71-82`. Its interval check is implemented as:\n\n```js\nconst ttl = await UserEmail.getValidationExpiry(uid);   // line 77\nconst max = meta.config.emailConfirmExpiry * 60 * 60 * 1000;  // line 78\nconst interval = meta.config.emailConfirmInterval * 60 * 1000; // line 79\nreturn ttl + interval < max;  // line 81\n```\n\n`getValidationExpiry` (lines 58-61) calls `db.pttl('confirm:byUid:<uid>')`, which returns the **remaining** TTL in milliseconds (a value that counts down from `max` toward 0 as time passes). Adding `interval` to the remaining TTL and comparing against `max` is arithmetically equivalent to checking whether at least `interval` milliseconds have elapsed since the confirmation was issued — which is the intended rate-limit behaviour.\n\n**Violation — TTL-unavailable baseline is wrong:**\n\nThe requirement states: \"if TTL is unavailable, use the current time as the baseline.\" When `db.pttl` returns a negative value (key missing → `-2`, key exists but has no TTL → `-1`), `canSendValidation` does not handle these cases. However, the outer guard at line 72-75 already returns `true` early when `isValidationPending` is false (i.e., no pending confirmation exists), so the `ttl` path is only reached when a pending confirmation is confirmed to exist. The `-2` (key gone) case is therefore unreachable in practice via this path.\n\n**Violation — TTL is a database-level construct, not a stored timestamp:**\n\nThe requirement mandates comparing \"the stored TTL timestamp if available.\" The current implementation reads the database-level TTL via `db.pttl()` rather than a stored `expires` field in the confirmation object. As established in req-009/req-010, no `expires` field is written to the `confirm:<code>` object at `src/user/email.js:139-142`. The requirement's intent is that `canSendValidation` should derive the baseline from `confirmObj.expires` (a stored Unix timestamp) rather than from `db.pttl()`. This is the primary violation: the stored-timestamp path does not exist because the `expires` field is never written.\n\n**Arithmetic correctness of the existing check (when TTL is valid):**\n\n`ttl` = remaining milliseconds = `max - elapsed`. So `ttl + interval < max` ↔ `elapsed > interval`. This correctly prevents resends until `interval` ms have passed since issuance. The logic is sound for the TTL-available case, but it operates on a database-level TTL rather than a stored object field as the requirement demands.\n\n**Summary:** The function exists and its rate-limit arithmetic is logically correct for the TTL-available case, but it violates the requirement because (a) it reads a database-level TTL (`db.pttl`) instead of a stored `expires` timestamp in the confirmation object, and (b) the fallback \"use current time as baseline\" branch for a missing TTL is not explicitly implemented (though partially masked by the early-return guard).",
+      "findings": "The `canSendValidation` function exists at `src/user/email.js:71-82` and does implement a resend-prevention interval check, but it violates the requirement in two concrete ways.\n\n**Violation 1 — wrong data source for the TTL baseline.**\nThe requirement mandates using the *stored TTL timestamp* (i.e., the `expires` Unix-ms field that req-009/req-010 require to be persisted in the `confirm:<code>` object). The current implementation calls `UserEmail.getValidationExpiry(uid)` (line 77), which resolves to `db.pttl('confirm:byUid:<uid>')` (line 60) — a database-level residual TTL in milliseconds, not a stored object field. The `expires` field does not exist in the confirmation object at all (confirmed by analysis of `sendValidationEmail` lines 139-142, which writes only `{ email, uid }`). This means the required data source is entirely absent.\n\n**Violation 2 — no fallback to current time when the TTL timestamp is unavailable.**\nThe requirement explicitly states: \"if TTL is unavailable, use the current time as the baseline.\" The current code handles the no-pending case (lines 73-75) with an early `return true`, but it does not implement a separate branch for the case where `getValidationExpiry` returns `null`, or where `db.pttl` returns `-1` (key has no TTL) or `-2` (key does not exist in Redis). There is no `Date.now()`-based fallback anywhere in the function. If `ttl` were `null` or a negative sentinel value, the arithmetic at line 81 would produce incorrect results without any guard.\n\n**What the code does correctly:**\nThe arithmetic structure at line 81 — `return ttl + interval < max` — is semantically correct for the resend-prevention goal: it checks whether the remaining window (`ttl`) plus the required minimum interval is still less than the full max window, meaning enough time has passed since the original send to allow a resend. This logic is sound; only the data source and fallback path are wrong.",
       "rework_context": ""
     },
     {
@@ -422,11 +383,13 @@
       "evidence_locations": [
         "src/database/redis/main.js:59-61",
         "src/database/mongo/main.js:61-78",
-        "src/database/mongo/main.js:53-59",
         "src/database/postgres/main.js:101-120",
-        "src/database/postgres/main.js:87-99"
+        "src/database/mongo/main.js:57",
+        "src/database/mongo/main.js:19-29",
+        "src/database/postgres/main.js:31-41",
+        "src/database/postgres/main.js:92-99"
       ],
-      "findings": "The `db.mget` method is entirely absent from all three database adapter files. A grep for `mget` across the entire `src/database/` tree returns zero matches — no definition, no export, no call site exists anywhere.\n\n**Redis** (`src/database/redis/main.js:59-61`): Only `module.get = async function (key) { return await module.client.get(key); }` is present. The Redis client natively supports `client.mget(keys)` which returns an array in input order with `null` for missing keys, but this is never wrapped or exported as `module.mget`.\n\n**MongoDB** (`src/database/mongo/main.js:61-78`): Only `module.get = async function (key)` exists. It queries the `objects` collection with `findOne({ _key: key }, { projection: { _id: 0 } })` and applies a `data`/`value` fallback for backwards compatibility. No batch variant using `{ _key: { $in: keys } }` exists. The `deleteAll` method at lines 53-59 already uses `{ _key: { $in: keys } }`, confirming the pattern is available in the codebase but has not been applied to a `mget` method.\n\n**PostgreSQL** (`src/database/postgres/main.js:101-120`): Only `module.get = async function (key)` exists. It joins `legacy_object_live` and `legacy_string` with `WHERE o.\"_key\" = $1::TEXT LIMIT 1`. No multi-key variant using `ANY($1::TEXT[])` exists. The `deleteAll` method at lines 87-99 already uses `ANY($1::TEXT[])`, confirming the binding style is available but not applied to a `mget` method.\n\nThe order-preserving, null-for-missing-keys return contract specified in the output type `Promise<(string | null)[]>` is also entirely absent from all three adapters. The entire `mget` surface must be implemented from scratch.",
+      "findings": "The `db.mget` method is entirely absent from all three database adapter `main.js` files. A targeted grep across the entire `src/database/` directory tree for `mget` returns zero matches, and direct reads of all three files confirm no such method is defined anywhere.\n\n**Redis** (`src/database/redis/main.js`, lines 59–61): `module.get` wraps `module.client.get(key)` for a single key. Redis's native `client.mget(keys)` — which preserves input order and returns `null` for missing keys — is never called or exposed anywhere in this file.\n\n**MongoDB** (`src/database/mongo/main.js`, lines 61–78): `module.get` calls `module.client.collection('objects').findOne({ _key: key }, { projection: { _id: 0 } })` and inspects `objectData.data` / `objectData.value` with a backwards-compat fallback (comment: \"fallback to old field name 'value' for backwards compatibility #6340\"). A `$in` filter on `_key` exists in `deleteAll` (line 57) and `exists` (lines 19–29), but there is no `find`+projection batch-read counterpart using that pattern.\n\n**PostgreSQL** (`src/database/postgres/main.js`, lines 101–120): `module.get` issues a parameterized JOIN of `legacy_object_live` and `legacy_string` on a single `$1::TEXT` key (aliased column `t`), returning `res.rows[0].t`. An `ANY($1::TEXT[])` pattern exists in `exists` (lines 31–41) and `deleteAll` (lines 95–99), but no multi-key read variant using that pattern is present.\n\nNo part of the required interface — batch key lookup, input-order preservation, or `null` at missing-key positions — is implemented in any of the three adapters.",
       "rework_context": ""
     },
     {
@@ -436,13 +399,13 @@
       "verdict": "TO_BE_MISSING",
       "evidence_locations": [
         "src/user/email.js:1-227",
+        "src/user/email.js:112-113",
         "src/user/email.js:47-56",
-        "src/user/email.js:113",
-        "src/user/email.js:48",
-        "src/user/email.js:51",
-        "src/user/email.js:163-164"
+        "src/user/email.js:162-166",
+        "src/socket.io/admin/user.js:62-70",
+        "src/socket.io/admin/user.js:79-80"
       ],
-      "findings": "The function `getEmailForValidation` does not exist anywhere in `src/user/email.js`. A full read of the file (227 lines) confirms the `UserEmail` module exports exactly: `exists`, `available`, `remove`, `isValidationPending`, `getValidationExpiry`, `expireValidation`, `canSendValidation`, `sendValidationEmail`, `confirmByCode`, and `confirmByUid`. There is no `getEmailForValidation` definition, no export, and no call site anywhere in the repository (grep across all of `src/` returns zero matches).\n\nThe three-step logic the function must implement is entirely absent as a unified routine:\n\n1. **Profile lookup (step 1)** — `user.getUserField(uid, 'email')` is called at lines 113, 174, and 194, but none of these occurrences are inside a `getEmailForValidation` function.\n\n2. **Fallback to confirmation object (steps 2a–2b)** — `db.get('confirm:byUid:${uid}')` appears at lines 48 and 64; `db.getObject('confirm:${code}')` appears at lines 51 and 163. These are used inside `isValidationPending` and `confirmByCode` respectively, not inside any email-retrieval helper.\n\n3. **UID equality guard** — `confirmObj.uid` is referenced at line 164 as a presence check (`!confirmObj.uid`) inside `confirmByCode`, but no function performs the equality comparison `confirmObj.uid === uid` before returning an email string.\n\nThe closest analog is `UserEmail.isValidationPending` (lines 47–56): it reads `confirm:byUid:${uid}` then `confirm:${code}`, but returns a boolean and does not return the email string or enforce UID equality. The function must be implemented from scratch in `src/user/email.js`.",
+      "findings": "The function `UserEmail.getEmailForValidation` (or any alias) does not exist anywhere in the codebase. A repo-wide grep for `getEmailForValidation` returned zero matches, and a full read of `src/user/email.js` (lines 1–227) confirms it is not defined there.\n\nThe file `src/user/email.js` exports exactly 10 functions on `UserEmail`: `exists` (line 18), `available` (line 23), `remove` (line 28), `isValidationPending` (line 47), `getValidationExpiry` (line 58), `expireValidation` (line 63), `canSendValidation` (line 71), `sendValidationEmail` (line 84), `confirmByCode` (line 162), and `confirmByUid` (line 190). None of these correspond to `getEmailForValidation`.\n\nThe two behavioral steps the function must implement are each present in other functions but never composed into a standalone `getEmailForValidation` entry point:\n\n1. **Primary lookup — user profile email**: `user.getUserField(uid, 'email')` is used as a fallback inside `sendValidationEmail` at line 113, but is not exposed as a first-try retrieval step by any dedicated function.\n\n2. **Fallback — confirmation object email with UID guard**: The lookup chain `db.get('confirm:byUid:<uid>') → db.getObject('confirm:<code>') → confirmObj.email` (with `confirmObj.uid` validation) exists across `isValidationPending` (lines 47–56) and `confirmByCode` (lines 162–166), but is not surfaced by any `getEmailForValidation` entry point.\n\nThe two integration points that are supposed to call this function currently bypass it entirely:\n- `User.validateEmail` (`src/socket.io/admin/user.js:62–70`) calls `user.email.confirmByUid(uid)` directly.\n- `User.sendValidationEmail` (`src/socket.io/admin/user.js:79–80`) passes only `{ force: true }` to `user.email.sendValidationEmail`, with no `email` option resolved via `getEmailForValidation`.",
       "rework_context": ""
     }
   ],

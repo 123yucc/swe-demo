@@ -71,11 +71,43 @@ def check_correct_attribution(evidence: EvidenceCards | None) -> list[str]:
             continue
         if r.verdict == "AS_IS_COMPLIANT":
             continue
+        # TO_BE_MISSING describes absent functionality — the agent may not be
+        # able to point to specific lines since the code doesn't exist yet.
+        # Allow empty evidence_locations for this verdict.
+        if r.verdict == "TO_BE_MISSING" and not r.evidence_locations:
+            continue
         if not r.evidence_locations:
             bad.append(r.id)
             continue
         if any(not _EVIDENCE_LOCATION_RE.match(loc) for loc in r.evidence_locations):
             bad.append(r.id)
+    return bad
+
+
+def check_consistency_anchors_format(
+    evidence: EvidenceCards | None,
+) -> list[str]:
+    """Return malformed anchor strings (format-only check).
+
+    Each ``StructuralCard.consistency_anchors`` entry must split on ``<->``
+    into two halves, each of which is ``path:locator`` with a non-empty path
+    and locator. Factual verification (file exists, symbol/line resolves) is
+    handled by ``check_consistency_anchors`` in
+    ``src/orchestrator/consistency_checks.py``.
+
+    This guard runs alongside ``check_correct_attribution`` — failures here
+    bounce the pipeline back to UNDER_SPECIFIED without consulting the LLM.
+    """
+    if evidence is None:
+        return []
+    # Local import to avoid pulling subprocess/Path eagerly in guards.
+    from src.orchestrator.consistency_checks import parse_anchor
+
+    bad: list[str] = []
+    for raw in evidence.structural.consistency_anchors:
+        parsed = parse_anchor(raw)
+        if parsed.parse_error:
+            bad.append(f"{raw!r}: {parsed.parse_error}")
     return bad
 
 

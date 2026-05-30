@@ -1,7 +1,8 @@
-"""
-Deep Search sub-agent (phase 18.E): given a specific TODO investigation task
+"""Deep Search sub-agent (phase 18.E): given a specific TODO investigation task
 and the current EvidenceCards snapshot, searches the repository using native
-Grep / Read / Glob tools and returns a structured DeepSearchReport.
+Grep / Read / Glob tools and may also actively query long-term memory using
+the MemGovern-style Search → Browse workflow before returning a structured
+DeepSearchReport.
 
 Phase 18.E adds a self-reflection round after the first structured output:
 the agent verifies its own findings for hallucination and boundary issues
@@ -24,7 +25,10 @@ RequirementItem to verify against the current code using Grep/Read/Glob.
 Your job, for that single requirement:
 1. Locate the relevant code (call chain, data flow, callers, similar impls).
 2. Decide a verdict among: AS_IS_COMPLIANT, AS_IS_VIOLATED, TO_BE_MISSING,
-   TO_BE_PARTIAL.
+   TO_BE_PARTIAL. You MUST pick one of these four — UNCHECKED is NEVER valid.
+   If you cannot fully determine the status after investigation, use
+   TO_BE_PARTIAL (meaning partial evidence exists but full verification is
+   inconclusive).
 3. Populate target_requirement_id, requirement_verdict, requirement_findings,
    requirement_evidence_locations. evidence_locations must be non-empty
    unless the verdict is AS_IS_COMPLIANT.
@@ -40,6 +44,55 @@ CRITICAL: requirement_evidence_locations MUST use format 'file.py:LINE' or
 
 Paths are relative to repo root. Do NOT modify files. Do NOT fabricate code
 that isn't there.
+
+────────────────────────────────────────────────────────────────────────
+CONSISTENCY ANCHORS (structural.consistency_anchors)
+────────────────────────────────────────────────────────────────────────
+
+When the requirement matches ANY of the patterns below, you MUST populate
+``structural.consistency_anchors`` with one entry per pair of code points
+that must remain jointly consistent. A code gate will mechanically verify
+each anchor's two endpoints; missing or unresolvable endpoints bounce the
+pipeline back to deep-search.
+
+Pattern A — Configuration ↔ code-side definition:
+  The requirement (or the code) introduces a configuration/data file
+  (yml/yaml/json/toml/ini/...) that references an identifier-shaped name
+  (a class, enum, function, or method name). The code side must define
+  that name. Emit one anchor per such reference.
+
+Pattern B — Renamed or visibility-changed symbol:
+  The requirement implies an exported symbol changes name, case, or
+  visibility (public → private, etc.). Use Grep to enumerate every
+  agent-visible reference to the OLD name across the repo, INCLUDING
+  same-package ``_test.*`` files that ship at base_commit. Emit one
+  anchor per old-vs-new reference pair so the gate can verify the rename
+  is fully propagated. (Do NOT reference evaluator-injected hidden test
+  fixtures — they are agent-invisible and out of scope.)
+
+Pattern C — New file with mount/import sites elsewhere:
+  The requirement implies a new file is added that other files must
+  register, import, or mount. Emit one anchor per (new_file, mount_site)
+  pair so the gate can verify both sides exist.
+
+Anchor format (strict):
+  '<path_a>:<locator_a> <-> <path_b>:<locator_b>'
+
+Each locator is one of:
+  * 'LINE'           — single line number
+  * 'LINE-LINE'      — inclusive line range
+  * 'class:NAME'     — symbol with prefix (also: func, method, type,
+                       enum, field, name, key, interface, struct, var, const)
+  * 'NAME'           — bare identifier (the gate verifies via word-boundary
+                       grep in the file)
+
+Examples (illustrative shape, NOT specific to any repo):
+  - 'config/settings.yml:type=Foo <-> src/types.py:class Foo'
+  - 'pkg/api.go:Bar <-> pkg/api_test.go:42'
+  - 'src/new_module.py:1-10 <-> src/main.py:import:new_module'
+
+If the requirement does NOT match Pattern A/B/C, leave consistency_anchors
+empty. Do NOT pad with anchors that are not load-bearing.
 """
 
 
@@ -77,6 +130,13 @@ SELF-REFLECTION CHECKS:
    requirements, ensure your verdict is consistent with the code's
    actual behaviour in those shared regions.
 
+4. ANCHOR ENDPOINT VERIFICATION — For every entry you wrote in
+   ``structural.consistency_anchors``, both LHS and RHS endpoints must
+   resolve in files you actually Read during this investigation. If only
+   one endpoint was verified, either drop the anchor or move the half-
+   verified observation into ``findings`` as a single-side note. Do not
+   leave anchors whose existence relies on a file you never opened.
+
 If reflection reveals issues, revise the DeepSearchReport fields accordingly.
 Return a DeepSearchReport (original or revised).  Do NOT fabricate new
 Read results — stay within what your previous investigation opened.
@@ -90,12 +150,23 @@ async def _run_deep_search_async(
     todo_task: str,
     evidence: EvidenceCards,
     repo_dir: Path | None = None,
+    working_memory_block: str = "",
 ) -> DeepSearchReport:
     evidence_summary = evidence.model_dump_json(indent=2)
+    memory_section = (
+        f"{working_memory_block.strip()}\n\n"
+        if working_memory_block and working_memory_block.strip()
+        else ""
+    )
     prompt = (
+        f"{memory_section}"
         f"TODO task: {todo_task}\n\n"
         f"Current evidence cards:\n```json\n{evidence_summary}\n```\n\n"
-        "Investigate and return a structured report of your findings."
+        "Investigate and return a structured report of your findings. "
+        "When useful, use long-term memory progressively: first search for "
+        "relevant experience summaries, then browse only the most relevant "
+        "experience ids for detailed fix guidance, and re-search with refined "
+        "keywords if the first results are not sufficient."
     )
 
     # ── Phase 18.E: Round 1 — primary investigation ──────────────────
@@ -105,18 +176,22 @@ async def _run_deep_search_async(
         response_model=DeepSearchReport,
         component="deep-search",
         allowed_tools=["Grep", "Read", "Glob", "TodoWrite"],
-        max_turns=30,
-        max_budget_usd=1.0,
+        max_turns=50,
+        max_budget_usd=3.0,
         cwd=str(repo_dir) if repo_dir is not None else None,
     )
 
     # ── Phase 18.E: Round 2 — self-reflection ────────────────────────
     report_json = report.model_dump_json(indent=2)
     reflection_prompt = (
+        f"{memory_section}"
         "Review and self-correct your findings:\n\n"
         f"## Your DeepSearchReport\n"
         f"```json\n{report_json}\n```\n\n"
         "Execute the self-reflection checks described in the system prompt. "
+        "IMPORTANT: You MUST preserve the requirement_verdict and "
+        "target_requirement_id from the original report unless your "
+        "reflection explicitly justifies changing the verdict. "
         "Return a DeepSearchReport (original or revised)."
     )
 
@@ -131,8 +206,19 @@ async def _run_deep_search_async(
             max_budget_usd=0.5,
             cwd=str(repo_dir) if repo_dir is not None else None,
         )
-        # Use reflected report if it came back with valid data
+        # Use reflected report only if it preserved the verdict.
+        # The reflection round's job is to correct findings/anchors, not
+        # to downgrade the verdict. If it returned the schema default
+        # (TO_BE_PARTIAL) while Round 1 had a more specific verdict,
+        # prefer Round 1's verdict.
         if reflected and reflected.target_requirement_id:
+            # Carry over Round 1 verdict if reflection didn't set one
+            # that differs meaningfully (i.e., not just the schema default
+            # when Round 1 had something specific).
+            r1_verdict = report.requirement_verdict
+            r2_verdict = reflected.requirement_verdict
+            if r2_verdict == "TO_BE_PARTIAL" and r1_verdict != "TO_BE_PARTIAL":
+                reflected.requirement_verdict = r1_verdict
             return reflected
     except Exception as exc:
         print(
@@ -148,14 +234,22 @@ def run_deep_search(
     todo_task: str,
     evidence: EvidenceCards,
     repo_dir: Path | None = None,
+    working_memory_block: str = "",
 ) -> DeepSearchReport:
     """Synchronous wrapper.
 
     Args:
         todo_task: A specific investigation task string from the orchestrator.
         evidence:  Current EvidenceCards state.
+        working_memory_block: Optional rendered SharedWorkingMemory section
+            (LTM summaries, custom repair discipline, build feedback) to
+            inject ahead of the TODO. Empty string disables injection.
 
     Returns:
         DeepSearchReport with structured findings.
     """
-    return asyncio.run(_run_deep_search_async(todo_task, evidence, repo_dir))
+    return asyncio.run(
+        _run_deep_search_async(
+            todo_task, evidence, repo_dir, working_memory_block
+        )
+    )

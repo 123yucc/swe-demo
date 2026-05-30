@@ -89,16 +89,41 @@ def _build_per_req_audit_feedback(
     return out
 
 from src.agents.closure_checker_agent import _run_closure_checker_async
+from src.agents.custom_router_agent import run_custom_router
 from src.agents.deep_search_agent import _run_deep_search_async
+from src.agents.ltm_agent import run_agentic_ltm_retrieval
 from src.agents.parser_agent import _run_parser_async
 from src.agents.patch_generator_agent import _run_patch_generator_async
 from src.agents.patch_planner_agent import _run_patch_planner_async
+from src.memory import (
+    Experience,
+    append_custom_recommendations_log,
+    append_recommendations_log,
+    format_custom_rules_for_prompt,
+    format_experiences_for_prompt,
+    load_custom_rules,
+    select_matching_rules,
+)
 from src.models.context import EvidenceCards
+from src.models.custom_rules import RouteTags
 from src.models.evidence import RequirementItem
 from src.models.verdict import ClosureVerdict
 from src.orchestrator.audit import build_audit_manifest
+from src.orchestrator.build_verify import (
+    BuildCheckResult,
+    detect_build_system,
+    diff_new_errors,
+    render_errors_for_feedback,
+    run_build_check,
+)
+from src.orchestrator.consistency_checks import (
+    check_consistency_anchors,
+    check_rename_residue,
+    render_residue_for_feedback,
+)
 from src.orchestrator.guards import (
     DeepSearchBudget,
+    check_consistency_anchors_format,
     check_correct_attribution,
     check_structural_invariants,
     check_sufficiency,
@@ -143,6 +168,40 @@ def _run_git(repo_dir: Path, *args: str) -> tuple[int, str, str]:
     return result.returncode, _decode(result.stdout), _decode(result.stderr)
 
 
+def _strip_mode_only_hunks(diff_text: str) -> str:
+    """Remove diff entries that contain only file-mode changes or submodule dirty markers.
+
+    On Windows/NTFS, git may report spurious 755->644 mode changes that
+    pollute patch.diff. Submodule -dirty markers are also noise when the
+    patch did not intentionally update the submodule pointer.
+    """
+    if not diff_text:
+        return diff_text
+    entries: list[str] = []
+    current_lines: list[str] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current_lines:
+            entries.append("".join(current_lines))
+            current_lines = []
+        current_lines.append(line)
+    if current_lines:
+        entries.append("".join(current_lines))
+
+    kept: list[str] = []
+    for entry in entries:
+        lines = entry.splitlines()
+        has_content = any(
+            (l.startswith("+") or l.startswith("-"))
+            and not l.startswith("--- ")
+            and not l.startswith("+++ ")
+            and "Subproject commit " not in l
+            for l in lines
+        )
+        if has_content:
+            kept.append(entry)
+    return "".join(kept)
+
+
 def _collect_git_diff(repo_dir: Path, planned_files: list[str] | None = None) -> str:
     """Return `git diff HEAD` of the working tree, including new files.
 
@@ -174,6 +233,8 @@ def _collect_git_diff(repo_dir: Path, planned_files: list[str] | None = None) ->
     rc, diff_text, err = _run_git(repo_dir, "diff", "HEAD")
     if rc != 0:
         print(f"[orchestrator] git diff exit={rc}: {err.strip()}", flush=True)
+
+    diff_text = _strip_mode_only_hunks(diff_text or "")
 
     if added:
         rc_reset, _, err_reset = _run_git(repo_dir, "reset", "--", *added)
@@ -212,6 +273,58 @@ def _verify_plan_coverage(
         if norm not in diff_paths:
             missing.append(norm)
     return missing
+
+
+def _compute_baseline_build(
+    repo_dir: Path,
+    system: str,
+) -> BuildCheckResult | None:
+    """Compute the build result at clean base_commit, restoring the patch after.
+
+    The post-patch working tree is ``base + patch`` (tracked edits plus any
+    files the generator created). To get a baseline we stash everything
+    (``-u`` includes untracked created files), run the same build on the clean
+    base tree, then pop the stash to restore the patch.
+
+    Returns the baseline BuildCheckResult, or None if the stash failed (in
+    which case the caller conservatively treats every post error as new — i.e.
+    assumes base_commit compiles, which is true for any real released commit).
+    """
+    rc, out, err = _run_git(repo_dir, "stash", "push", "-u", "-m", "build-verify-baseline")
+    combined = f"{out}\n{err}".lower()
+    if rc != 0:
+        print(
+            f"[build-verify] git stash failed (rc={rc}); cannot compute "
+            f"baseline, treating all errors as new: {err.strip()}",
+            flush=True,
+        )
+        return None
+    if "no local changes" in combined:
+        # Nothing to stash — working tree already clean base. No patch to
+        # diff against; treat all post errors as new.
+        print(
+            "[build-verify] nothing to stash for baseline (clean tree); "
+            "treating all errors as new",
+            flush=True,
+        )
+        return None
+
+    try:
+        baseline = run_build_check(repo_dir, system)
+        print(
+            f"[build-verify] baseline build at base_commit: ok={baseline.ok} "
+            f"errors={len(baseline.errors)}",
+            flush=True,
+        )
+        return baseline
+    finally:
+        pop_rc, _, pop_err = _run_git(repo_dir, "stash", "pop")
+        if pop_rc != 0:
+            print(
+                f"[build-verify] CRITICAL: git stash pop failed (rc={pop_rc}); "
+                f"working tree may be missing the patch: {pop_err.strip()}",
+                flush=True,
+            )
 
 
 def _pick_next_requirement(evidence: EvidenceCards) -> RequirementItem | None:
@@ -273,12 +386,55 @@ async def _persist_report_findings(report, scope_requirement_id: str) -> None:
     if target_id:
         verdict_args: dict[str, Any] = {
             "requirement_id": target_id,
-            "verdict": report.requirement_verdict or "UNCHECKED",
+            "verdict": report.requirement_verdict or "TO_BE_PARTIAL",
             "evidence_locations": list(report.requirement_evidence_locations),
             "findings": report.requirement_findings or "",
         }
         try:
-            await update_requirement_verdict.handler(verdict_args)
+            result = await update_requirement_verdict.handler(verdict_args)
+            # Handler returns error dict (not exception) when validation fails.
+            # Most common: non-compliant verdict with empty evidence_locations.
+            result_text = ""
+            if isinstance(result, dict):
+                for item in result.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        result_text = item.get("text", "")
+            if "ERROR" in result_text:
+                print(
+                    f"[orchestrator] update_requirement_verdict rejected: "
+                    f"{result_text[:120]}",
+                    flush=True,
+                )
+                # Fallback: if locations are empty but verdict is not compliant,
+                # use exact_code_regions as fallback locations.
+                if "evidence_locations must be non-empty" in result_text:
+                    fallback_locs = list(report.exact_code_regions or [])
+                    if fallback_locs:
+                        verdict_args["evidence_locations"] = fallback_locs
+                        await update_requirement_verdict.handler(verdict_args)
+                        print(
+                            f"[orchestrator] retried with exact_code_regions as "
+                            f"evidence_locations ({len(fallback_locs)} locs).",
+                            flush=True,
+                        )
+                    else:
+                        # Last resort: write directly to the requirement object,
+                        # bypassing the handler's non-empty check. This prevents
+                        # infinite loops for TO_BE_MISSING requirements where the
+                        # agent cannot point to specific lines.
+                        evidence = get_submitted_evidence()
+                        if evidence:
+                            for req in evidence.requirements:
+                                if req.id == target_id:
+                                    req.verdict = verdict_args["verdict"]
+                                    req.findings = verdict_args["findings"]
+                                    print(
+                                        f"[orchestrator] wrote verdict "
+                                        f"{verdict_args['verdict']} directly "
+                                        f"(no evidence_locations available).",
+                                        flush=True,
+                                    )
+                                    break
         except Exception as exc:
             print(
                 f"[orchestrator] update_requirement_verdict.handler failed: {exc}",
@@ -340,6 +496,119 @@ def _write_patch_outcome(
     print(f"[orchestrator] Patch outcome saved -> {patch_outcome_path}", flush=True)
 
 
+async def _progressive_retrieve_ltm(
+    *,
+    stage: str,
+    query: str,
+    output_dir: Path,
+    summary_top_k: int = 8,
+    detail_top_k: int = 3,
+) -> tuple[list[str], list[Experience]]:
+    """MemGovern-style progressive retrieval via a multi-turn LTM agent."""
+    try:
+        summaries, selected_ids, experiences = await run_agentic_ltm_retrieval(
+            stage=stage,
+            query_text=query,
+            output_dir=output_dir,
+            max_turns=max(10, summary_top_k),
+            max_budget_usd=1.0,
+        )
+        log_path = append_recommendations_log(
+            output_dir,
+            stage=stage,
+            query=query,
+            search_summaries=summaries,
+            selected_ids=selected_ids,
+            experiences=experiences,
+        )
+        print(
+            f"[ltm] recorded retrieval stage={stage} -> {log_path} "
+            f"(selected_ids={selected_ids})",
+            flush=True,
+        )
+        return summaries, experiences
+    except Exception as exc:
+        log_path = append_recommendations_log(
+            output_dir,
+            stage=stage,
+            query=query,
+            search_summaries=[],
+            selected_ids=[],
+            experiences=[],
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        print(
+            f"[ltm] agentic retrieval failed at stage={stage}: {exc}",
+            flush=True,
+        )
+        print(
+            f"[ltm] wrote failure record -> {log_path}",
+            flush=True,
+        )
+        return [], []
+
+
+async def _route_and_match_custom_rules(
+    *,
+    stage: str,
+    query: str,
+    output_dir: Path,
+) -> str:
+    """Run the custom-rule router, match against the local rule library,
+    and return a rendered prompt block (or "" if nothing matched).
+
+    Logs every invocation to ``custom_recommendations.json``. Any failure
+    (router error, file missing, etc.) is recorded in the same log with
+    an ``error`` field; the function then returns "" so the pipeline
+    continues without injection.
+    """
+    rules = load_custom_rules()
+    if not rules:
+        append_custom_recommendations_log(
+            output_dir,
+            stage=stage,
+            query=query,
+            route=None,
+            matched_ids=[],
+            error="no_custom_rules_loaded",
+        )
+        return ""
+
+    try:
+        route = await run_custom_router(query)
+    except Exception as exc:
+        append_custom_recommendations_log(
+            output_dir,
+            stage=stage,
+            query=query,
+            route=None,
+            matched_ids=[],
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        print(
+            f"[custom-route] router failed at stage={stage}: {exc}",
+            flush=True,
+        )
+        return ""
+
+    matched = select_matching_rules(rules, route)
+    block = format_custom_rules_for_prompt(matched)
+
+    log_path = append_custom_recommendations_log(
+        output_dir,
+        stage=stage,
+        query=query,
+        route=route.model_dump(),
+        matched_ids=[r.id for r in matched],
+    )
+    print(
+        f"[custom-route] stage={stage} matched={len(matched)}/{len(rules)} "
+        f"-> {log_path}",
+        flush=True,
+    )
+    return block
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Code-driven pipeline
 # ══════════════════════════════════════════════════════════════════════════
@@ -349,6 +618,7 @@ async def run_pipeline(
     repo_dir: str | Path,
     artifact_text: str,
     output_dir: str | Path,
+    problem_statement: str = "",
 ) -> Path:
     """Drive the full repair pipeline via a code-driven state-machine loop.
 
@@ -360,10 +630,46 @@ async def run_pipeline(
 
     All flow control (transitions, iteration budget, mechanical checks)
     is enforced by code.
+
+    ``problem_statement`` is the raw issue body used as the long-term-memory
+    semantic search query.  Falls back to ``artifact_text`` when empty.
     """
     repo_dir = Path(repo_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    ltm_query = (problem_statement or artifact_text).strip()
+    # custom-rule routing benefits from seeing requirements/interface text
+    # (e.g. specific function names like db.mget, field names like
+    # email:pending) which tell the LLM what change shapes will be
+    # involved. The bug-shape ChromaDB path is happier with the bare
+    # problem_statement, so we keep them separate.
+    custom_route_query = artifact_text.strip()
+
+    # ── Step 0: long-term memory retrieval (early-stage) ───────────────
+    # Pull top-5 similar past bugs and inject the bug_description block as
+    # reference reading material for the deep-search rounds. fix_experience
+    # is NOT pulled here — it would only confuse the investigation phase
+    # before evidence has been collected.
+    early_summaries, early_experiences = await _progressive_retrieve_ltm(
+        stage="under_specified",
+        query=ltm_query,
+        output_dir=output_dir,
+        summary_top_k=5,
+        detail_top_k=3,
+    )
+    early_ltm_block = format_experiences_for_prompt(
+        early_experiences, include_fix=False,
+    )
+
+    # ── Step 0b: parallel custom-rule tag-routing path ─────────────────
+    # Independent of ChromaDB; classifies the case on three axes and
+    # injects matched hand-written repair-discipline rules.
+    early_custom_block = await _route_and_match_custom_rules(
+        stage="under_specified",
+        query=custom_route_query,
+        output_dir=output_dir,
+    )
 
     # ── Step 1: Parser produces initial EvidenceCards ──────────────────
     print("[orchestrator] Running parser agent...", flush=True)
@@ -373,6 +679,14 @@ async def run_pipeline(
     # ── Step 2: Initialize shared state ────────────────────────────────
     set_repo_root(repo_dir)
     memory = init_working_memory(issue_context=artifact_text, evidence=evidence)
+    memory.ltm_search_summaries = early_summaries
+    if early_ltm_block:
+        # Stash on memory so deep-search can prepend it to its TODO without
+        # re-issuing the network call. Will be replaced before patch-planning
+        # with a fix-experience-bearing block (top-3 with full text).
+        memory.ltm_reference_block = early_ltm_block
+    if early_custom_block:
+        memory.custom_repair_block = early_custom_block
     memory.record_action(phase="parser", outcome="initial_cards_created")
 
     evidence_path = output_dir / "evidence.json"
@@ -387,6 +701,8 @@ async def run_pipeline(
         evidence_path=evidence_path,
         memory=memory,
         initial_state=PipelineState.UNDER_SPECIFIED,
+        ltm_query=ltm_query,
+        custom_route_query=custom_route_query,
     )
 
 
@@ -394,6 +710,7 @@ async def run_pipeline_from_evidence(
     issue_id: str,
     repo_dir: str | Path,
     output_dir: str | Path,
+    problem_statement: str = "",
 ) -> Path:
     """Resume the pipeline from pre-populated evidence + working memory.
 
@@ -423,6 +740,7 @@ async def run_pipeline_from_evidence(
         evidence_path=evidence_path,
         memory=memory,
         initial_state=PipelineState.EVIDENCE_REFINING,
+        ltm_query=(problem_statement or memory.issue_context).strip(),
     )
 
 
@@ -433,6 +751,8 @@ async def _run_state_machine(
     evidence_path: Path,
     memory,
     initial_state: PipelineState,
+    ltm_query: str = "",
+    custom_route_query: str = "",
 ) -> Path:
     """Core state-machine loop shared by run_pipeline and run_pipeline_from_evidence."""
     state = initial_state
@@ -449,6 +769,30 @@ async def _run_state_machine(
     # round counter tracks how many rework rounds have been consumed so far.
     rework_rounds_used = 0
     rework_rounds_max = 3
+
+    # Per-requirement retry counter: prevents infinite loops where the same
+    # requirement keeps returning UNCHECKED and starving other requirements.
+    per_req_unchecked_count: dict[str, int] = {}
+    per_req_unchecked_max = 3
+
+    # Post-patch build verification: on NEW compile/collection errors the
+    # pipeline re-opens patch planning (CLOSED) with the errors fed back via
+    # memory.build_error_feedback. Capped at patch_verify_rounds_max.
+    patch_verify_rounds_used = 0
+    patch_verify_rounds_max = 2
+    # LTM/custom-rule retrieval for planning is expensive; run it once on the
+    # first CLOSED entry and reuse the cached blocks on repatch rounds.
+    planner_ltm_loaded = False
+    # Every filepath any plan round intended to touch — used so the final
+    # git-diff promotes ALL created files (a repatch overwrites memory.patch_plan
+    # with the fixup plan, which would otherwise drop first-round new files).
+    all_planned_files: set[str] = set()
+    # Per-round build verification records, written to build_verification.json.
+    build_verify_log: list[dict[str, Any]] = []
+    # Consecutive deep-search failure counter per requirement id.
+    # Prevents infinite retry when a requirement keeps failing before verdict is set.
+    _ds_fail_counts: dict[str, int] = {}
+    _DS_FAIL_MAX = 3
 
     _terminal_states = (
         PipelineState.PATCH_SUCCESS,
@@ -508,6 +852,10 @@ async def _run_state_machine(
                 target,
                 rework_context=target.rework_context,
             )
+            # Inject the rendered SharedWorkingMemory section (LTM summaries,
+            # custom repair discipline, build-error feedback) so the deep-search
+            # agent actually sees the same context the orchestrator gathered.
+            working_memory_block = memory.format_for_prompt()
             print(
                 f"[orchestrator] Dispatching deep-search for {target.id}: "
                 f"{target.text[:80]!r}",
@@ -516,6 +864,7 @@ async def _run_state_machine(
             try:
                 report = await _run_deep_search_async(
                     todo_task, current_evidence, repo_dir,
+                    working_memory_block=working_memory_block,
                 )
             except Exception as exc:
                 budget.record_iteration()
@@ -546,6 +895,40 @@ async def _run_state_machine(
                 outcome=f"iter{budget.iteration}:{report.requirement_verdict}",
                 requirement_id=target.id,
             )
+
+            # Per-requirement stall breaker: after persisting, check if the
+            # requirement is STILL UNCHECKED (handler may have silently rejected
+            # the write due to empty evidence_locations). Track consecutive stalls
+            # and force-write after per_req_unchecked_max attempts.
+            current_evidence_check = get_submitted_evidence()
+            target_after = None
+            if current_evidence_check:
+                for r in current_evidence_check.requirements:
+                    if r.id == target.id:
+                        target_after = r
+                        break
+            if target_after and target_after.verdict == "UNCHECKED":
+                per_req_unchecked_count[target.id] = (
+                    per_req_unchecked_count.get(target.id, 0) + 1
+                )
+                if per_req_unchecked_count[target.id] >= per_req_unchecked_max:
+                    print(
+                        f"[orchestrator] {target.id} still UNCHECKED after "
+                        f"{per_req_unchecked_count[target.id]} iterations "
+                        f"(verdict write likely rejected) — forcing directly.",
+                        flush=True,
+                    )
+                    target_after.verdict = report.requirement_verdict or "TO_BE_PARTIAL"
+                    target_after.findings = report.requirement_findings or (
+                        "[forced after repeated stall]"
+                    )
+                    target_after.evidence_locations = list(
+                        report.requirement_evidence_locations
+                        or report.exact_code_regions
+                        or []
+                    )
+            else:
+                per_req_unchecked_count.pop(target.id, None)
 
             # Transition to EvidenceRefining
             assert is_valid_transition(state, PipelineState.EVIDENCE_REFINING)
@@ -590,6 +973,12 @@ async def _run_state_machine(
                     f"{bad_attribution[:5]}. Returning to deep-search.",
                     flush=True,
                 )
+                for rid in bad_attribution:
+                    reset_requirement_for_rework(
+                        rid,
+                        audit_feedback="Attribution check failed: non-compliant verdict "
+                        "requires valid evidence_locations (path:LINE or path:LINE-LINE).",
+                    )
                 memory.record_action(
                     phase="evidence-refining",
                     outcome=f"attribution_failed:{len(bad_attribution)}_missing_locations",
@@ -597,6 +986,72 @@ async def _run_state_machine(
                 assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
                 state = PipelineState.UNDER_SPECIFIED
                 continue
+
+            # Consistency-anchor format check (phase 23). Each anchor must
+            # split into LHS/RHS as 'path:locator <-> path:locator'.
+            anchor_format_bad = check_consistency_anchors_format(current_evidence)
+            if anchor_format_bad and not budget.is_exhausted():
+                print(
+                    f"[orchestrator] consistency-anchor format check failed: "
+                    f"{anchor_format_bad[:3]}. Returning to deep-search.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="evidence-refining",
+                    outcome=f"anchor_format_failed:{len(anchor_format_bad)}_bad",
+                )
+                assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
+                state = PipelineState.UNDER_SPECIFIED
+                continue
+
+            # Consistency-anchor factual check (phase 23). Pure file/grep —
+            # no LLM. Failures are routed back to the requirement that owns
+            # the LHS path so deep-search can re-investigate.
+            anchor_failures = check_consistency_anchors(current_evidence, repo_dir)
+            if anchor_failures and not budget.is_exhausted():
+                # Group by owning requirement; reset each into rework with the
+                # specific failure messages as audit_feedback.
+                per_req: dict[str, list[str]] = {}
+                for f in anchor_failures:
+                    per_req.setdefault(f.requirement_id, []).append(f.render())
+                reset_ids: list[str] = []
+                for rid, lines in per_req.items():
+                    if rid == "<global>":
+                        continue
+                    feedback = (
+                        "Consistency-anchor code gate found endpoint(s) that "
+                        "do not resolve in the repository:\n"
+                        + "\n".join(f"  - {line}" for line in lines)
+                        + "\n\nRe-investigate: either correct the anchor "
+                        "(both endpoints must be agent-visible files; line "
+                        "ranges and symbol names must exist) or, if the "
+                        "endpoint truly should not exist, encode that as a "
+                        "TO_BE_MISSING verdict instead of an anchor."
+                    )
+                    if reset_requirement_for_rework(rid, audit_feedback=feedback):
+                        reset_ids.append(rid)
+                # Global failures (no owning requirement) — log but do not
+                # block; they will resurface next round if anchors stay broken.
+                global_lines = per_req.get("<global>", [])
+                if global_lines:
+                    print(
+                        "[orchestrator] anchor failures without owning req: "
+                        + "; ".join(global_lines[:3]),
+                        flush=True,
+                    )
+                if reset_ids:
+                    print(
+                        f"[orchestrator] consistency-anchor factual check → "
+                        f"reset {reset_ids}; returning to deep-search.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="evidence-refining",
+                        outcome=f"anchor_factual_failed:{len(reset_ids)}_reqs",
+                    )
+                    assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
+                    state = PipelineState.UNDER_SPECIFIED
+                    continue
 
             # ── Structural invariants (phase 18.A) ───────────────────────
             # I2 violations (new_interface + AS_IS_COMPLIANT) are mechanical
@@ -846,8 +1301,44 @@ async def _run_state_machine(
 
         # ── Closed: dispatch patch-planner ────────────────────────────
         elif state == PipelineState.CLOSED:
+            # Long-term memory injection for patch planning: top-3 with full
+            # fix_experience text, overwrites the lighter under-specified
+            # block that was set at startup.  Reference experience is
+            # marked in the prompt itself as "code wins on conflict" so the
+            # planner does not blindly transplant a fix from another repo.
+            #
+            # Run retrieval only once: on repatch rounds (re-entry from
+            # PATCH_VERIFYING) the cached blocks on memory are reused and the
+            # build_error_feedback drives the new plan instead.
+            if not planner_ltm_loaded:
+                planner_summaries, planner_experiences = await _progressive_retrieve_ltm(
+                    stage="patch_planning",
+                    query=ltm_query,
+                    output_dir=output_dir,
+                    summary_top_k=5,
+                    detail_top_k=3,
+                )
+                planner_block = format_experiences_for_prompt(
+                    planner_experiences, include_fix=True,
+                )
+                planner_custom_block = await _route_and_match_custom_rules(
+                    stage="patch_planning",
+                    query=custom_route_query or ltm_query,
+                    output_dir=output_dir,
+                )
+                memory.ltm_search_summaries = planner_summaries
+                memory.ltm_reference_block = planner_block
+                memory.custom_repair_block = planner_custom_block
+                planner_ltm_loaded = True
+            else:
+                print(
+                    "[orchestrator] repatch re-plan: reusing cached LTM blocks, "
+                    "build errors drive the new plan.",
+                    flush=True,
+                )
+
             print("[orchestrator] Dispatching patch-planner...", flush=True)
-            plan = await _run_patch_planner_async(memory)
+            plan = await _run_patch_planner_async(memory, repo_dir)
             memory.record_action(
                 phase="patch-planning",
                 subagent="patch-planner",
@@ -859,17 +1350,23 @@ async def _run_state_machine(
 
         # ── PatchPlanning: dispatch patch-generator ───────────────────
         elif state == PipelineState.PATCH_PLANNING:
+            # Accumulate planned files across rounds so the final git-diff
+            # promotes every created file even after a repatch overwrites
+            # memory.patch_plan with the fixup plan.
+            if memory.patch_plan is not None:
+                all_planned_files.update(e.filepath for e in memory.patch_plan.edits)
+
             print("[orchestrator] Dispatching patch-generator...", flush=True)
-            success = await _run_patch_generator_async(memory, repo_dir)
+            success = await _run_patch_generator_async(memory, repo_dir, output_dir)
             if success:
                 memory.record_action(
                     phase="patch-generation",
                     subagent="patch-generator",
-                    outcome="PATCH_SUCCESS",
+                    outcome="PATCH_APPLIED",
                 )
-                patch_outcome = "PATCH_SUCCESS"
-                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
-                state = PipelineState.PATCH_SUCCESS
+                # Defer the final PATCH_SUCCESS verdict to the build gate.
+                assert is_valid_transition(state, PipelineState.PATCH_VERIFYING)
+                state = PipelineState.PATCH_VERIFYING
             else:
                 memory.record_action(
                     phase="patch-generation",
@@ -877,6 +1374,159 @@ async def _run_state_machine(
                     outcome="PATCH_FAILED",
                 )
                 patch_outcome = "PATCH_FAILED"
+                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                state = PipelineState.PATCH_FAILED
+
+        # ── PatchVerifying: deterministic post-patch build gate ────────
+        elif state == PipelineState.PATCH_VERIFYING:
+            system = detect_build_system(repo_dir)
+            print(
+                f"[build-verify] build system detected: {system}",
+                flush=True,
+            )
+
+            if system in ("node", "unknown"):
+                print(
+                    f"[build-verify] no compile step for '{system}'; skipping "
+                    "build gate (accepting patch).",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome=f"skipped:{system}",
+                )
+                build_verify_log.append(
+                    {"round": patch_verify_rounds_used, "system": system,
+                     "skipped": True, "ok": True}
+                )
+                patch_outcome = "PATCH_SUCCESS"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
+                continue
+
+            post = run_build_check(repo_dir, system)
+            print(
+                f"[build-verify] post-patch: ok={post.ok} "
+                f"errors={len(post.errors)} timed_out={post.timed_out} "
+                f"cmd='{post.command}'",
+                flush=True,
+            )
+
+            # Rename-residue gate (phase 23): independent of build outcome.
+            # Old symbols left behind by an under-propagated rename frequently
+            # compile fine yet break grep-visible callers — the build gate
+            # alone misses them. We diff the working tree against HEAD; the
+            # repo was hard-reset to base_commit at startup, so HEAD == base.
+            residues = check_rename_residue(repo_dir, base_commit=None)
+            if residues:
+                print(
+                    f"[build-verify] rename-residue gate: "
+                    f"{len(residues)} unupdated old-symbol references.",
+                    flush=True,
+                )
+            else:
+                print("[build-verify] rename-residue gate: clean.", flush=True)
+
+            if post.ok and not residues:
+                memory.record_action(phase="build-verify", outcome="ok")
+                build_verify_log.append(
+                    {"round": patch_verify_rounds_used, "system": system,
+                     "ok": True, "command": post.command}
+                )
+                patch_outcome = "PATCH_SUCCESS"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
+                continue
+
+            # Build failed — distinguish patch-induced from pre-existing.
+            if post.ok:
+                baseline = None
+                new_errors = []
+            else:
+                baseline = _compute_baseline_build(repo_dir, system)
+                new_errors = diff_new_errors(baseline, post)
+                print(
+                    f"[build-verify] new (patch-induced) errors: {len(new_errors)} "
+                    f"(baseline_errors="
+                    f"{len(baseline.errors) if baseline else 'n/a'})",
+                    flush=True,
+                )
+
+            # Combine residue records with build errors so the repatch loop
+            # sees one unified feedback channel.
+            combined_errors = list(new_errors) + list(residues)
+            build_verify_log.append(
+                {
+                    "round": patch_verify_rounds_used,
+                    "system": system,
+                    "ok": post.ok,
+                    "command": post.command,
+                    "timed_out": post.timed_out,
+                    "baseline_computed": baseline is not None,
+                    "new_errors": [
+                        {"file": e.file, "line": e.line, "message": e.message}
+                        for e in new_errors
+                    ],
+                    "rename_residues": [
+                        {"file": e.file, "line": e.line, "message": e.message}
+                        for e in residues
+                    ],
+                }
+            )
+
+            if not combined_errors:
+                # All failures pre-existed at base_commit — not the patch's
+                # fault. Accept the patch.
+                print(
+                    "[build-verify] all build errors pre-existed at base "
+                    "and no rename residues; accepting patch.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome="ok_preexisting_only",
+                )
+                patch_outcome = "PATCH_SUCCESS"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
+                continue
+
+            if patch_verify_rounds_used < patch_verify_rounds_max:
+                patch_verify_rounds_used += 1
+                feedback_parts: list[str] = []
+                if new_errors:
+                    feedback_parts.append(render_errors_for_feedback(new_errors))
+                if residues:
+                    feedback_parts.append(render_residue_for_feedback(residues))
+                memory.build_error_feedback = "\n\n".join(p for p in feedback_parts if p)
+                print(
+                    "[build-verify] BUILD_FAILED → repatch: re-opening planning "
+                    f"(round {patch_verify_rounds_used}/{patch_verify_rounds_max}) "
+                    f"with {len(new_errors)} build errors and "
+                    f"{len(residues)} rename residues.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome=(
+                        f"repatch:round={patch_verify_rounds_used}/"
+                        f"{patch_verify_rounds_max}:"
+                        f"{len(new_errors)}_errors+{len(residues)}_residues"
+                    ),
+                )
+                assert is_valid_transition(state, PipelineState.CLOSED)
+                state = PipelineState.CLOSED
+            else:
+                print(
+                    "[build-verify] BUILD_FAILED and repatch budget exhausted; "
+                    "terminating as PATCH_FAILED.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome="BUILD_FAILED_terminal",
+                )
+                patch_outcome = "BUILD_FAILED"
                 assert is_valid_transition(state, PipelineState.PATCH_FAILED)
                 state = PipelineState.PATCH_FAILED
 
@@ -914,20 +1564,35 @@ async def _run_state_machine(
             plan_path.write_text(wm.patch_plan.model_dump_json(indent=2), encoding="utf-8")
             print(f"[orchestrator] Patch plan saved -> {plan_path}", flush=True)
 
+    # Persist per-round build verification diagnostics.
+    if build_verify_log:
+        bv_path = output_dir / "build_verification.json"
+        bv_path.write_text(
+            json.dumps(build_verify_log, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"[orchestrator] Build verification log saved -> {bv_path}", flush=True)
+
     # Collect git diff \u2014 pass planned files so newly-created files are
     # promoted from untracked to intent-to-add and surface in the diff.
-    planned_files: list[str] = []
+    # Use the UNION of every file any plan round intended to touch so a repatch
+    # (which overwrote memory.patch_plan with the fixup plan) does not drop a
+    # file the first round created.  The narrower coverage check below uses the
+    # final plan only, to avoid false downgrades from first-round files that
+    # turned out unnecessary.
+    final_plan_files: list[str] = []
     if wm.patch_plan is not None:
-        planned_files = [edit.filepath for edit in wm.patch_plan.edits]
-    diff_text = _collect_git_diff(repo_dir, planned_files=planned_files)
+        final_plan_files = [edit.filepath for edit in wm.patch_plan.edits]
+    diff_planned_files = sorted(all_planned_files | set(final_plan_files))
+    diff_text = _collect_git_diff(repo_dir, planned_files=diff_planned_files)
     if diff_text.startswith("\ufeff"):
         diff_text = diff_text.lstrip("\ufeff")
 
-    # Plan-coverage check: every planned file must appear in the diff.
+    # Plan-coverage check: every file in the FINAL plan must appear in the diff.
     # If the generator silently dropped an edit (e.g. SEARCH mismatch it
     # failed to recover from), the outcome is a partial patch; downgrade
     # PATCH_SUCCESS so downstream eval sees the real state.
-    missing_from_diff = _verify_plan_coverage(diff_text, planned_files)
+    missing_from_diff = _verify_plan_coverage(diff_text, final_plan_files)
     if missing_from_diff and patch_outcome == "PATCH_SUCCESS":
         print(
             "[orchestrator] WARNING: planned files missing from patch.diff: "
@@ -964,6 +1629,7 @@ def run_orchestrator(
     repo_dir: str | Path,
     artifact_text: str,
     output_dir: str | Path,
+    problem_statement: str = "",
 ) -> Path:
     """Synchronous entry-point. Returns the path to evidence.json."""
     return asyncio.run(
@@ -972,5 +1638,6 @@ def run_orchestrator(
             repo_dir=repo_dir,
             artifact_text=artifact_text,
             output_dir=output_dir,
+            problem_statement=problem_statement,
         )
     )

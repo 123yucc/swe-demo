@@ -11,6 +11,14 @@ RequirementVerdict = Literal[
     "TO_BE_PARTIAL",
 ]
 
+# Subset used by deep-search output — UNCHECKED is not a valid investigation result.
+ActiveVerdict = Literal[
+    "AS_IS_COMPLIANT",
+    "AS_IS_VIOLATED",
+    "TO_BE_MISSING",
+    "TO_BE_PARTIAL",
+]
+
 RequirementOrigin = Literal["problem_statement", "requirements", "new_interfaces"]
 
 
@@ -183,5 +191,22 @@ class StructuralCard(BaseModel):
         description=(
             "Cross-cutting dependency paths: interface / package / config "
             "relationships that propagate changes across the codebase."
+        ),
+    )
+    consistency_anchors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Pairs of code points that MUST stay jointly consistent. "
+            "Format: '<endpoint_a> <-> <endpoint_b>' where each endpoint is "
+            "either 'path/to/file.ext:LINE', 'path/to/file.ext:LINE-LINE', "
+            "or 'path/to/file.ext:symbol:NAME' (symbol prefix may be 'class', "
+            "'func', 'type', 'enum', 'field', 'method', or 'name'). "
+            "Use this for: (a) configuration-file references that must have a "
+            "code-side definition, (b) renamed/visibility-changed symbols and "
+            "all their grep-visible callers (including same-package _test.* "
+            "files at base_commit), (c) new files and their mount/import sites. "
+            "Every anchor is machine-verified by the consistency code gate; "
+            "agent-invisible files (e.g. evaluator-injected hidden tests) are "
+            "out of scope and must not be referenced."
         ),
     )

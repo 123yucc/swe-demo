@@ -1,5 +1,5 @@
 diff --git a/lib/ansible/module_utils/urls.py b/lib/ansible/module_utils/urls.py
-index 7b3dcd7331..5a0018f05b 100644
+index 7b3dcd7331..e45c939cfb 100644
 --- a/lib/ansible/module_utils/urls.py
 +++ b/lib/ansible/module_utils/urls.py
 @@ -1307,7 +1307,7 @@ class Request:
@@ -11,14 +11,14 @@ index 7b3dcd7331..5a0018f05b 100644
          """This class works somewhat similarly to the ``Session`` class of from requests
          by defining a cookiejar that an be used across requests as well as cascaded defaults that
          can apply to repeated requests
-@@ -1345,6 +1345,7 @@ class Request:
-         self.unredirected_headers = unredirected_headers
-         self.decompress = decompress
-         self.ciphers = ciphers
+@@ -1330,6 +1330,7 @@ class Request:
+         if not isinstance(self.headers, dict):
+             raise ValueError("headers must be a dict: %r" % self.headers)
+         self.use_proxy = use_proxy
 +        self.use_netrc = use_netrc
-         if isinstance(cookies, cookiejar.CookieJar):
-             self.cookies = cookies
-         else:
+         self.force = force
+         self.timeout = timeout
+         self.validate_certs = validate_certs
 @@ -1361,7 +1362,7 @@ class Request:
               force_basic_auth=None, follow_redirects=None,
               client_cert=None, client_key=None, cookies=None, use_gssapi=False,
@@ -64,7 +64,7 @@ index 7b3dcd7331..5a0018f05b 100644
  
          if not use_proxy:
              proxyhandler = urllib_request.ProxyHandler({})
-@@ -1652,20 +1655,20 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+@@ -1652,7 +1655,7 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
               force_basic_auth=False, follow_redirects='urllib2',
               client_cert=None, client_key=None, cookies=None,
               use_gssapi=False, unix_socket=None, ca_path=None,
@@ -73,27 +73,17 @@ index 7b3dcd7331..5a0018f05b 100644
      '''
      Sends a request via HTTP(S) or FTP using urllib2 (Python2) or urllib (Python3)
  
-     Does not require the module environment
-     '''
-     method = method or ('POST' if data else 'GET')
--    return Request().open(method, url, data=data, headers=headers, use_proxy=use_proxy,
--                          force=force, last_mod_time=last_mod_time, timeout=timeout, validate_certs=validate_certs,
--                          url_username=url_username, url_password=url_password, http_agent=http_agent,
--                          force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
--                          client_cert=client_cert, client_key=client_key, cookies=cookies,
--                          use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
+@@ -1665,7 +1668,8 @@ def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+                           force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
+                           client_cert=client_cert, client_key=client_key, cookies=cookies,
+                           use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
 -                          unredirected_headers=unredirected_headers, decompress=decompress, ciphers=ciphers)
-+    return Request(use_netrc=use_netrc).open(method, url, data=data, headers=headers, use_proxy=use_proxy,
-+                                             force=force, last_mod_time=last_mod_time, timeout=timeout, validate_certs=validate_certs,
-+                                             url_username=url_username, url_password=url_password, http_agent=http_agent,
-+                                             force_basic_auth=force_basic_auth, follow_redirects=follow_redirects,
-+                                             client_cert=client_cert, client_key=client_key, cookies=cookies,
-+                                             use_gssapi=use_gssapi, unix_socket=unix_socket, ca_path=ca_path,
-+                                             unredirected_headers=unredirected_headers, decompress=decompress, ciphers=ciphers)
++                          unredirected_headers=unredirected_headers, decompress=decompress, ciphers=ciphers,
++                          use_netrc=use_netrc)
  
  
  def prepare_multipart(fields):
-@@ -1818,7 +1821,7 @@ def url_argument_spec():
+@@ -1818,7 +1822,7 @@ def url_argument_spec():
  def fetch_url(module, url, data=None, headers=None, method=None,
                use_proxy=None, force=False, last_mod_time=None, timeout=10,
                use_gssapi=False, unix_socket=None, ca_path=None, cookies=None, unredirected_headers=None,
@@ -102,7 +92,15 @@ index 7b3dcd7331..5a0018f05b 100644
      """Sends a request via HTTP(S) or FTP (needs the module as parameter)
  
      :arg module: The AnsibleModule (used to get username, password etc. (s.b.).
-@@ -1902,7 +1905,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+@@ -1839,6 +1843,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
+     :kwarg unredirected_headers: (optional) A list of headers to not attach on a redirected request
+     :kwarg decompress: (optional) Whether to attempt to decompress gzip content-encoded responses
+     :kwarg cipher: (optional) List of ciphers to use
++    :kwarg use_netrc: (optional) Whether to use credentials from ~/.netrc (Default: True)
+ 
+     :returns: A tuple of (**response**, **info**). Use ``response.read()`` to read the data.
+         The **info** contains the 'status' and other meta data. When a HttpError (status >= 400)
+@@ -1902,7 +1907,7 @@ def fetch_url(module, url, data=None, headers=None, method=None,
                       follow_redirects=follow_redirects, client_cert=client_cert,
                       client_key=client_key, cookies=cookies, use_gssapi=use_gssapi,
                       unix_socket=unix_socket, ca_path=ca_path, unredirected_headers=unredirected_headers,
@@ -215,17 +213,18 @@ index ee34ce5521..26ed9d2fd0 100644
      elapsed = (datetime.datetime.utcnow() - start).seconds
  
 diff --git a/lib/ansible/plugins/lookup/url.py b/lib/ansible/plugins/lookup/url.py
-index 50b0d7360a..5bd570da51 100644
+index 50b0d7360a..cf61efdc2a 100644
 --- a/lib/ansible/plugins/lookup/url.py
 +++ b/lib/ansible/plugins/lookup/url.py
-@@ -164,6 +164,17 @@ options:
-     ini:
-         - section: url_lookup
-           key: ciphers
+@@ -26,6 +26,18 @@ options:
+     description: Flag to control if the lookup will observe HTTP proxy environment variables when present.
+     type: boolean
+     default: True
 +  use_netrc:
-+    description: Whether to use credentials from the C(.netrc) file when no explicit credentials are provided.
++    description: Flag to control if the lookup will use credentials from the C(.netrc) file when present.
 +    type: boolean
 +    default: True
++    version_added: "2.14"
 +    vars:
 +        - name: ansible_lookup_url_use_netrc
 +    env:
@@ -233,10 +232,10 @@ index 50b0d7360a..5bd570da51 100644
 +    ini:
 +        - section: url_lookup
 +          key: use_netrc
- """
- 
- EXAMPLES = """
-@@ -230,6 +241,7 @@ class LookupModule(LookupBase):
+   username:
+     description: Username to use for HTTP authentication.
+     type: string
+@@ -230,6 +242,7 @@ class LookupModule(LookupBase):
                      ca_path=self.get_option('ca_path'),
                      unredirected_headers=self.get_option('unredirected_headers'),
                      ciphers=self.get_option('ciphers'),

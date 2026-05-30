@@ -11,7 +11,7 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.models.evidence import RequirementVerdict
+from src.models.evidence import ActiveVerdict
 
 
 class DeepSearchReport(BaseModel):
@@ -34,11 +34,12 @@ class DeepSearchReport(BaseModel):
             "Empty only when no requirement scope is active."
         ),
     )
-    requirement_verdict: RequirementVerdict = Field(
-        default="UNCHECKED",
+    requirement_verdict: ActiveVerdict = Field(
         description=(
-            "The verdict for target_requirement_id after on-site verification. "
-            "UNCHECKED is only valid when no requirement scope was set."
+            "REQUIRED. The verdict for target_requirement_id after on-site "
+            "verification. Choose one of: AS_IS_COMPLIANT, AS_IS_VIOLATED, "
+            "TO_BE_MISSING, TO_BE_PARTIAL. If you cannot fully determine the "
+            "status after investigation, use TO_BE_PARTIAL."
         ),
     )
     requirement_findings: str = Field(

@@ -8,9 +8,13 @@ rather than via the Agent tool dispatch.
 """
 
 import asyncio
+import hashlib
+import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -25,11 +29,206 @@ from src.models.patch import FileEditPlan, PatchPlan
 from src.tools.patch_tools import apply_search_replace
 
 
+AttemptOutcome = Literal["CHANGED", "IDEMPOTENT", "FAILED"]
+
+
+_IDEMPOTENT_MARKERS = (
+    "patch_applied",
+    "already",
+    "no change needed",
+    "no changes needed",
+    "no changes were needed",
+    "no substantive changes",
+    "correct state",
+    "correct target state",
+    "already in place",
+    "already conformant",
+)
+
+
+def _classify_attempt(
+    *,
+    hash_changed: bool,
+    tool_calls_delta: int,
+    result_text: str,
+) -> AttemptOutcome:
+    """Decide whether a sub-edit attempt succeeded.
+
+    Three outcomes:
+    - CHANGED: file content hash differs before/after (real edit applied).
+    - IDEMPOTENT: no hash change, but the model affirmed the file is already
+      at the target state (PATCH_APPLIED / "already correct" / etc.). This
+      is success — no retry, the patch plan was a no-op for this file.
+    - FAILED: no hash change, no idempotency signal. Real silent failure;
+      caller may retry.
+
+    tool_calls_delta is recorded for diagnostics but is no longer the primary
+    signal: a model that says "PATCH_APPLIED — already in target state"
+    without calling apply_search_replace is correct, not failed.
+    """
+    if hash_changed:
+        return "CHANGED"
+    lowered = result_text.lower()
+    if "patch_incomplete" in lowered:
+        return "FAILED"
+    for marker in _IDEMPOTENT_MARKERS:
+        if marker in lowered:
+            return "IDEMPOTENT"
+    return "FAILED"
+
+
+def _file_hash(path: Path) -> str | None:
+    """Return sha1 of *path* contents, or None if the file doesn't exist."""
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+class PatchFailureLogger:
+    """Append-only JSONL log for patch-generator failures.
+
+    Written to ``<output_dir>/patch_failures.log`` (jsonl, one event per line).
+    Three event kinds:
+    - ``attempt_failed``: a single sub-edit attempt classified as FAILED.
+    - ``file_summary``: per-file rollup written after all sub-edits + fallback.
+    - ``run_summary``: pipeline-level rollup written at the end of a run.
+
+    The logger is best-effort: any IO error is swallowed with a stderr print
+    so the patch pipeline itself never crashes because of logging.
+    """
+
+    def __init__(self, output_dir: Path | None) -> None:
+        self._path: Path | None = None
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._path = output_dir / "patch_failures.log"
+
+    def _write(self, payload: dict) -> None:
+        if self._path is None:
+            return
+        payload = {"ts": datetime.now(timezone.utc).isoformat(), **payload}
+        try:
+            with self._path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            print(f"[patch-generator] PatchFailureLogger write failed: {exc}", flush=True)
+
+    def attempt_failed(
+        self,
+        *,
+        filepath: str,
+        sub_label: str,
+        attempt_idx: int,
+        prompt_chars: int,
+        max_turns: int,
+        max_budget: float,
+        subtype: str,
+        limit_hit: str | None,
+        tool_calls_delta: int,
+        hash_changed: bool,
+        classification: AttemptOutcome,
+        result_preview: str,
+    ) -> None:
+        self._write(
+            {
+                "kind": "attempt_failed",
+                "file": filepath,
+                "sub_label": sub_label,
+                "attempt": attempt_idx,
+                "prompt_chars": prompt_chars,
+                "max_turns": max_turns,
+                "max_budget": max_budget,
+                "subtype": subtype,
+                "limit_hit": limit_hit,
+                "tool_calls_delta": tool_calls_delta,
+                "hash_changed": hash_changed,
+                "classification": classification,
+                "result_preview": result_preview,
+            }
+        )
+
+    def file_summary(
+        self,
+        *,
+        filepath: str,
+        sub_edits_total: int,
+        sub_edits_changed: int,
+        sub_edits_idempotent: int,
+        sub_edits_failed: int,
+        fallback_used: bool,
+        fallback_outcome: AttemptOutcome | None,
+        missing_from_diff: list[str],
+        final_status: str,
+    ) -> None:
+        self._write(
+            {
+                "kind": "file_summary",
+                "file": filepath,
+                "sub_edits_total": sub_edits_total,
+                "sub_edits_changed": sub_edits_changed,
+                "sub_edits_idempotent": sub_edits_idempotent,
+                "sub_edits_failed": sub_edits_failed,
+                "fallback_used": fallback_used,
+                "fallback_outcome": fallback_outcome,
+                "missing_from_diff": missing_from_diff,
+                "final_status": final_status,
+            }
+        )
+
+    def run_summary(
+        self,
+        *,
+        files_total: int,
+        files_succeeded: int,
+        files_failed: int,
+    ) -> None:
+        self._write(
+            {
+                "kind": "run_summary",
+                "files_total": files_total,
+                "files_succeeded": files_succeeded,
+                "files_failed": files_failed,
+            }
+        )
+
+
 def _safe_preview(text: str, limit: int = 1000) -> str:
     """Return a console-safe preview string for Windows GBK terminals."""
     preview = text[:limit].replace("\n", " | ")
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     return preview.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def _strip_mode_only_hunks(diff_text: str) -> str:
+    """Remove diff entries that contain only file-mode changes or submodule dirty markers."""
+    if not diff_text:
+        return diff_text
+    entries: list[str] = []
+    current_lines: list[str] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git ") and current_lines:
+            entries.append("".join(current_lines))
+            current_lines = []
+        current_lines.append(line)
+    if current_lines:
+        entries.append("".join(current_lines))
+
+    kept: list[str] = []
+    for entry in entries:
+        lines = entry.splitlines()
+        has_content = any(
+            (l.startswith("+") or l.startswith("-"))
+            and not l.startswith("--- ")
+            and not l.startswith("+++ ")
+            and "Subproject commit " not in l
+            for l in lines
+        )
+        if has_content:
+            kept.append(entry)
+    return "".join(kept)
 
 
 def _run_git_diff(repo_dir: Path, planned_files: list[str]) -> str:
@@ -90,7 +289,7 @@ def _run_git_diff(repo_dir: Path, planned_files: list[str]) -> str:
             flush=True,
         )
         return ""
-    return diff_result.stdout or ""
+    return _strip_mode_only_hunks(diff_result.stdout or "")
 
 
 def _planned_files_present_in_diff(diff_text: str, planned_files: list[str]) -> list[str]:
@@ -238,14 +437,61 @@ def _build_requirement_section(memory: SharedWorkingMemory, edit: FileEditPlan) 
     return "\n\n## Relevant Requirements (verbatim)\n" + "\n\n".join(req_lines)
 
 
-def _build_single_edit_prompt(memory: SharedWorkingMemory, edit: FileEditPlan) -> str:
-    """Construct a focused prompt for one file-level edit plan."""
+# Per-edit attempt count. Each subsequent attempt bumps max_turns and
+# budget so an edit silently truncated by turn-exhaustion gets a real
+# chance to finish. SWE-bench Pro requires all tests to pass, so a single
+# unfinished edit fails the whole case — give as much rope as needed.
+_SUB_EDIT_MAX_ATTEMPTS = 3
+# (max_turns, max_budget_usd) per attempt index (1-based, padded to last).
+_ATTEMPT_LIMITS = [(20, 0.75), (30, 1.2), (40, 1.8)]
+
+# Soft threshold: if the planner emits a single FileEditPlan with this many
+# functions or findings, log a warning. Phase-C (post-split-removal) the
+# planner is supposed to thematically split; a fat FileEditPlan signals it
+# ignored guidance and the edit will likely exhaust turn budget.
+_HEAVY_EDIT_FUNC_WARN = 8
+_HEAVY_EDIT_FINDING_WARN = 12
+
+
+def _warn_if_heavy(edit: FileEditPlan) -> None:
+    """Print a warning when a single FileEditPlan crosses heuristic
+    heaviness thresholds. Does NOT modify the plan or block execution —
+    the planner remains authoritative.
+    """
+    n_funcs = len(edit.target_functions)
+    n_findings = len(edit.preserved_findings)
+    if n_funcs >= _HEAVY_EDIT_FUNC_WARN or n_findings >= _HEAVY_EDIT_FINDING_WARN:
+        print(
+            f"[patch-generator] WARNING: heavy FileEditPlan for {edit.filepath} "
+            f"(target_functions={n_funcs}, preserved_findings={n_findings}). "
+            "Patch-planner should have split this thematically; expect long "
+            "prompts and possible turn-budget exhaustion.",
+            flush=True,
+        )
+
+
+def _build_single_edit_prompt(
+    memory: SharedWorkingMemory,
+    edit: FileEditPlan,
+    *,
+    sub_edit_label: str = "",
+    retry_preamble: str = "",
+) -> str:
+    """Construct a focused prompt for one (sub-)edit plan."""
     findings = "\n".join(f"- {item}" for item in edit.preserved_findings) or "- (none)"
     targets = ", ".join(edit.target_functions) or "(unspecified)"
     co_edits = ", ".join(edit.co_edit_dependencies) or "(none)"
     req_section = _build_requirement_section(memory, edit)
+    scope_note = (
+        f"Scope: this run patches ONLY function(s) {targets} in {edit.filepath}. "
+        "Do NOT touch other parts of the file.\n\n"
+        if sub_edit_label
+        else ""
+    )
     return (
+        f"{retry_preamble}"
         "Execute the following single-file patch plan. Only patch the target file in this run.\n\n"
+        f"{scope_note}"
         f"Patch plan overview:\n{memory.patch_plan.overview if memory.patch_plan else ''}\n\n"
         "## Target File Edit\n"
         f"filepath: {edit.filepath}\n"
@@ -257,31 +503,70 @@ def _build_single_edit_prompt(memory: SharedWorkingMemory, edit: FileEditPlan) -
         f"{req_section}\n\n"
         "Instructions:\n"
         "- Read the target file first.\n"
-        "- Apply minimal SEARCH/REPLACE edits only to this file.\n"
+        "- Apply minimal SEARCH/REPLACE edits only to the listed target_functions.\n"
         "- Respect preserved_findings as hard constraints.\n"
-        "- If this file cannot be patched, output PATCH_INCOMPLETE.\n"
+        "- You MUST call mcp__patch__apply_search_replace at least once before finishing.\n"
+        "- If this file cannot be patched, output PATCH_INCOMPLETE explicitly.\n"
         "- If the file is successfully patched, output PATCH_APPLIED.\n"
     )
 
 
-async def _run_single_file_patch(
-    memory: SharedWorkingMemory,
-    repo_dir: Path,
-    edit: FileEditPlan,
-) -> bool:
-    """Run a focused patch-generator query for a single file."""
-    prompt = _build_single_edit_prompt(memory, edit)
-    planned_files = [edit.filepath]
-    patch_actions_before = sum(
+def _count_apply_actions(memory: SharedWorkingMemory, filepath: str) -> int:
+    """Count apply_search_replace events recorded for *filepath*."""
+    return sum(
         1
         for event in memory.action_history
         if event.phase == "patch-generation"
         and event.subagent == "apply_search_replace"
-        and event.outcome.endswith(f":{edit.filepath}")
+        and event.outcome.endswith(f":{filepath}")
     )
 
+
+async def _attempt_sub_edit(
+    memory: SharedWorkingMemory,
+    repo_dir: Path,
+    edit: FileEditPlan,
+    *,
+    sub_edit_label: str,
+    attempt_idx: int,
+    retry_preamble: str,
+    failure_logger: PatchFailureLogger,
+) -> AttemptOutcome:
+    """Run one attempt at a single FileEditPlan.
+
+    Phase-C: the unit of work is a FileEditPlan (the planner's atomic edit
+    intent). Same filepath may legitimately appear in multiple
+    FileEditPlans, each with its own theme. The label parameter
+    ``sub_edit_label`` is a free-form display string used in logs only;
+    it stays named ``sub_edit_label`` to keep call sites stable but the
+    concept is now "edit attempt label".
+
+    Returns an AttemptOutcome:
+    - CHANGED: file hash changed after the attempt — real edit applied.
+    - IDEMPOTENT: hash unchanged but model signaled "already at target state"
+      via PATCH_APPLIED / "already correct" / similar — accept as success
+      without retry. Avoids the issue-010 pattern where a no-op edit gets
+      retried 3× because the model correctly declined to call MCP.
+    - FAILED: hash unchanged with no idempotency signal — true silent failure.
+
+    tool_calls_delta is logged for diagnostics but is no longer the success
+    criterion: file content + result text are the truth.
+    """
+    prompt = _build_single_edit_prompt(
+        memory,
+        edit,
+        sub_edit_label=sub_edit_label,
+        retry_preamble=retry_preamble,
+    )
+    actions_before = _count_apply_actions(memory, edit.filepath)
+    abs_target = repo_dir / edit.filepath
+    hash_before = _file_hash(abs_target)
+
+    limits_idx = min(attempt_idx, len(_ATTEMPT_LIMITS)) - 1
+    max_turns, max_budget = _ATTEMPT_LIMITS[limits_idx]
     print(
-        f"[patch-generator] Single-file prompt for {edit.filepath}: {len(prompt)} chars",
+        f"[patch-generator] {sub_edit_label} attempt {attempt_idx}: "
+        f"prompt={len(prompt)} chars, max_turns={max_turns}, max_budget=${max_budget}",
         flush=True,
     )
 
@@ -296,120 +581,305 @@ async def _run_single_file_patch(
         allowed_tools=["Read", "mcp__patch__apply_search_replace", "TodoWrite"],
         mcp_servers={"patch": patch_mcp},
         cwd=str(repo_dir),
-        max_turns=20,
-        max_budget_usd=0.75,
+        max_turns=max_turns,
+        max_budget_usd=max_budget,
         permission_mode="acceptEdits",
     )
 
     result_text = ""
     limit_hit: str | None = None
+    subtype = ""
     async with ClaudeSDKClient(options=options) as client:
         await client.query(prompt)
         async for message in client.receive_response():
             if isinstance(message, ResultMessage):
                 result_text = message.result or ""
-                if message.subtype in ("error_max_turns", "error_max_budget_usd"):
-                    limit_hit = message.subtype
-                print(
-                    f"[patch-generator] Received result for {edit.filepath} (subtype={message.subtype})",
-                    flush=True,
-                )
+                subtype = message.subtype or ""
+                if subtype in ("error_max_turns", "error_max_budget_usd"):
+                    limit_hit = subtype
 
-    if limit_hit is not None:
+    actions_after = _count_apply_actions(memory, edit.filepath)
+    delta = actions_after - actions_before
+    hash_after = _file_hash(abs_target)
+    hash_changed = (
+        hash_before is not None
+        and hash_after is not None
+        and hash_before != hash_after
+    )
+
+    classification = _classify_attempt(
+        hash_changed=hash_changed,
+        tool_calls_delta=delta,
+        result_text=result_text,
+    )
+
+    result_preview = _safe_preview(result_text, limit=400)
+    print(
+        f"[patch-generator] {sub_edit_label} attempt {attempt_idx} done: "
+        f"subtype={subtype} tool_calls_delta={delta} hash_changed={hash_changed} "
+        f"classification={classification} limit_hit={limit_hit} "
+        f"result='{result_preview}'",
+        flush=True,
+    )
+
+    if classification == "FAILED":
+        failure_logger.attempt_failed(
+            filepath=edit.filepath,
+            sub_label=sub_edit_label,
+            attempt_idx=attempt_idx,
+            prompt_chars=len(prompt),
+            max_turns=max_turns,
+            max_budget=max_budget,
+            subtype=subtype,
+            limit_hit=limit_hit,
+            tool_calls_delta=delta,
+            hash_changed=hash_changed,
+            classification=classification,
+            result_preview=result_preview,
+        )
+
+    return classification
+
+
+def _retry_preamble_for(
+    sub_edit_label: str,
+    prior_attempt_signal: str,
+) -> str:
+    """Compose a directive preamble for retry attempts."""
+    return (
+        f"PRIOR ATTEMPT FOR {sub_edit_label} FAILED ({prior_attempt_signal}).\n"
+        "Common cause: too many turns spent thinking before producing the first "
+        "SEARCH/REPLACE block. To avoid this:\n"
+        "1. Issue exactly ONE Read on the target file.\n"
+        "2. Immediately produce SEARCH/REPLACE blocks and call "
+        "mcp__patch__apply_search_replace.\n"
+        "3. Skip TodoWrite and skip extended deliberation.\n"
+        "4. Output PATCH_APPLIED on success or PATCH_INCOMPLETE on failure.\n\n"
+    )
+
+
+async def _run_single_edit(
+    memory: SharedWorkingMemory,
+    repo_dir: Path,
+    edit: FileEditPlan,
+    edit_idx: int,
+    edit_total: int,
+    failure_logger: PatchFailureLogger,
+    prior_changed_files: set[str] | None = None,
+) -> bool:
+    """Run patch generation for a single FileEditPlan (atomic unit).
+
+    Phase-C contract: the patch-planner is responsible for thematic split.
+    Each FileEditPlan is a focused, self-contained edit. The patch-generator
+    no longer attempts to re-split heavy edits — it just retries with
+    progressively higher turn/budget limits and reports failure cleanly.
+
+    Pipeline:
+    1. Optional warning if the FileEditPlan is heuristically "heavy"
+       (planner ignored thematic-split guidance). Does not block.
+    2. Up to _SUB_EDIT_MAX_ATTEMPTS attempts. CHANGED or IDEMPOTENT both
+       count as success; FAILED triggers retry.
+    3. Final acceptance: success classification AND the file appears in
+       `git diff` for its planned path. A fully-IDEMPOTENT FileEditPlan
+       with no diff signals the planner asked for a no-op edit; the
+       coverage check catches that and downgrades to failure.
+    """
+    _warn_if_heavy(edit)
+
+    # Same filepath may appear in multiple FileEditPlans (phase C). Label
+    # disambiguates per-edit so logs are unambiguous; downstream tools
+    # parse this label as opaque.
+    primary_func = (
+        edit.target_functions[0]
+        if edit.target_functions
+        else "(file-wide pass)"
+    )
+    edit_label = f"{edit.filepath} edit {edit_idx}/{edit_total} ({primary_func})"
+
+    outcome: AttemptOutcome = "FAILED"
+    prior_signal = "no apply_search_replace tool call"
+    for attempt in range(1, _SUB_EDIT_MAX_ATTEMPTS + 1):
+        preamble = (
+            ""
+            if attempt == 1
+            else _retry_preamble_for(edit_label, prior_signal)
+        )
+        outcome = await _attempt_sub_edit(
+            memory,
+            repo_dir,
+            edit,
+            sub_edit_label=edit_label,
+            attempt_idx=attempt,
+            retry_preamble=preamble,
+            failure_logger=failure_logger,
+        )
+        if outcome in ("CHANGED", "IDEMPOTENT"):
+            break
+
+    if outcome == "CHANGED":
+        memory.record_action(
+            phase="patch-generation",
+            subagent="patch-generator",
+            outcome=f"EDIT_SUCCESS:{edit_label}",
+        )
+    elif outcome == "IDEMPOTENT":
         print(
-            f"[patch-generator] aborted for {edit.filepath} due to per-query limit: {limit_hit}",
+            f"[patch-generator] {edit_label}: idempotent (file already at target state)",
             flush=True,
         )
-        return False
-
-    result_preview = _safe_preview(result_text)
-    print(
-        f"[patch-generator] Final result for {edit.filepath} (first 1000 chars): {result_preview}",
-        flush=True,
-    )
-
-    has_patch_applied = "PATCH_APPLIED" in result_text
-    has_patch_incomplete = "PATCH_INCOMPLETE" in result_text
-    has_error = "ERROR" in result_text
-
-    patch_actions_after = sum(
-        1
-        for event in memory.action_history
-        if event.phase == "patch-generation"
-        and event.subagent == "apply_search_replace"
-        and event.outcome.endswith(f":{edit.filepath}")
-    )
-    applied_tool_calls = patch_actions_after - patch_actions_before
-    diff_text = _run_git_diff(repo_dir, planned_files)
-    missing_from_diff = _planned_files_present_in_diff(diff_text, planned_files)
-
-    print(
-        "[patch-generator] Verification: "
-        f"file={edit.filepath}, tool_calls_delta={applied_tool_calls}, missing_from_diff={missing_from_diff}",
-        flush=True,
-    )
-
-    if has_patch_applied and not missing_from_diff:
-        if applied_tool_calls <= 0:
+        memory.record_action(
+            phase="patch-generation",
+            subagent="patch-generator",
+            outcome=f"EDIT_IDEMPOTENT:{edit_label}",
+        )
+    else:
+        # If every attempt returned empty (no tool calls, no result text) AND
+        # a prior edit in this run already CHANGED the same file, the most
+        # likely explanation is that the file-wide rename/rewrite made all
+        # subsequent per-function edits no-ops: the LLM reads the already-
+        # patched file, sees nothing left to do, and returns silently instead
+        # of saying "PATCH_APPLIED". Treat this as IDEMPOTENT rather than
+        # failure so the overall patch is not aborted.  The coverage check
+        # below (missing_from_diff) still applies: if the file really did not
+        # change at all we will catch it there.
+        filepath_norm = edit.filepath.replace("\\", "/")
+        prior = prior_changed_files or set()
+        if filepath_norm in prior:
             print(
-                f"[patch-generator] PATCH_APPLIED for {edit.filepath} but no apply_search_replace action was captured; trusting git diff verification",
+                f"[patch-generator] {edit_label}: silent after prior CHANGED edit "
+                f"for same file — promoting to IDEMPOTENT (prior edit likely covered it)",
                 flush=True,
             )
-        return True
-    if has_patch_incomplete or has_error:
-        return False
-    return False
+            outcome = "IDEMPOTENT"
+            memory.record_action(
+                phase="patch-generation",
+                subagent="patch-generator",
+                outcome=f"EDIT_IDEMPOTENT_PROMOTED:{edit_label}",
+            )
+        else:
+            print(
+                f"[patch-generator] {edit_label}: gave up after {_SUB_EDIT_MAX_ATTEMPTS} attempts",
+                flush=True,
+            )
+            memory.record_action(
+                phase="patch-generation",
+                subagent="patch-generator",
+                outcome=f"EDIT_FAILED:{edit_label}",
+            )
+
+    diff_text = _run_git_diff(repo_dir, [edit.filepath])
+    missing_from_diff = _planned_files_present_in_diff(diff_text, [edit.filepath])
+    print(
+        f"[patch-generator] Verification: {edit_label} "
+        f"outcome={outcome} missing_from_diff={missing_from_diff}",
+        flush=True,
+    )
+
+    edit_ok = outcome in ("CHANGED", "IDEMPOTENT") and not missing_from_diff
+    final_status = "PATCH_SUCCESS" if edit_ok else "PATCH_FAILED"
+    failure_logger.file_summary(
+        filepath=edit.filepath,
+        sub_edits_total=1,
+        sub_edits_changed=1 if outcome == "CHANGED" else 0,
+        sub_edits_idempotent=1 if outcome == "IDEMPOTENT" else 0,
+        sub_edits_failed=1 if outcome == "FAILED" else 0,
+        fallback_used=False,
+        fallback_outcome=None,
+        missing_from_diff=missing_from_diff,
+        final_status=final_status,
+    )
+
+    return edit_ok
 
 
 async def _run_patch_generator_async(
     memory: SharedWorkingMemory,
     repo_dir: Path,
+    output_dir: Path | None = None,
 ) -> bool:
-    """Run the patch generator agent. Returns True if all patches applied."""
+    """Run the patch generator agent. Returns True iff every FileEditPlan applied.
+
+    Phase-C model: each FileEditPlan is an atomic unit. Same filepath may
+    appear multiple times in plan.edits — each instance is its own focused
+    edit (e.g. "field rename pass" + "audit context fix" both targeting
+    forwarder.go). The generator no longer splits or merges; it just runs
+    each FileEditPlan with attempt-level retries.
+
+    No early-abort: each edit is attempted independently regardless of prior
+    failures.  This is required for SWE-bench Pro scoring, which only credits
+    a case when the entire test suite passes — partial coverage is worthless,
+    so an aborted failing edit should not silently kill remaining edits.
+
+    When *output_dir* is provided, structured failure events are appended to
+    ``<output_dir>/patch_failures.log`` (jsonl) for post-mortem analysis.
+    """
+    failure_logger = PatchFailureLogger(output_dir)
+
     sanitized_plan = _sanitize_patch_plan(memory, repo_dir)
     if sanitized_plan is None or not sanitized_plan.edits:
-        print("[patch-generator] No valid planned files remain after sanitization", flush=True)
+        print("[patch-generator] No valid planned edits remain after sanitization", flush=True)
+        failure_logger.run_summary(files_total=0, files_succeeded=0, files_failed=0)
         return False
 
+    edit_total = len(sanitized_plan.edits)
     print(
-        f"[patch-generator] Running focused patch generation for {len(sanitized_plan.edits)} files",
+        f"[patch-generator] Running focused patch generation for {edit_total} edits",
         flush=True,
     )
     for edit in sanitized_plan.edits:
         print(
-            f"  - {edit.filepath} ({len(edit.preserved_findings)} preserved_findings)",
+            f"  - {edit.filepath} ({len(edit.preserved_findings)} preserved_findings, "
+            f"{len(edit.target_functions)} target_functions)",
             flush=True,
         )
 
-    all_succeeded = True
-    for edit in sanitized_plan.edits:
-        ok = await _run_single_file_patch(memory, repo_dir, edit)
+    edits_succeeded = 0
+    edits_failed = 0
+    changed_files: set[str] = set()
+    for edit_idx, edit in enumerate(sanitized_plan.edits, 1):
+        ok = await _run_single_edit(
+            memory, repo_dir, edit, edit_idx, edit_total, failure_logger,
+            prior_changed_files=changed_files,
+        )
         if ok:
+            edits_succeeded += 1
+            # Track files where an edit actually landed so subsequent edits
+            # for the same file can detect "prior CHANGED" promotion.
+            changed_files.add(edit.filepath.replace("\\", "/"))
             memory.record_action(
                 phase="patch-generation",
                 subagent="patch-generator",
                 outcome=f"PATCH_SUCCESS:{edit.filepath}",
             )
-            continue
-        memory.record_action(
-            phase="patch-generation",
-            subagent="patch-generator",
-            outcome=f"PATCH_FAILED:{edit.filepath}",
-        )
-        all_succeeded = False
-        break
+        else:
+            edits_failed += 1
+            memory.record_action(
+                phase="patch-generation",
+                subagent="patch-generator",
+                outcome=f"PATCH_FAILED:{edit.filepath}",
+            )
 
-    return all_succeeded
+    failure_logger.run_summary(
+        files_total=edit_total,
+        files_succeeded=edits_succeeded,
+        files_failed=edits_failed,
+    )
+    return edits_failed == 0
 
 
-def run_patch_generator(memory: SharedWorkingMemory, repo_dir: Path) -> bool:
+def run_patch_generator(
+    memory: SharedWorkingMemory,
+    repo_dir: Path,
+    output_dir: Path | None = None,
+) -> bool:
     """Synchronous wrapper.
 
     Args:
         memory: SharedWorkingMemory with patch plan and cached code.
         repo_dir: Repository root directory.
+        output_dir: Optional directory where patch_failures.log is written.
 
     Returns:
         True if patches were successfully applied.
     """
-    return asyncio.run(_run_patch_generator_async(memory, repo_dir))
+    return asyncio.run(_run_patch_generator_async(memory, repo_dir, output_dir))

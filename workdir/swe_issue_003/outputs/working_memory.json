@@ -3,12 +3,12 @@
   "evidence_cards": {
     "symptom": {
       "observable_failures": [
-        "Requests to `.well-known/webfinger` result in a 404 since no such endpoint exists.",
-        "The `.well-known/change-password` route is defined within the user-specific route file, which does not align with its global utility purpose."
+        "Requests to .well-known/webfinger result in a 404 since no such endpoint exists.",
+        "The .well-known/change-password route is defined within the user-specific route file, which does not align with its global utility purpose."
       ],
       "repair_targets": [
-        "The application should serve valid WebFinger responses at `.well-known/webfinger`, allowing compliant clients to discover user identity metadata.",
-        "The `.well-known/change-password` route should be handled through a centralized router dedicated to `.well-known` assets, improving modularity and clarity of route definitions."
+        "The application should serve valid WebFinger responses at .well-known/webfinger, allowing compliant clients to discover user identity metadata.",
+        "The .well-known/change-password route should be handled through a centralized router dedicated to .well-known assets, improving modularity and clarity of route definitions."
       ],
       "regression_expectations": []
     },
@@ -17,100 +17,125 @@
       "behavioral_constraints": [],
       "backward_compatibility": [],
       "similar_implementation_patterns": [
-        "src/routes/user.js:40-42 — existing /.well-known/change-password redirect (inline, not modular)",
-        "src/routes/meta.js — pattern for well-known-style static/meta routes (sitemap, robots, manifest)",
-        "src/prestart.js:94 — nconf.set('url_parsed', url.parse(nconf.get('url'))) establishes the config key whose .hostname property the handler must read",
-        "src/middleware/user.js:138-147 — canViewUsers middleware: privileges.global.can('view:users', req.uid) → controllers.helpers.notAllowed(req, res) on false",
-        "src/controllers/user.js:64-66 — getUserDataByUID: same privilege check, throws [[error:no-privileges]] on false",
-        "src/privileges/helpers.js:15-18 — uidToSystemGroup maps uid=0 to 'guests', uid=-1 to 'spiders'; anonymous req.uid=0 is automatically evaluated as Guest role",
-        "src/routes/meta.js — pattern for static/meta routes (sitemap, robots, manifest) that return structured responses",
-        "src/controllers/user.js — contains user lookup logic (uid-from-slug resolution) that the aliases construction will need; exact function name not confirmed in this reflection pass",
-        "src/routes/index.js:19-25 — _mounts pattern: each module is required here then called in addCoreRoutes",
-        "src/routes/index.js:153 — _mounts.meta(router, middleware, controllers) — reference call signature for the new well-known mount",
-        "src/middleware/user.js:138-147 — canViewUsers middleware: privileges.global.can('view:users', req.uid) -> controllers.helpers.notAllowed(req, res) on false",
-        "src/privileges/helpers.js:15-18 — uidToSystemGroup maps uid=0 to 'guests'; anonymous req.uid=0 is automatically evaluated as Guest role with no special-casing needed",
-        "src/controllers/index.js:322-327 -- Controllers.manifest: async function builds and returns res.status(200).json(data.manifest) — same JSON response pattern the webfinger handler must use",
-        "src/middleware/user.js:138-147 -- canViewUsers: privileges.global.can('view:users', req.uid) -> controllers.helpers.notAllowed on false — direct reference for the auth check pattern",
-        "src/controllers/user.js:60-66 -- getUserDataByUID: same privilege check pattern with thrown error on failure (API context); webfinger handler should use notAllowed instead for HTTP context",
-        "src/privileges/helpers.js:15-18 -- uidToSystemGroup: {0:'guests','-1':'spiders'} — anonymous uid=0 auto-evaluates as Guest with no special-casing needed in the handler",
-        "src/routes/meta.js — pattern for a standalone route module exporting function(router, middleware, controllers) that registers static/meta routes"
+        "src/routes/meta.js — observed via src/routes/index.js:19-25 to be registered as _mounts.meta; same mounting pattern applies to the new well-known router (internal structure of meta.js not read in detail during this investigation)",
+        "src/routes/user.js:40-42 — inline app.use for /.well-known/change-password shows the redirect pattern to be migrated into the new router",
+        "src/routes/user.js:15 — setupPageRoute(app, '/me', [], middleware.redirectMeToUserslug) uses empty middleware array to allow unauthenticated access, same pattern as the change-password redirect",
+        "src/routes/meta.js — registered via _mounts.meta at src/routes/index.js:153; structural analogue for the new well-known router module",
+        "src/routes/user.js:40-42 — existing /.well-known/change-password redirect; shows the .well-known path space is already partially used within the app",
+        "src/controllers/user.js:64-66 — privileges.global.can('view:users', callerUid) + throw [[error:no-privileges]] on denial; direct analogue for the privilege check in the webfinger handler",
+        "src/middleware/user.js:138-147 — canViewUsers middleware using privileges.global.can('view:users', req.uid) at line 142 + controllers.helpers.notAllowed(req, res) at line 146 on denial; shows the middleware-level variant of the same pattern",
+        "src/privileges/helpers.js:15-18 — uidToSystemGroup map: 0 -> 'guests'; confirms that passing req.uid=0 to privileges.global.can automatically evaluates under the Guest role via isAllowedToPrivileges:73 without extra branching in the controller",
+        "src/routes/meta.js — registered via _mounts at src/routes/index.js:19-25 and invoked at lines 153-159; direct structural analogue for the new well-known router module",
+        "src/routes/user.js:40-42 — existing /.well-known/change-password redirect that the new router must absorb",
+        "src/routes/index.js:21 — `meta: require('./meta')` in _mounts; structural template for adding `wellKnown: require('./well-known')`",
+        "src/routes/index.js:153 — `_mounts.meta(router, middleware, controllers)` in addCoreRoutes; template for `_mounts.wellKnown(router, middleware, controllers)`",
+        "src/controllers/user.js:64-66 — privileges.global.can('view:users', callerUid) + throw [[error:no-privileges]] on denial; direct analogue for the controller-level check req-009 requires",
+        "src/middleware/user.js:138-147 — canViewUsers middleware: privileges.global.can('view:users', req.uid) at line 142 + controllers.helpers.notAllowed(req,res) at line 146; shows how to translate a false result into a 403-class response",
+        "src/privileges/helpers.js:15-18 — uidToSystemGroup map: 0 -> 'guests'; confirms uid=0 automatically evaluates under Guest role with no extra branching",
+        "src/privileges/helpers.js:73 — parseInt(uidOrGroupName,10) <= 0 branch routes to isSystemGroupAllowedToPrivileges; the exact path traversed for unauthenticated callers",
+        "src/controllers/index.js:36-37 — Controllers['404'] = require('./404') shows bracket-key registration pattern for the new Controllers['well-known'] entry",
+        "src/controllers/index.js:36 — Controllers.osd = require('./osd') shows the dot-key variant; well-known should use bracket notation consistent with '404'",
+        "src/controllers/osd.js — module.exports named-export pattern (e.g. module.exports.handle); webfinger would use module.exports.webfinger in the same style",
+        "src/controllers/user.js — privileges.global.can('view:users', callerUid) with error throw on denial; direct analogue for the 403 gate",
+        "src/middleware/user.js — canViewUsers middleware using privileges.global.can + notAllowed on false result; shows the standard privilege-check idiom",
+        "src/privileges/global.js — privileges.global.can API entry point used for view:users checks throughout the codebase",
+        "src/routes/index.js:19-21 -- object-literal property `meta: require('./meta')` shows the require pattern; wellKnown would follow as `wellKnown: require('./well-known')`",
+        "src/routes/index.js:153 -- `_mounts.meta(router, middleware, controllers)` shows the invocation pattern used inside addCoreRoutes",
+        "src/routes/user.js:40-42 -- existing inline /.well-known/change-password redirect that the new router must absorb and this location must lose"
       ],
       "missing_elements_to_implement": [
-        "Controller: WebFinger handler | Name: webfinger | Type: Function | Location: src/controllers/well-known.js | Input: req: Request (expects query param resource), res: Response | Output: HTTP 200 with JSON { subject, aliases, links } on success; HTTP 400 / 403 / 404 on validation/authorization/not-found cases | Description: Handles GET /.well-known/webfinger. Validates resource, checks authorization, resolves the username (slug) to a UID, and returns a structured WebFinger JSON payload (subject set to the original resource, aliases with UID- and slug-based URLs, and links including an entry for the user's HTML profile). When req.uid is absent, authorization should be evaluated as the Guest role, and access should be gated by the groups:view:users global permission.",
-        "Router: .well-known routes initializer | Name: .well-known routes initializer | Type: Function (route configuration module) | Location: src/routes/well-known.js | Input: (app, middleware, controllers) | Output: Registers routes and returns void | Description: Mounts /.well-known/change-password: redirects to /me/edit/password, and registers GET /.well-known/webfinger, delegating to controllers['well-known'].webfinger. Integrated into the main route composition, so it's mounted at app startup."
+        "Controller: WebFinger handler — Name: webfinger, Type: Function, Location: src/controllers/well-known.js, Input: req: Request (expects query param resource), res: Response, Output: HTTP 200 with JSON { subject, aliases, links } on success; HTTP 400 / 403 / 404 on validation/authorization/not-found cases",
+        "Router: .well-known routes initializer — Name: .well-known routes initializer, Type: Function (route configuration module), Location: src/routes/well-known.js, Input: (app, middleware, controllers), Output: Registers routes and returns void; mounts /.well-known/change-password redirecting to /me/edit/password, and registers GET /.well-known/webfinger delegating to controllers['well-known'].webfinger"
       ]
     },
     "localization": {
       "suspect_entities": [
-        "src/routes/well-known.js",
-        "src/controllers/well-known.js",
-        "src/routes/user.js",
         "src/routes/index.js",
+        "src/routes/user.js",
+        "src/controllers/well-known.js",
+        "src/routes/well-known.js",
+        "src/prestart.js",
+        "src/controllers/well-known.js (absent)",
         "src/privileges/global.js",
         "src/privileges/helpers.js",
-        "src/controllers/helpers.js",
+        "src/routes/well-known.js (absent)",
+        "src/controllers/user.js",
+        "src/middleware/user.js",
         "src/controllers/index.js"
       ],
       "exact_code_regions": [
-        "src/routes/user.js:40-42",
         "src/routes/index.js:19-25",
+        "src/routes/user.js:40-42",
         "src/routes/user.js:7-13",
+        "src/routes/index.js:153-159",
         "src/prestart.js:94",
-        "src/routes/index.js:152-160",
         "src/privileges/global.js:108-117",
         "src/privileges/helpers.js:15-18",
-        "src/privileges/helpers.js:57-58",
-        "src/privileges/helpers.js:73-74",
-        "src/controllers/helpers.js:125-153",
-        "src/controllers/index.js:14-41",
-        "src/controllers/helpers.js:125-159"
+        "src/privileges/helpers.js:65-79",
+        "src/controllers/user.js:64-66",
+        "src/middleware/user.js:138-147",
+        "src/routes/index.js:152-159",
+        "src/install.js:437",
+        "src/controllers/index.js:36-37",
+        "src/controllers/index.js:14-41"
       ],
       "call_chain_context": [
-        "app startup -> src/webserver.js:103 -> src/routes/index.js (routes()) -> [no well-known module mounted]",
-        "app startup -> src/webserver.js:103 (await routes(app, middleware)) -> src/routes/index.js:20 (user: require('./user')) -> src/routes/user.js:40 (app.use('/.well-known/change-password', inline handler))",
-        "No call chain exists — src/controllers/well-known.js is absent, so no handler is reachable from any route",
-        "GET /.well-known/webfinger -> [no route registered] -> [no handler reachable] -> authorization check never executed",
-        "Intended chain: GET /.well-known/webfinger -> src/routes/well-known.js (TO_BE_MISSING) -> src/controllers/well-known.js:webfinger (TO_BE_MISSING) -> privileges.global.can('view:users', req.uid) [src/privileges/global.js:108] -> helpers.isAllowedTo [src/privileges/helpers.js:30] -> uid=0 maps to 'guests' [src/privileges/helpers.js:57-58] -> 403 via controllers.helpers.notAllowed [src/controllers/helpers.js:125] if denied",
-        "GET /.well-known/webfinger -> [no route registered in src/routes/index.js] -> [no handler reachable] -> structured JSON response never sent",
-        "app startup -> src/routes/index.js -> _mounts object (lines 19-25) -> no well-known module present (verified)",
-        "src/routes/user.js:40 registers /.well-known/change-password inline — this is the only .well-known route in the entire app (verified)",
-        "app startup -> (inferred, not Read-verified) src/routes/index.js -> src/routes/user.js:40 (app.use('/.well-known/change-password', inline handler)) — route still lives here, not in a well-known module",
-        "app startup -> src/webserver.js -> src/routes/index.js:module.exports -> addCoreRoutes(app, router, middleware, mounts) [line 147] -> _mounts.meta / .api / .feed / .main / .mod / .globalMod called [lines 153-159] — no _mounts['well-known'] call present",
-        "Intended chain (inferred; src/routes/well-known.js was not independently verified as absent): GET /.well-known/webfinger -> src/routes/well-known.js -> src/controllers/well-known.js:webfinger (TO_BE_MISSING) -> privileges.global.can('view:users', req.uid) [src/privileges/global.js:108] -> helpers.isAllowedTo [src/privileges/helpers.js:30] -> parseInt(uid)<=0 branch [src/privileges/helpers.js:57,73] -> isSystemGroupAllowedToPrivileges -> uidToSystemGroup[0]='guests' [src/privileges/helpers.js:15-18] -> 403 via controllers.helpers.notAllowed [src/controllers/helpers.js:125] if denied",
-        "GET /.well-known/webfinger -> [no route registered] -> [no handler reachable] -> src/controllers/well-known.js (absent) -> webfinger() (absent)",
-        "Intended chain: GET /.well-known/webfinger -> src/routes/well-known.js (TO_BE_MISSING) -> controllers['well-known'].webfinger (TO_BE_MISSING) -> privileges.global.can('view:users', req.uid) [src/privileges/global.js:108] -> uidToSystemGroup[0]='guests' [src/privileges/helpers.js:15-18] -> 403/401 via controllers.helpers.notAllowed [src/controllers/helpers.js:125] if denied -> resource param validation -> user slug resolution -> res.status(200).json({subject, aliases, links})",
-        "app startup -> src/routes/index.js:addCoreRoutes (line 152) -> _mounts object (lines 19-25) -> no well-known key present -> src/routes/well-known.js never required or called",
-        "GET /.well-known/change-password -> src/routes/user.js:40 (inline handler, not in well-known module) -> res.redirect('/me/edit/password')",
-        "GET /.well-known/webfinger -> [no route registered anywhere] -> [no handler reachable] -> src/controllers/well-known.js (absent)"
+        "app startup -> src/routes/index.js (_mounts composition) -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger",
+        "HTTP request -> app.use('/.well-known/change-password') @ src/routes/user.js:40 -> res.redirect('/me/edit/password') @ src/routes/user.js:41 (no middleware in chain)",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger -> validate resource -> lookup user -> return 400/404/200",
+        "app startup -> src/routes/index.js:153-159 (_mounts invocations) -> [missing] _mounts.wellKnown -> [missing] src/routes/well-known.js",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger -> privileges.global.can('view:users', req.uid) -> src/privileges/global.js:108 -> helpers.isAllowedTo([privilege], uid, 0) -> isAllowedToPrivileges (helpers.js:65) -> [uid<=0] isSystemGroupAllowedToPrivileges('guests') at helpers.js:73-74 -> return 403 if false",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger -> construct { subject, aliases, links } -> res.json(payload)",
+        "app startup -> src/routes/index.js (_mounts composition, lines 19-25) -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger (name from req-006 spec)",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger (name from req-006 spec)",
+        "HTTP request /.well-known/change-password -> currently: src/routes/user.js:40-42 (inline redirect) -> TO BE: src/routes/well-known.js (dedicated router)",
+        "HTTP request /.well-known/change-password -> currently: src/routes/user.js:40-42 (inline app.use redirect) -> TO BE: src/routes/well-known.js (dedicated router)",
+        "app startup -> src/routes/index.js:addCoreRoutes (line 152) -> [missing] _mounts.wellKnown -> [missing] src/routes/well-known.js",
+        "HTTP GET /.well-known/webfinger -> [missing] src/controllers/well-known.js#webfinger -> privileges.global.can('view:users', req.uid || 0) -> src/privileges/global.js:108 privsGlobal.can -> helpers.isAllowedTo(['view:users'], uid, 0) at line 112 -> src/privileges/helpers.js:65 isAllowedToPrivileges -> line 73: parseInt(uid)<=0 -> isSystemGroupAllowedToPrivileges('guests') -> return false if Guest lacks view:users -> 403 Forbidden",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger -> validate resource (400) -> privileges.global.can('view:users', req.uid||0) (403) -> user slug resolution (404) -> res.json({ subject, aliases, links }) (200)",
+        "app startup -> src/controllers/index.js:37 [missing Controllers['well-known']] -> [missing] src/controllers/well-known.js",
+        "app startup -> src/routes/index.js:addCoreRoutes (line 152) -> [missing] _mounts.wellKnown(router, middleware, controllers) -> [missing] src/routes/well-known.js",
+        "HTTP GET /.well-known/webfinger -> [missing] src/routes/well-known.js -> [missing] src/controllers/well-known.js#webfinger"
       ],
       "dataflow_relevant_uses": [
-        "req.uid (0 for anonymous) -> privileges.global.can('view:users', req.uid) [src/privileges/global.js:108] -> helpers.isAllowedTo [src/privileges/helpers.js:30] -> parseInt(uid) <= 0 branch [src/privileges/helpers.js:57,73] -> isSystemGroupAllowedTo* resolves 'guests' group membership [src/privileges/helpers.js:16]",
-        "req.uid (0 for anonymous) -> privileges.global.can('view:users', req.uid) [src/privileges/global.js:108] -> helpers.isAllowedTo(['view:users'], 0, 0) [src/privileges/global.js:112] -> isAllowedToPrivileges [src/privileges/helpers.js] -> parseInt(0)<=0 branch [src/privileges/helpers.js:73] -> isSystemGroupAllowedToPrivileges [src/privileges/helpers.js] -> uidToSystemGroup[0]='guests' [src/privileges/helpers.js:15-16] -> groups.isMemberOfGroups('guests', ['cid:0:privileges:groups:view:users']) -> boolean result -> 403 via controllers.helpers.notAllowed [src/controllers/helpers.js:125] if false",
-        "privileges.global.can('view:users', uid) defined at src/privileges/global.js:108 — used by middleware.canViewUsers at src/middleware/user.js:142 and getUserDataByUID at src/controllers/user.js:64; webfinger handler must use same pattern",
-        "uidToSystemGroup defined at src/privileges/helpers.js:15-18 — consumed by helpers.isAllowedTo to resolve uid=0 to 'guests' group; no special-casing needed in webfinger handler",
-        "controllers.helpers.notAllowed defined at src/controllers/helpers.js:125 — called by middleware.canViewUsers at src/middleware/user.js:146; webfinger handler must call same function on privilege denial"
+        "src/prestart.js:94 — nconf.set('url_parsed', url.parse(nconf.get('url'))) — sets the parsed URL object whose .hostname property the validation must read",
+        "req.uid (undefined or 0 for unauthenticated) -> coerced to 0 via (req.uid || 0) -> passed to privileges.global.can at src/privileges/global.js:108 -> forwarded to helpers.isAllowedTo at line 112 as [privilege] array with cid=0 -> isAllowedToPrivileges at helpers.js:65 -> line 73: parseInt(0)<=0 routes to isSystemGroupAllowedToPrivileges -> uses uidToSystemGroup[0]='guests' (helpers.js:16) -> evaluates cid:0:privileges:groups:view:users membership for guests group"
       ]
     },
     "structural": {
       "must_co_edit_relations": [
-        "If src/routes/well-known.js is created -> src/routes/index.js must be updated to mount it",
-        "If src/controllers/well-known.js is created -> src/routes/well-known.js must import and delegate to it",
-        "src/routes/well-known.js (create) -> src/routes/index.js:19-25 must add well-known to _mounts",
-        "src/controllers/well-known.js (create) -> src/routes/well-known.js must require and delegate to it",
-        "src/routes/user.js:40-42 must have the change-password route removed once src/routes/well-known.js owns it",
-        "If src/routes/well-known.js is created -> src/routes/index.js must be updated to mount it (per req-008)",
-        "src/routes/index.js:152-160 must call _mounts['well-known'] once the module exists",
-        "src/controllers/well-known.js (create) -> src/controllers/index.js must add Controllers['well-known'] = require('./well-known')",
-        "src/controllers/well-known.js (create) -> src/routes/well-known.js (create) must require and call controllers['well-known'].webfinger",
-        "src/routes/well-known.js (create) -> src/routes/index.js must add well-known to _mounts and invoke it in addCoreRoutes"
+        "If src/routes/well-known.js is created -> src/routes/index.js:19-25 must also be updated to require and mount it",
+        "If src/controllers/well-known.js is created -> src/routes/well-known.js must reference the webfinger handler from that controller",
+        "src/routes/user.js:40-42 change-password redirect -> should be removed once src/routes/well-known.js owns it (req-007)",
+        "If src/controllers/well-known.js is created -> src/routes/well-known.js must import and wire it",
+        "If src/routes/well-known.js is created -> src/routes/index.js:19-25 must add it to _mounts and src/routes/index.js:153-159 must invoke it",
+        "If src/controllers/well-known.js is created -> src/routes/well-known.js must import and wire the webfinger handler (name per req-006 spec)",
+        "Once src/routes/well-known.js owns /.well-known/change-password -> src/routes/user.js:40-42 inline redirect should be removed (req-007)",
+        "Once src/routes/well-known.js is created and owns /.well-known/change-password -> src/routes/user.js:40-42 inline redirect must be removed",
+        "If src/routes/well-known.js is created -> src/routes/index.js must add it to _mounts and invoke it (req-008)",
+        "If src/routes/well-known.js is created -> src/routes/index.js:19-25 must add `wellKnown: require('./well-known')` to _mounts",
+        "If src/routes/well-known.js is created -> src/routes/index.js:152-159 must add `_mounts.wellKnown(router, middleware, controllers)` call in addCoreRoutes",
+        "src/controllers/well-known.js (create) -> src/controllers/index.js:37 must add Controllers['well-known'] = require('./well-known')",
+        "src/controllers/well-known.js (create) -> src/routes/well-known.js must import and wire the webfinger export",
+        "src/routes/well-known.js (create) -> src/routes/index.js:19-25 must add wellKnown: require('./well-known') to _mounts",
+        "src/routes/well-known.js (create) -> src/routes/index.js:152-159 must add _mounts.wellKnown(router, middleware, controllers) call",
+        "If src/routes/well-known.js is created -> src/routes/index.js:19-25 must add wellKnown: require('./well-known') to _mounts",
+        "If src/routes/well-known.js is created -> src/routes/index.js:152-159 must add _mounts.wellKnown(router, middleware, controllers) call",
+        "Once src/routes/well-known.js owns /.well-known/change-password -> src/routes/user.js:40-42 inline redirect must be removed",
+        "src/routes/well-known.js depends on src/controllers/well-known.js existing and exporting webfinger before it can wire the GET /.well-known/webfinger route"
       ],
       "dependency_propagation": [
-        "src/routes/index.js controls which route modules are loaded at startup; well-known module must be added there",
-        "src/privileges/helpers.js:15-18 (uidToSystemGroup) is the mechanism that makes uid=0 evaluate as Guest — no special-casing needed in the handler",
-        "src/install.js:437 grants groups:view:users to 'guests' by default, meaning anonymous access passes unless an admin rescinds it (as shown in test/controllers.js:1803)",
-        "src/controllers/index.js must add Controllers['well-known'] = require('./well-known') once the file is created",
-        "src/routes/well-known.js must require and delegate to controllers['well-known'].webfinger",
-        "src/routes/index.js:19-25 _mounts object must gain a well-known key pointing to the new route module"
+        "src/routes/index.js requires all route modules at startup; the new well-known router must be added to _mounts and invoked in the same pattern as _mounts.meta and _mounts.user",
+        "src/routes/index.js requires all route modules at startup; once src/routes/well-known.js is created it must be added to _mounts and invoked in the same pattern as lines 153-159",
+        "nconf.get('url_parsed').hostname (sourced from src/prestart.js:94) must be read inside the controller to perform hostname suffix validation",
+        "src/privileges/global.js:privsGlobal.can -> src/privileges/helpers.js:isAllowedTo -> isAllowedToPrivileges (line 65) -> [uid<=0 at line 73] isSystemGroupAllowedToPrivileges uses uidToSystemGroup[0]='guests' (helpers.js:16) to resolve the Guest privilege set",
+        "src/routes/well-known.js (missing) must pass req.uid through to the controller so the privilege check receives it correctly; if req.uid is undefined it must be coerced to 0 before calling privileges.global.can to guarantee the Guest path at helpers.js:73",
+        "src/privileges/global.js -> src/privileges/helpers.js (isAllowedTo, isAllowedToPrivileges, isSystemGroupAllowedToPrivileges) -> groups membership checks for cid:0:privileges:groups:view:users",
+        "src/install.js:437 grants groups:view:users to guests by default; revocation by admin will flip privileges.global.can result to false, triggering the 403 gate the handler must implement",
+        "src/controllers/well-known.js -> requires parsed hostname from nconf (set during prestart) for resource hostname validation",
+        "src/controllers/well-known.js -> requires privileges.global.can (src/privileges/global.js) for view:users gate",
+        "src/controllers/well-known.js -> requires user module for slug-to-UID resolution",
+        "src/controllers/index.js -> must register Controllers['well-known'] before src/routes/well-known.js can reference controllers['well-known'].webfinger"
       ]
     },
     "requirements": [
@@ -120,22 +145,21 @@
         "origin": "requirements",
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
-          "src/routes/user.js:40-42",
-          "src/routes/index.js:19-25"
+          "src/routes/index.js:19-25",
+          "src/routes/user.js:40-42"
         ],
-        "findings": "No /.well-known/webfinger route exists anywhere in the codebase. Neither src/routes/well-known.js nor src/controllers/well-known.js have been created. The only .well-known route currently registered is /.well-known/change-password, defined inline in src/routes/user.js at lines 40-42 as a simple redirect — it is unrelated to WebFinger. The main route composition in src/routes/index.js mounts modules for user, meta, api, admin, and feed, but no well-known module is present. There is no WebFinger handler returning { subject, aliases, links } anywhere in the codebase.",
+        "findings": "Neither `src/controllers/well-known.js` nor `src/routes/well-known.js` exist in the repository. A grep for \"webfinger\" across the entire `src/` tree returns zero matches. There is no route registered at `/.well-known/webfinger`, no handler that constructs the `{ subject, aliases, links }` JSON payload described by req-001 (that shape comes from the requirement spec, not from any file read during this investigation), and no controller that validates the `resource` query parameter. The only `.well-known` route in the codebase is a `change-password` redirect defined inline inside the user route module (`src/routes/user.js:40-42`). The main route composition object `_mounts` in `src/routes/index.js:19-25` contains no reference to a well-known router. `src/routes/meta.js` was observed to be registered via `_mounts.meta` in `src/routes/index.js`, and serves as the closest structural analogue for the new router, but its internal content was not read in detail during this investigation. Everything described by req-001 is entirely absent and must be created from scratch.",
         "rework_context": ""
       },
       {
         "id": "req-002",
         "text": "The /.well-known/change-password route should redirect requests to /me/edit/password. This redirection should be implemented independently of user authentication context.",
         "origin": "requirements",
-        "verdict": "AS_IS_VIOLATED",
+        "verdict": "AS_IS_COMPLIANT",
         "evidence_locations": [
-          "src/routes/user.js:40-42",
-          "src/routes/user.js:7-13"
+          "src/routes/user.js:40-42"
         ],
-        "findings": "The /.well-known/change-password redirect to /me/edit/password exists and is functionally correct. src/routes/user.js:40-42 registers it via app.use with a plain inline handler — no auth middleware is applied, so the redirect itself is authentication-independent. However, the requirement is violated on the structural/modularity axis: the route is defined inside the user-specific route module (src/routes/user.js), not in a dedicated well-known router. The module function signature at line 7 is `(app, name, middleware, controllers)` and the route is registered alongside account-specific page routes that carry accountMiddlewares (ensureLoggedIn, checkAccountPermissions, lines 9-13). While the change-password handler itself does not apply those middlewares, its placement inside the user module is the structural violation the requirement targets. No src/routes/well-known.js file exists.",
+        "findings": "The /.well-known/change-password route is registered via `app.use` at src/routes/user.js:40-42 and unconditionally redirects to /me/edit/password. The handler is a bare two-argument callback `(req, res) => res.redirect('/me/edit/password')` with no authentication middleware interposed — no `ensureLoggedIn`, no `accountMiddlewares`, no auth check of any kind. The surrounding routes that require authentication (lines 9-13 define `accountMiddlewares` including `ensureLoggedIn`) are passed explicitly to `setupPageRoute`; this route bypasses all of that. Both conditions stated in req-002 are satisfied: correct redirect target and auth-context independence.",
         "rework_context": ""
       },
       {
@@ -144,9 +168,10 @@
         "origin": "requirements",
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
+          "src/routes/index.js:19-25",
           "src/prestart.js:94"
         ],
-        "findings": "The WebFinger handler described by req-003 does not exist anywhere in the codebase. Neither src/controllers/well-known.js nor src/routes/well-known.js have been created. A grep for \"webfinger\" across all of src/ returns zero matches. The validation logic required by this requirement — checking for a missing resource param, enforcing the acct: prefix, validating the hostname against nconf.get('url_parsed').hostname, and returning 404 when the username cannot be resolved — is entirely absent. The only evidence of nconf url_parsed usage is in src/prestart.js:94 where the parsed URL is set, confirming the config key exists but is not yet consumed by any WebFinger handler.",
+        "findings": "The WebFinger handler described by req-003 does not exist anywhere in the codebase. Both `src/controllers/well-known.js` and `src/routes/well-known.js` are absent (Glob returns no results for either path). A full-tree grep for \"webfinger\" across `src/` returns zero matches. Consequently, none of the validation logic required by req-003 is present: there is no check for a missing resource query parameter, no `acct:` prefix check, no hostname suffix comparison against `nconf.get('url_parsed').hostname`, and no user-resolution step that would return 404. The `url_parsed` value that the hostname check would depend on is established at `src/prestart.js:94` via `nconf.set('url_parsed', url.parse(nconf.get('url')))`, but nothing reads it for WebFinger purposes. The `_mounts` composition in `src/routes/index.js:19-25` and its invocations at lines 153–159 contain no reference to a well-known router. All validation behaviour specified by req-003 must be implemented from scratch inside the missing `src/controllers/well-known.js` file.",
         "rework_context": ""
       },
       {
@@ -157,11 +182,10 @@
         "evidence_locations": [
           "src/privileges/global.js:108-117",
           "src/privileges/helpers.js:15-18",
-          "src/middleware/user.js:138-147",
           "src/controllers/user.js:64-66",
-          "src/controllers/helpers.js:125-153"
+          "src/middleware/user.js:138-147"
         ],
-        "findings": "The authorization check described by req-004 does not exist anywhere in the codebase. src/controllers/well-known.js has not been created, so there is no WebFinger handler to enforce the groups:view:users permission or return 403. The infrastructure to implement this requirement correctly is fully present: privileges.global.can('view:users', req.uid) at src/privileges/global.js:108-117 performs the check, and uid=0 (anonymous) is automatically mapped to the 'guests' group via uidToSystemGroup at src/privileges/helpers.js:15-18, so passing req.uid directly handles the anonymous/Guest-role case without extra logic. controllers.helpers.notAllowed at src/controllers/helpers.js:125-153 issues the 403 response. The identical pattern is already used in src/middleware/user.js:138-147 (canViewUsers middleware) and src/controllers/user.js:64-66 (getUserDataByUID). The requirement is entirely absent because the target file does not exist.",
+        "findings": "The authorization check described by req-004 is entirely absent because `src/controllers/well-known.js` does not exist. There is no WebFinger handler anywhere in the codebase that could gate on `groups:view:users` or return 403.\n\nThe underlying privilege infrastructure is fully in place and already supports both branches of the requirement:\n1. Per-user check: `privsGlobal.can` at `src/privileges/global.js:108-117` accepts `(privilege, uid)`, short-circuits for administrators via `user.isAdministrator(uid)`, and delegates to `helpers.isAllowedTo([privilege], uid, 0)`.\n2. Anonymous → Guest mapping: `src/privileges/helpers.js:15-18` defines `uidToSystemGroup = { 0: 'guests', '-1': 'spiders' }`. Inside `isAllowedToPrivileges` (helpers.js:73), when `parseInt(uidOrGroupName, 10) <= 0` the call routes to `isSystemGroupAllowedToPrivileges`, which evaluates privileges against the 'guests' group. Passing `req.uid` (0 for unauthenticated requests in NodeBB) directly to `privileges.global.can` therefore automatically evaluates as Guest — no special branching is needed in the controller.\n\nAnalogous implementations already using this pattern:\n- `src/controllers/user.js:64-66`: calls `privileges.global.can('view:users', callerUid)` and throws `[[error:no-privileges]]` when denied.\n- `src/middleware/user.js:138-147`: `canViewUsers` middleware calls `privileges.global.can('view:users', req.uid)` at line 142 and calls `controllers.helpers.notAllowed(req, res)` at line 146 on denial.\n\nNeither of these fulfills req-004 for the WebFinger endpoint — they guard different routes. The 403-gating logic must be implemented inside the missing `src/controllers/well-known.js#webfinger` function.",
         "rework_context": ""
       },
       {
@@ -173,7 +197,7 @@
           "src/routes/index.js:19-25",
           "src/routes/user.js:40-42"
         ],
-        "findings": "The structured JSON response described by req-005 — { subject, aliases, links } — is never produced because the handler that would build and send it does not exist. A grep for \"webfinger\" (case-insensitive) across all of src/ returns zero matches, and src/controllers/well-known.js is absent from the filesystem. There is no code path that constructs a subject field from the resource query param, assembles an aliases array with UID-based and slug-based profile URLs, or builds a links array referencing the user's HTML profile page. The response shape required by this requirement is entirely unimplemented.",
+        "findings": "The structured JSON response shape described by req-005 — `{ subject, aliases: [uid-url, slug-url], links: [{ ..., href: /user/<slug> }] }` — is entirely absent from the codebase. A case-insensitive grep for \"webfinger\" across the entire `src/` tree returns zero matches. Neither `src/controllers/well-known.js` nor `src/routes/well-known.js` exist (confirmed by Glob). There is therefore no handler that could set `subject` to the original resource string, construct an `aliases` array with UID-based and slug-based profile URLs, or populate a `links` array pointing at the canonical `/user/<slug>` page. The only `.well-known` route in the codebase is the `change-password` redirect at `src/routes/user.js:40-42` (`app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })`), which is unrelated. The `_mounts` composition in `src/routes/index.js:19-25` has entries for `user`, `meta`, `api`, `admin`, and `feed` — no entry for a well-known router. The entire response-construction logic required by req-005 must be implemented from scratch inside the missing `src/controllers/well-known.js#webfinger` function.",
         "rework_context": ""
       },
       {
@@ -183,9 +207,10 @@
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
           "src/routes/index.js:19-25",
+          "src/routes/index.js:153-159",
           "src/routes/user.js:40-42"
         ],
-        "findings": "Both files required by req-006 are entirely absent from the codebase.\n\n1. `src/controllers/well-known.js` — does not exist. A glob across `src/controllers/*.js` lists 29 controller files; `well-known.js` is not among them. No `webfinger` symbol appears anywhere in `src/controllers/index.js` or any other controller file.\n\n2. `src/routes/well-known.js` — does not exist. A glob for the exact path returns no results.\n\n3. The `_mounts` object in `src/routes/index.js` (lines 19–25) enumerates the five currently loaded route modules: `user`, `meta`, `api`, `admin`, and `feed`. There is no `well-known` entry, and no `require('./well-known')` call anywhere in that file.\n\n4. The only `.well-known` route currently registered is `/.well-known/change-password`, defined inline in `src/routes/user.js:40` — not in a dedicated well-known router.\n\nBoth the controller file and the router file described by req-006 must be created from scratch.",
+        "findings": "Both `src/controllers/well-known.js` and `src/routes/well-known.js` are entirely absent from the repository — confirmed by Glob returning no results for either path. Neither file exists at any other location under `src/`. The main route composition in `src/routes/index.js` contains no reference to a well-known router (grep for `well.known`, `wellKnown`, and `well_known` returns zero matches). The only `.well-known` route currently registered in the codebase is the inline `change-password` redirect at `src/routes/user.js:40-42`, which lives inside the user route module rather than a dedicated controller/router pair. The `_mounts` object defined at `src/routes/index.js:19-25` has no well-known entry, and its invocation block at lines 153-159 likewise has no call to a well-known router initialiser. Both artefacts required by req-006 — the controller file and the router file — must be created from scratch. Note: the handler name `webfinger` and the expected property name `wellKnown` are sourced from the req-006 specification, not from observed code (since both files are absent); they do not appear in any Read output from this investigation.",
         "rework_context": ""
       },
       {
@@ -196,7 +221,7 @@
         "evidence_locations": [
           "src/routes/user.js:40-42"
         ],
-        "findings": "Neither half of the required refactoring has been performed.\n\n1. **Source not cleaned up** — `src/routes/user.js:40-42` still contains the inline `/.well-known/change-password` handler (`app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })`). It has not been removed.\n\n2. **Destination does not exist** — `src/routes/well-known.js` is entirely absent from the filesystem. A glob for `src/routes/well-known*` returns no results. There is nowhere for the route to have been moved to.\n\nBoth the removal from `src/routes/user.js` and the redefinition in `src/routes/well-known.js` are outstanding. The requirement is fully unimplemented.",
+        "findings": "Neither half of req-007 has been implemented. `src/routes/well-known.js` does not exist (confirmed by Glob). The `/.well-known/change-password` redirect is still defined inline inside the user route module at `src/routes/user.js:40-42`:\n\n```js\napp.use('/.well-known/change-password', (req, res) => {\n    res.redirect('/me/edit/password');\n});\n```\n\nIt has not been removed from that file, and no dedicated well-known router exists. Both the removal from `src/routes/user.js` and the creation of `src/routes/well-known.js` are entirely absent.",
         "rework_context": ""
       },
       {
@@ -206,9 +231,9 @@
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
           "src/routes/index.js:19-25",
-          "src/routes/index.js:152-160"
+          "src/routes/index.js:152-159"
         ],
-        "findings": "Both preconditions for req-008 are unmet.\n\n1. `src/routes/well-known.js` does not exist — a glob for the exact path returns no results. There is nothing to integrate.\n\n2. `src/routes/index.js` has no reference to a well-known module anywhere. The `_mounts` object (lines 19–25) loads exactly five modules: `user`, `meta`, `api`, `admin`, and `feed`. There is no `well-known` key. The `addCoreRoutes` function (lines 152–160) calls `_mounts.meta`, `_mounts.api`, `_mounts.feed`, `_mounts.main`, `_mounts.mod`, and `_mounts.globalMod` — no well-known call is present. No `require('./well-known')` appears anywhere in the file.\n\nThe integration point where the new module must be added is `src/routes/index.js:19-25` (the `_mounts` object) and the corresponding call inside `addCoreRoutes` around lines 153–155. Until `src/routes/well-known.js` is created and a `_mounts['well-known']` entry plus its invocation are added to `src/routes/index.js`, this requirement remains entirely unimplemented.",
+        "findings": "Both preconditions for req-008 are absent. `src/routes/well-known.js` does not exist (Glob returns no results). Consequently, there is nothing to integrate. Additionally, `src/routes/index.js` contains no reference to a well-known router: a grep for `well.known`, `wellKnown`, and `well_known` across that file returns zero matches.\n\nThe `_mounts` object defined at `src/routes/index.js:19-25` lists five entries — `user`, `meta`, `api`, `admin`, `feed` — with no well-known entry. The `addCoreRoutes` function starting at line 152 invokes `_mounts.meta`, `_mounts.api`, `_mounts.feed`, `_mounts.main`, `_mounts.mod`, and `_mounts.globalMod` during startup — no well-known invocation is present. Neither a `require('./well-known')` call nor a `_mounts.wellKnown(...)` invocation appears anywhere in the file.\n\nTo satisfy req-008, two changes are needed once `src/routes/well-known.js` is created:\n1. Add `wellKnown: require('./well-known')` to the `_mounts` object at `src/routes/index.js:19-25`.\n2. Call `_mounts.wellKnown(router, middleware, controllers)` inside `addCoreRoutes` at `src/routes/index.js:153-159`, following the same pattern used by `_mounts.meta` (line 153) and `_mounts.feed` (line 155).",
         "rework_context": ""
       },
       {
@@ -217,15 +242,14 @@
         "origin": "requirements",
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
-          "src/privileges/global.js:108-117",
           "src/privileges/helpers.js:15-18",
-          "src/privileges/helpers.js:57-58",
-          "src/privileges/helpers.js:73-74",
-          "src/controllers/helpers.js:125-153",
+          "src/privileges/helpers.js:65-79",
+          "src/privileges/global.js:108-117",
+          "src/controllers/user.js:64-66",
           "src/middleware/user.js:138-147",
-          "src/controllers/user.js:64-66"
+          "src/install.js:437"
         ],
-        "findings": "The authorization check for unauthenticated requests described by req-009 is entirely absent because `src/controllers/well-known.js` does not exist. A glob for that exact path returns no results, and a case-insensitive grep for \"webfinger\" across all of `src/` returns zero matches — there is no handler anywhere in the codebase that could perform this check.\n\nThe full infrastructure required to implement the requirement correctly is present and verified:\n\n1. **`privileges.global.can('view:users', req.uid)`** — `src/privileges/global.js:108-117` implements this. It calls `helpers.isAllowedTo([privilege], uid, 0)` which routes through `isAllowedToPrivileges`. When `parseInt(uid) <= 0` (i.e., anonymous uid=0), it delegates to `isSystemGroupAllowedToPrivileges` (`src/privileges/helpers.js:73-74`), which resolves the system group name via `uidToSystemGroup` (`src/privileges/helpers.js:15-18`: `{ 0: 'guests', '-1': 'spiders' }`). This means passing `req.uid` (which is `0` for anonymous requests) directly to `privileges.global.can` automatically evaluates the check under the Guest role — no special-casing is needed in the handler.\n\n2. **`controllers.helpers.notAllowed`** — `src/controllers/helpers.js:125-153` issues the 403 response. For logged-in users or spiders (`req.loggedIn || req.uid === -1`) it renders a 403 page or JSON; for anonymous API requests it returns 401 with a redirect; for anonymous non-API requests it redirects to login. The WebFinger handler would need to call this (or send `res.status(403).json(...)` directly) when the privilege check fails.\n\n3. **Identical pattern already in use** — `src/middleware/user.js:138-147` (canViewUsers middleware) and `src/controllers/user.js:64-66` (getUserDataByUID) both call `privileges.global.can('view:users', req.uid)` and invoke `controllers.helpers.notAllowed` on failure, providing a direct reference implementation.\n\nThe requirement cannot be satisfied until `src/controllers/well-known.js` is created with a `webfinger` function that performs this privilege check.",
+        "findings": "The entire WebFinger handler is absent. `src/controllers/well-known.js` does not exist (confirmed by Glob), so the Guest-role authorization check mandated by req-009 cannot be present there. No code anywhere in the codebase implements the described behavior.\n\nThe underlying privilege infrastructure that would make the check trivial to implement is fully in place:\n\n1. uid=0 → Guest role mapping: `src/privileges/helpers.js:15-18` defines `uidToSystemGroup = { 0: 'guests', '-1': 'spiders' }`. When an unauthenticated request arrives and `req.uid` is 0, passing that value to `privileges.global.can` is sufficient — no special branching is required in the controller.\n\n2. Automatic Guest routing: `isAllowedToPrivileges` at `src/privileges/helpers.js:73` checks `parseInt(uidOrGroupName, 10) <= 0` and, when true, routes to `isSystemGroupAllowedToPrivileges`, which evaluates the 'guests' group's privilege set. This is the exact path req-009 requires.\n\n3. The call entry point: `privsGlobal.can(privilege, uid)` at `src/privileges/global.js:108-117` calls `helpers.isAllowedTo([privilege], uid, 0)` and will return `false` if the Guest role lacks that permission — enabling the 403 gate.\n\n4. Reference patterns for the 403 gate already exist: `src/controllers/user.js:64-66` (`privileges.global.can('view:users', callerUid)` + throw on denial) and `src/middleware/user.js:138-147` (`privileges.global.can('view:users', req.uid)` + `notAllowed` on denial).\n\n5. Default privilege grant at `src/install.js:437` gives guests `groups:view:users` at install time, but admins can revoke it — the handler must check dynamically.\n\nThe missing implementation is entirely contained in the not-yet-created `src/controllers/well-known.js`. Once that file exists with a WebFinger handler, a single `await privileges.global.can('view:users', req.uid || 0)` call, followed by a 403 response if the result is false, would satisfy req-009 in full.",
         "rework_context": ""
       },
       {
@@ -234,14 +258,10 @@
         "origin": "new_interfaces",
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
-          "src/controllers/index.js:14-41",
-          "src/privileges/global.js:108-117",
-          "src/privileges/helpers.js:15-18",
-          "src/controllers/helpers.js:125",
-          "src/routes/index.js:19-25",
-          "src/routes/user.js:40-42"
+          "src/controllers/index.js:36-37",
+          "src/routes/index.js:19-25"
         ],
-        "findings": "src/controllers/well-known.js does not exist. A glob across src/controllers/*.js lists 29 controller files — well-known.js is absent. A case-insensitive grep for \"webfinger\" across all of src/ returns zero matches. Controllers/index.js (lines 14–41) enumerates every registered controller module; there is no Controllers['well-known'] entry and no require('./well-known') call anywhere in the file. The entire webfinger function — including resource validation, privilege check, slug-to-UID resolution, and JSON response construction — is entirely unimplemented. All required infrastructure exists (privileges.global.can at src/privileges/global.js:108-117, uidToSystemGroup guest mapping at src/privileges/helpers.js:15-18, notAllowed at src/controllers/helpers.js:125+) but none of it is wired to a webfinger handler because the handler file has never been created. src/routes/well-known.js is also absent (glob of src/routes/*.js lists 9 files, none named well-known.js), and src/routes/index.js:19-25 has no well-known key in the _mounts object.",
+        "findings": "The WebFinger handler function `webfinger` and its containing file `src/controllers/well-known.js` are entirely absent from the codebase. Three independent checks confirm this:\n\n1. Glob for `src/controllers/well-known.js` returns no results.\n2. Case-insensitive grep for \"webfinger\" across all of `src/` returns zero matches.\n3. `src/controllers/index.js` lists every controller registration across lines 14–41; there is no `Controllers['well-known']` entry anywhere in that range. The closest analogues — `Controllers.osd` at line 36 and `Controllers['404']` at line 37 — show the expected registration pattern but no well-known entry is present.\n\nNothing in the codebase implements any part of req-010's described behaviour: there is no `resource` query-param validation, no `acct:` prefix check, no hostname comparison, no `privileges.global.can('view:users', ...)` gate, no slug-to-UID resolution, and no `{ subject, aliases, links }` JSON response construction. The entire handler must be created from scratch.\n\nThe integration point for the controller registry is `src/controllers/index.js:37`, where a new line `Controllers['well-known'] = require('./well-known')` would follow the `Controllers['404']` entry. The route wiring integration points are `src/routes/index.js:19-25` (_mounts composition) and lines 153–159 (addCoreRoutes invocations).",
         "rework_context": ""
       },
       {
@@ -251,34 +271,35 @@
         "verdict": "TO_BE_MISSING",
         "evidence_locations": [
           "src/routes/index.js:19-25",
-          "src/routes/index.js:152-160",
+          "src/routes/index.js:152-159",
           "src/routes/user.js:40-42"
         ],
-        "findings": "src/routes/well-known.js does not exist. A glob across src/routes/*.js lists exactly 9 files (admin.js, api.js, authentication.js, debug.js, feeds.js, helpers.js, index.js, meta.js, user.js) — well-known.js is absent. src/controllers/well-known.js is also absent (glob returns no results).\n\nNone of the three required behaviors are implemented:\n\n1. **Module file absent** — There is no `src/routes/well-known.js` exporting a function with signature `(app, middleware, controllers)`.\n\n2. **change-password not moved** — The `/.well-known/change-password` redirect to `/me/edit/password` remains inline in `src/routes/user.js:40-42`:\n   `app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })`\n   It has not been relocated to a dedicated well-known router.\n\n3. **webfinger route absent** — No `GET /.well-known/webfinger` route is registered anywhere. A grep for \"well-known\" across `src/routes/` returns only the single inline hit in user.js:40. `src/controllers/well-known.js` is also absent, so there is no `controllers['well-known'].webfinger` to delegate to.\n\n4. **Not integrated into route composition** — `src/routes/index.js:19-25` defines the `_mounts` object with keys `user`, `meta`, `api`, `admin`, and `feed` only. There is no `well-known` key and no `require('./well-known')` call anywhere in the file. The `addCoreRoutes` function at lines 152–160 calls `_mounts.meta`, `_mounts.api`, `_mounts.feed`, `_mounts.main`, `_mounts.mod`, and `_mounts.globalMod` — no well-known invocation is present.",
+        "findings": "The route configuration module `src/routes/well-known.js` does not exist anywhere in the repository — Glob returns no results for that path, and the full listing of `src/routes/*.js` confirms only nine files: admin, api, authentication, debug, feeds, helpers, meta, index, and user. No well-known router module is present at any location.\n\nThree structural integration points that the module would need to be wired into are all unmodified:\n\n1. The `_mounts` object at `src/routes/index.js:19-25` lists exactly five entries (`user`, `meta`, `api`, `admin`, `feed`). There is no `wellKnown: require('./well-known')` entry. A grep for `well.known`, `wellKnown`, and `well_known` across `src/routes/index.js` returns zero matches.\n\n2. The `addCoreRoutes` function at `src/routes/index.js:152-159` invokes `_mounts.meta`, `_mounts.api`, `_mounts.feed`, `_mounts.main`, `_mounts.mod`, and `_mounts.globalMod`. There is no `_mounts.wellKnown(router, middleware, controllers)` call.\n\n3. The `/.well-known/change-password` redirect that req-011 requires to be owned by this module remains inline inside the user route module at `src/routes/user.js:40-42` (`app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })`). It has not been migrated.\n\nThe second route req-011 describes — `GET /.well-known/webfinger` delegating to `controllers['well-known'].webfinger` — is also entirely absent. Neither the route registration nor the controller it would delegate to (`src/controllers/well-known.js`) exists.\n\nAll three items described by req-011 must be created from scratch: the `src/routes/well-known.js` module itself, its `wellKnown` entry in `_mounts`, and its invocation in `addCoreRoutes`. The inline redirect at `src/routes/user.js:40-42` must also be removed once the new module owns it.",
         "rework_context": ""
       }
     ],
     "schema_version": "v2"
   },
   "patch_plan": {
-    "overview": "Root cause: Two files that must exist — `src/controllers/well-known.js` and `src/routes/well-known.js` — are entirely absent from the codebase. As a result, no `/.well-known/webfinger` route is reachable, and the `/.well-known/change-password` redirect is stranded inside the user-specific route module instead of a dedicated well-known router. The fix creates both missing files, wires them into the two existing registries (`src/controllers/index.js` and `src/routes/index.js`), and removes the now-orphaned inline handler from `src/routes/user.js`. All authorization infrastructure (`privileges.global.can`, `uidToSystemGroup`, `controllers.helpers.notAllowed`) is already present and requires no modification — it only needs to be called from the new controller. Edits are ordered so each dependency exists before the file that consumes it is modified.",
+    "overview": "Root cause: The application has no WebFinger endpoint (/.well-known/webfinger returns 404) and the /.well-known/change-password redirect is stranded inside the user route module instead of a dedicated .well-known router. The fix requires creating two new files — src/controllers/well-known.js (webfinger handler with resource validation, privilege gate, user resolution, and JSON response construction) and src/routes/well-known.js (route configuration module owning both .well-known routes) — then wiring them into the existing controller and route registries, and removing the now-orphaned inline redirect from src/routes/user.js. All changes follow established repo conventions: bracket-key controller registration (Controllers['404'] pattern), _mounts object composition + addCoreRoutes invocation pattern, and privileges.global.can for the view:users gate.",
     "edits": [
       {
         "filepath": "src/controllers/well-known.js",
         "target_functions": [
           "webfinger"
         ],
-        "change_rationale": "This file is entirely absent (req-006, req-010 both verdict TO_BE_MISSING; glob of src/controllers/*.js confirms 29 files, none named well-known.js). It must be created to implement the `webfinger` async handler function. The handler must: (1) validate the `resource` query param — return 400 if missing, not prefixed with `acct:`, or the hostname portion does not match `nconf.get('url_parsed').hostname`; (2) call `privileges.global.can('view:users', req.uid)` and invoke `controllers.helpers.notAllowed` on denial (uid=0 for anonymous is automatically evaluated as Guest via `uidToSystemGroup` — no special-casing needed); (3) resolve the username slug to a UID and return 404 if not found; (4) return `res.status(200).json({ subject, aliases, links })` on success, where `subject` is the original resource string, `aliases` contains UID-based and slug-based profile URLs, and `links` contains at least one entry for the user's HTML profile page. This is the leaf dependency — all other new files depend on it.",
+        "change_rationale": "This file is entirely absent (confirmed by Glob and grep). It must be created to satisfy req-001, req-003, req-004, req-005, req-009, and req-010. It exports a `webfinger` async function that: (1) validates the `resource` query param (missing → 400, no `acct:` prefix → 400, wrong hostname suffix using nconf.get('url_parsed').hostname → 400), (2) gates access with privileges.global.can('view:users', req.uid || 0) — passing 0 for unauthenticated callers routes through helpers.js:73 to the Guest role automatically — returning 403 on denial, (3) resolves the username slug to a UID returning 404 if not found, and (4) returns res.json({ subject, aliases: [uid-url, slug-url], links: [{ href: /user/<slug> }] }) on success. The module.exports.webfinger named-export style follows src/controllers/osd.js.",
         "preserved_findings": [
-          "checking for a missing resource param, enforcing the acct: prefix, validating the hostname against nconf.get('url_parsed').hostname, and returning 404 when the username cannot be resolved",
           "`nconf.get('url_parsed').hostname`",
-          "privileges.global.can('view:users', req.uid) at src/privileges/global.js:108-117 performs the check",
-          "controllers.helpers.notAllowed at src/controllers/helpers.js:125-153 issues the 403 response",
-          "passing req.uid (which is 0 for anonymous requests) directly to privileges.global.can automatically evaluates the check under the Guest role — no special-casing is needed in the handler",
-          "The identical pattern is already used in src/middleware/user.js:138-147 (canViewUsers middleware) and src/controllers/user.js:64-66 (getUserDataByUID)",
-          "subject set to the original resource, aliases with UID- and slug-based URLs, and links including an entry for the user's HTML profile",
-          "src/controllers/index.js:322-327 -- Controllers.manifest: async function builds and returns res.status(200).json(data.manifest) — same JSON response pattern the webfinger handler must use",
-          "Output: HTTP 200 with JSON { subject, aliases, links } on success; HTTP 400 / 403 / 404 on validation/authorization/not-found cases"
+          "`privileges.global.can('view:users', callerUid)`",
+          "`controllers.helpers.notAllowed(req, res)`",
+          "`uidToSystemGroup = { 0: 'guests', '-1': 'spiders' }`",
+          "`await privileges.global.can('view:users', req.uid || 0)`",
+          "`parseInt(uidOrGroupName, 10) <= 0`",
+          "`isSystemGroupAllowedToPrivileges`",
+          "{ subject, aliases: [uid-url, slug-url], links: [{ ..., href: /user/<slug> }] }",
+          "src/controllers/osd.js — module.exports named-export pattern (e.g. module.exports.handle); webfinger would use module.exports.webfinger in the same style",
+          "src/privileges/helpers.js:15-18 — uidToSystemGroup map: 0 -> 'guests'; confirms that passing req.uid=0 to privileges.global.can automatically evaluates under the Guest role via isAllowedToPrivileges:73 without extra branching in the controller"
         ],
         "co_edit_dependencies": [
           "src/controllers/index.js",
@@ -288,10 +309,11 @@
       {
         "filepath": "src/controllers/index.js",
         "target_functions": [],
-        "change_rationale": "must_co_edit_relations states: 'src/controllers/well-known.js (create) -> src/controllers/index.js must add Controllers[\"well-known\"] = require(\"./well-known\")'. The findings for req-010 confirm that lines 14-41 enumerate every registered controller module and there is currently no Controllers['well-known'] entry or require('./well-known') call anywhere in the file. Without this registration, `controllers['well-known']` will be undefined when `src/routes/well-known.js` attempts to delegate to it, causing a runtime crash.",
+        "change_rationale": "must_co_edit_relations states: 'src/controllers/well-known.js (create) -> src/controllers/index.js:37 must add Controllers[\"well-known\"] = require(\"./well-known\")'. The integration point is line 37, directly after Controllers['404']. The bracket-key notation Controllers['well-known'] is mandated by evidence (Controllers['404'] pattern at line 37, not the dot-key variant at line 36).",
         "preserved_findings": [
-          "src/controllers/well-known.js (create) -> src/controllers/index.js must add Controllers['well-known'] = require('./well-known')",
-          "Controllers/index.js (lines 14–41) enumerates every registered controller module; there is no Controllers['well-known'] entry and no require('./well-known') call anywhere in the file"
+          "`Controllers['well-known'] = require('./well-known')`",
+          "src/controllers/index.js:36-37 — Controllers['404'] = require('./404') shows bracket-key registration pattern for the new Controllers['well-known'] entry",
+          "src/controllers/index.js:36 — Controllers.osd = require('./osd') shows the dot-key variant; well-known should use bracket notation consistent with '404'"
         ],
         "co_edit_dependencies": [
           "src/controllers/well-known.js"
@@ -300,19 +322,17 @@
       {
         "filepath": "src/routes/well-known.js",
         "target_functions": [
-          "module.exports (route initializer function)"
+          "module.exports (initialiser function)"
         ],
-        "change_rationale": "This file is entirely absent (req-006, req-011 both verdict TO_BE_MISSING; glob of src/routes/*.js lists exactly 9 files, none named well-known.js). It must be created exporting a function with signature `(app, middleware, controllers)` that: (1) registers `app.use('/.well-known/change-password', ...)` redirecting to `/me/edit/password` (relocated from src/routes/user.js:40-42); (2) registers `GET /.well-known/webfinger` delegating to `controllers['well-known'].webfinger`. This satisfies must_co_edit_relations: 'src/controllers/well-known.js (create) -> src/routes/well-known.js must require and delegate to it'. The module pattern must match the existing meta.js pattern (standalone module exporting function(router, middleware, controllers)).",
+        "change_rationale": "This file is entirely absent. must_co_edit_relations states it must be created and must import and wire the webfinger handler from src/controllers/well-known.js. It exports a single initialiser function accepting (app, middleware, controllers) that: (1) registers app.use('/.well-known/change-password', ...) redirecting to /me/edit/password (absorbing the logic removed from src/routes/user.js:40-42), and (2) registers GET /.well-known/webfinger delegating to controllers['well-known'].webfinger. No authentication middleware is interposed on either route, matching the existing auth-context-independent pattern observed in the user.js inline redirect and setupPageRoute with empty middleware array.",
         "preserved_findings": [
-          "src/routes/meta.js — pattern for a standalone route module exporting function(router, middleware, controllers) that registers static/meta routes",
-          "Mounts /.well-known/change-password: redirects to /me/edit/password, and registers GET /.well-known/webfinger, delegating to controllers['well-known'].webfinger",
-          "Input: (app, middleware, controllers) | Output: Registers routes and returns void",
-          "src/controllers/well-known.js (create) -> src/routes/well-known.js (create) must require and call controllers['well-known'].webfinger",
-          "app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })"
+          "`app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })`",
+          "`controllers['well-known'].webfinger`",
+          "src/routes/user.js:15 — setupPageRoute(app, '/me', [], middleware.redirectMeToUserslug) uses empty middleware array to allow unauthenticated access, same pattern as the change-password redirect",
+          "Router: .well-known routes initializer — Name: .well-known routes initializer, Type: Function (route configuration module), Location: src/routes/well-known.js, Input: (app, middleware, controllers), Output: Registers routes and returns void; mounts /.well-known/change-password redirecting to /me/edit/password, and registers GET /.well-known/webfinger delegating to controllers['well-known'].webfinger"
         ],
         "co_edit_dependencies": [
           "src/controllers/well-known.js",
-          "src/controllers/index.js",
           "src/routes/index.js",
           "src/routes/user.js"
         ]
@@ -322,13 +342,14 @@
         "target_functions": [
           "addCoreRoutes"
         ],
-        "change_rationale": "must_co_edit_relations states: 'src/routes/well-known.js (create) -> src/routes/index.js must add well-known to _mounts and invoke it in addCoreRoutes' and 'src/routes/index.js:152-160 must call _mounts[\"well-known\"] once the module exists'. The findings for req-008 confirm that the `_mounts` object at lines 19-25 currently has only five keys (user, meta, api, admin, feed) and the `addCoreRoutes` function at lines 152-160 has no well-known invocation. Two changes are needed: (1) add `'well-known': require('./well-known')` to the `_mounts` object at lines 19-25; (2) add a `_mounts['well-known'](router, middleware, controllers)` call inside `addCoreRoutes` at the appropriate position (alongside the existing meta/api/feed calls at lines 153-155).",
+        "change_rationale": "Two separate must_co_edit_relations sentences apply: 'src/routes/well-known.js (create) -> src/routes/index.js:19-25 must add wellKnown: require(\"./well-known\") to _mounts' and 'src/routes/well-known.js (create) -> src/routes/index.js:152-159 must add _mounts.wellKnown(router, middleware, controllers) call'. Both changes follow the established meta pattern: add a require entry to the _mounts object literal at lines 19-25, then add a corresponding invocation in addCoreRoutes at lines 152-159.",
         "preserved_findings": [
-          "src/routes/index.js:19-25 — _mounts pattern: each module is required here then called in addCoreRoutes",
-          "src/routes/index.js:153 — _mounts.meta(router, middleware, controllers) — reference call signature for the new well-known mount",
-          "The integration point where the new module must be added is src/routes/index.js:19-25 (the _mounts object) and the corresponding call inside addCoreRoutes around lines 153–155",
-          "src/routes/index.js:19-25 _mounts object must gain a well-known key pointing to the new route module",
-          "src/routes/index.js:152-160 must call _mounts['well-known'] once the module exists"
+          "`wellKnown: require('./well-known')`",
+          "`_mounts.wellKnown(router, middleware, controllers)`",
+          "src/routes/index.js:21 — `meta: require('./meta')` in _mounts; structural template for adding `wellKnown: require('./well-known')`",
+          "src/routes/index.js:153 — `_mounts.meta(router, middleware, controllers)` in addCoreRoutes; template for `_mounts.wellKnown(router, middleware, controllers)`",
+          "src/routes/index.js:19-25 must add `wellKnown: require('./well-known')` to _mounts",
+          "src/routes/index.js:152-159 must add `_mounts.wellKnown(router, middleware, controllers)` call in addCoreRoutes"
         ],
         "co_edit_dependencies": [
           "src/routes/well-known.js"
@@ -337,10 +358,12 @@
       {
         "filepath": "src/routes/user.js",
         "target_functions": [],
-        "change_rationale": "must_co_edit_relations states: 'src/routes/user.js:40-42 must have the change-password route removed once src/routes/well-known.js owns it'. The findings for req-007 confirm that lines 40-42 still contain the inline `app.use('/.well-known/change-password', ...)` handler. Once `src/routes/well-known.js` registers this route, leaving it in user.js creates a duplicate registration. The three lines (40-42) must be deleted. No other changes to this file are required.",
+        "change_rationale": "must_co_edit_relations states: 'Once src/routes/well-known.js owns /.well-known/change-password -> src/routes/user.js:40-42 inline redirect must be removed'. The custom repair discipline also mandates 'move means move, not copy' — the symbol must not exist at both the old and new paths. The three lines at src/routes/user.js:40-42 (app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })) must be deleted.",
         "preserved_findings": [
-          "src/routes/user.js:40-42 still contains the inline /.well-known/change-password handler (app.use('/.well-known/change-password', (req, res) => { res.redirect('/me/edit/password'); })). It has not been removed.",
-          "src/routes/user.js:40-42 must have the change-password route removed once src/routes/well-known.js owns it"
+          "src/routes/user.js:40-42 — inline app.use for /.well-known/change-password shows the redirect pattern to be migrated into the new router",
+          "src/routes/user.js:40-42 — existing /.well-known/change-password redirect; shows the .well-known path space is already partially used within the app",
+          "Once src/routes/well-known.js owns /.well-known/change-password -> src/routes/user.js:40-42 inline redirect must be removed",
+          "src/routes/user.js:40-42 -- existing inline /.well-known/change-password redirect that the new router must absorb and this location must lose"
         ],
         "co_edit_dependencies": [
           "src/routes/well-known.js"
@@ -349,6 +372,16 @@
     ]
   },
   "retrieved_code": {},
+  "ltm_search_summaries": [
+    "home-assistant/home-assistant191655336 (score 0.8168): Monolithic HTTP component reorganized into modular middleware — extracted auth, IP banning, and static file handling into dedicated modules (auth.py, ban.py, static.py), updated main component to use middleware stack instead of inline logic. Direct analogy: splitting route logic out of a mixed-purpose file into focused, purpose-specific router modules.",
+    "mesonbuild/meson908105704 (score 0.8140): Large monolithic module split into smaller focused files — extracted specialized classes into individual files, relocated factory/detection logic to dedicated modules, updated all import statements to reflect new structure. Kept new files in the same directory rather than a subfolder. Analogy: exactly the pattern of extracting `.well-known` route handling from a user-route file into its own dedicated router file.",
+    "kubernetes/kubernetes220473520 (score 0.8303): Refactoring monolithic config structure into logical substructures without immediate functional changes — summary-only, not browsed.",
+    "rust-lang/rust722762396 (score 0.8219): Module reorganization moving implementation details from a monolithic file to separate submodules while preserving public API — summary-only, not browsed.",
+    "sympy/sympy555668293 (score 0.8228): Code refactoring with module reorganization without functional changes — summary-only, not browsed.",
+    "WebFinger / .well-known endpoint searches returned no relevant hits — queries on 'webfinger well-known federated identity', 'ActivityPub WebFinger JSON response', and 'well-known URL redirect change-password' all scored below 0.62, with no experiences directly covering WebFinger protocol implementation or .well-known route registration."
+  ],
+  "ltm_reference_block": "═══ LONG-TERM MEMORY (REFERENCE EXPERIENCES) ═══\n\nThe following are similar past bug fixes retrieved from a long-term\nmemory store. Treat them as REFERENCE EXPERIENCE only — they describe\nhistorical bugs in other contexts, not the current case.\n\nHARD CONSTRAINT: if any reference here conflicts with what the actual\ncode in the current repo shows, the code wins. Reference experience\nmay not match the current code base, language, or framework.\n\n--- Reference 1 (score=0.0000) ---\nTitle: <issue_start><issue_comment>Title: Reorganize HTTP component\nusername_0: **Descr\nSymptom:\nMonolithic HTTP component with intertwined authentication, banning, and static file handling logic causing maintenance and extensibility issues.\n\nGuidance:\nStrategic Approach: Refactor the monolithic HTTP component into a modular middleware-based architecture to separate concerns and improve maintainability. The fix involves extracting authentication, IP banning, and static file handling into distinct middleware components that intercept and process requests independently.\nStep-by-Step Implementation: 1. Create dedicated middleware modules for authentication (auth.py), IP banning (ban.py), and static file handling (static.py). 2. Move related constants and utility functions to separate files (const.py, util.py). 3. Update the main HTTP component to use the middleware stack instead of inline logic. 4. Modify dependent components to use the new middleware-based authentication checks. 5. Ensure all middleware properly integrates with the aiohttp request lifecycle.\n\n--- Reference 2 (score=0.0000) ---\nTitle: <issue_start><issue_comment>Title: Split dependencies.base\nusername_0: The first\nSymptom:\nRefactoring of a large monolithic module by splitting it into smaller, focused files to improve maintainability and code organization.\n\nGuidance:\nStrategic Approach: The fix involved a strategic refactoring of the codebase to break down a large, monolithic module into smaller, more manageable files. This approach aimed to enhance code maintainability, readability, and organization by separating generic base classes from specialized dependency implementations and moving factory and detection logic into dedicated modules.\nStep-by-Step Implementation:\n1. Extracted CMake, Config-tool, Pkg-Config, and other dependency classes from the monolithic base module into individual files.\n2. Relocated the factory and detection logic to separate modules to decouple creation and discovery mechanisms from the base classes.\n3. Fully annotated the remaining code in the base module to improve documentation and type safety.\n4. Updated import statements across the codebase to reference the new module structure, ensuring all dependencies are correctly resolved.\n5. Removed the initial proposal to create a custom subfolder for specialized dependencies after community feedback, opting to keep all dependency files in the main directory to avoid arbitrary separation.\n\n═══ END LONG-TERM MEMORY ═══",
+  "custom_repair_block": "═══ CUSTOM REPAIR DISCIPLINE (TAG-ROUTED) ═══\n\nThe following rules were hand-written and matched against the\ncurrent case via tag routing. They are repair-discipline notes,\nnot recipes for this specific bug.\n\nHARD CONSTRAINT: if any rule below conflicts with what the actual\ncode in the current repo shows, the code wins.\n\n--- Rule 1 (custom-21ce85968d70) ---\nTitle: Minimal-change discipline: don't invent, don't over-defend, don't duplicate\n\nGuidance:\nWhenever the input has the shape above, adopt minimum-surface change anchored in existing repo conventions as the default discipline:\n\n1. Name discovery, not name invention. Any new identifier (route path, privilege string, config key, error code, field name) should be derived from a string already present in the repo for the same concern, or from a literal in the problem statement. If you cannot point to one of those two sources for a name you introduced, treat it as a guess and search harder. Do not synthesize a 'looks right' variant. The same discovery discipline applies to wiring: when adding a file inside an existing sibling directory, first observe how existing sibling files are discovered, registered, mounted, or exported (central index module, convention-based autoload, explicit registration table — any of these), and replicate the same path for the new file. A module that is referenced but not registered will fail at startup.\n\n2. Validate only what the spec demands. Defensive guards - rejecting null / empty / malformed inputs, adding strict-format checks, throwing on edge cases - belong in the patch only if the problem statement names that scenario. Extra rejections become extra failure modes for callers that previously passed benign-looking inputs.\n\n3. 'Move' means move, not copy. When the spec talks about relocating, extracting, or splitting out logic, the old location must be removed in the same patch. A symbol existing at both old and new paths is almost always wrong: the canonical home is the new path, and downstream references compiled against it cannot resolve to the duplicate left behind. This applies to every named code unit, including tests: when the spec says 'tests need to be relocated' or describes a module rename/reorganization, the old test class, test cases, and imports must be removed from the old location, not merely have their call sites renamed.\n\nThe unifying rule: the smaller the deviation from the existing code's vocabulary and behavior, the smaller the chance of clashing with assumptions that were never written down.\n\n═══ END CUSTOM REPAIR DISCIPLINE ═══",
   "action_history": [
     {
       "phase": "parser",
@@ -365,7 +398,7 @@
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "10_entries",
+      "outcome": "11_entries",
       "requirement_id": "req-001"
     },
     {
@@ -383,7 +416,7 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "AS_IS_VIOLATED:2_locs",
+      "outcome": "AS_IS_COMPLIANT:1_locs",
       "requirement_id": "req-002"
     },
     {
@@ -395,7 +428,7 @@
     {
       "phase": "deep-search",
       "subagent": "deep-search",
-      "outcome": "iter2:AS_IS_VIOLATED",
+      "outcome": "iter2:AS_IS_COMPLIANT",
       "requirement_id": "req-002"
     },
     {
@@ -407,13 +440,13 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "TO_BE_MISSING:1_locs",
+      "outcome": "TO_BE_MISSING:2_locs",
       "requirement_id": "req-003"
     },
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "5_entries",
+      "outcome": "16_entries",
       "requirement_id": "req-003"
     },
     {
@@ -431,13 +464,13 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "TO_BE_MISSING:5_locs",
+      "outcome": "TO_BE_MISSING:4_locs",
       "requirement_id": "req-004"
     },
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "8_entries",
+      "outcome": "14_entries",
       "requirement_id": "req-004"
     },
     {
@@ -461,7 +494,7 @@
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "7_entries",
+      "outcome": "3_entries",
       "requirement_id": "req-005"
     },
     {
@@ -479,13 +512,13 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "TO_BE_MISSING:2_locs",
+      "outcome": "TO_BE_MISSING:3_locs",
       "requirement_id": "req-006"
     },
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "11_entries",
+      "outcome": "15_entries",
       "requirement_id": "req-006"
     },
     {
@@ -551,13 +584,13 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "TO_BE_MISSING:7_locs",
+      "outcome": "TO_BE_MISSING:6_locs",
       "requirement_id": "req-009"
     },
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "15_entries",
+      "outcome": "19_entries",
       "requirement_id": "req-009"
     },
     {
@@ -575,7 +608,7 @@
     {
       "phase": "deep-search",
       "subagent": "update_requirement_verdict",
-      "outcome": "TO_BE_MISSING:6_locs",
+      "outcome": "TO_BE_MISSING:2_locs",
       "requirement_id": "req-010"
     },
     {
@@ -605,7 +638,7 @@
     {
       "phase": "deep-search",
       "subagent": "update_localization",
-      "outcome": "13_entries",
+      "outcome": "17_entries",
       "requirement_id": "req-011"
     },
     {
@@ -629,7 +662,73 @@
     {
       "phase": "patch-generation",
       "subagent": "apply_search_replace",
+      "outcome": "1_blocks_applied:src/controllers/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "SUB_EDIT_SUCCESS:src/controllers/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "PATCH_SUCCESS:src/controllers/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "apply_search_replace",
       "outcome": "1_blocks_applied:src/controllers/index.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "SUB_EDIT_SUCCESS:src/controllers/index.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "PATCH_SUCCESS:src/controllers/index.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "apply_search_replace",
+      "outcome": "1_blocks_applied:src/routes/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "SUB_EDIT_SUCCESS:src/routes/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "PATCH_SUCCESS:src/routes/well-known.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "apply_search_replace",
+      "outcome": "2_blocks_applied:src/routes/index.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "SUB_EDIT_SUCCESS:src/routes/index.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "PATCH_SUCCESS:src/routes/index.js",
       "requirement_id": ""
     },
     {
@@ -640,8 +739,14 @@
     },
     {
       "phase": "patch-generation",
-      "subagent": "apply_search_replace",
-      "outcome": "2_blocks_applied:src/routes/index.js",
+      "subagent": "patch-generator",
+      "outcome": "SUB_EDIT_SUCCESS:src/routes/user.js",
+      "requirement_id": ""
+    },
+    {
+      "phase": "patch-generation",
+      "subagent": "patch-generator",
+      "outcome": "PATCH_SUCCESS:src/routes/user.js",
       "requirement_id": ""
     },
     {

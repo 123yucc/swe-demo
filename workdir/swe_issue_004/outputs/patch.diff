@@ -1,5 +1,36 @@
+diff --git a/qutebrowser/components/braveadblock.py b/qutebrowser/components/braveadblock.py
+index bd30f5d29..c61ffc3ac 100644
+--- a/qutebrowser/components/braveadblock.py
++++ b/qutebrowser/components/braveadblock.py
+@@ -162,6 +162,13 @@ class BraveAdBlocker:
+             # Do nothing if adblocking is disabled for this site.
+             return False
+ 
++        if blockutils.is_whitelisted_url(request_url):
++            logger.debug(
++                "Request to %s is whitelisted, thus not blocked",
++                request_url.toDisplayString(),
++            )
++            return False
++
+         result = self._engine.check_network_urls(
+             request_url.toString(),
+             first_party_url.toString(),
+@@ -184,12 +191,6 @@ class BraveAdBlocker:
+                 result.exception,
+             )
+             return False
+-        elif blockutils.is_whitelisted_url(request_url):
+-            logger.debug(
+-                "Request to %s is whitelisted, thus not blocked",
+-                request_url.toDisplayString(),
+-            )
+-            return False
+         return True
+ 
+     def filter_request(self, info: interceptor.Request) -> None:
 diff --git a/qutebrowser/components/hostblock.py b/qutebrowser/components/hostblock.py
-index 8a0174584..658c83e53 100644
+index 8a0174584..71e416623 100644
 --- a/qutebrowser/components/hostblock.py
 +++ b/qutebrowser/components/hostblock.py
 @@ -37,7 +37,7 @@ from qutebrowser.api import (
@@ -7,7 +38,7 @@ index 8a0174584..658c83e53 100644
  )
  from qutebrowser.components.utils import blockutils
 -from qutebrowser.utils import version  # FIXME: Move needed parts into api namespace?
-+from qutebrowser.utils import version, urlutils  # FIXME: Move needed parts into api namespace?
++from qutebrowser.utils import urlutils, version  # FIXME: Move needed parts into api namespace?
  
  
  logger = logging.getLogger("network")
@@ -23,8 +54,8 @@ index 8a0174584..658c83e53 100644
 +            return False
 +
 +        host = request_url.host().rstrip('.')
-+        for hostname in urlutils.widened_hostnames(host):
-+            if hostname in self._blocked_hosts or hostname in self._config_blocked_hosts:
++        for host in urlutils.widened_hostnames(host):
++            if host in self._blocked_hosts or host in self._config_blocked_hosts:
 +                return True
 +        return False
  
@@ -55,7 +86,7 @@ index d619eb21f..e889ad4aa 100644
  
  class ScopedValue:
 diff --git a/qutebrowser/utils/urlutils.py b/qutebrowser/utils/urlutils.py
-index 045981680..6bd0b4394 100644
+index 045981680..c02bcff03 100644
 --- a/qutebrowser/utils/urlutils.py
 +++ b/qutebrowser/utils/urlutils.py
 @@ -26,7 +26,7 @@ import ipaddress
@@ -67,23 +98,20 @@ index 045981680..6bd0b4394 100644
  
  from PyQt5.QtCore import QUrl
  from PyQt5.QtNetwork import QHostInfo, QHostAddress, QNetworkProxy
-@@ -41,6 +41,19 @@ from qutebrowser.browser.network import pac
- # https://github.com/qutebrowser/qutebrowser/issues/108
+@@ -73,6 +73,16 @@ class InvalidUrlError(Error):
+         super().__init__(self.msg)
  
  
 +def widened_hostnames(hostname: str) -> Iterable[str]:
 +    """A generator for widening string hostnames.
 +
-+    Generates parent-domain variants of a hostname by successively removing
-+    the leftmost label.
-+
-+    Ex: a.b.c -> [a.b.c, b.c, c]
++    Ex: a.c.foo -> [a.c.foo, c.foo, foo]
 +    """
 +    while hostname:
 +        yield hostname
 +        hostname = hostname.partition(".")[-1]
 +
 +
- # URL schemes supported by QtWebEngine
- WEBENGINE_SCHEMES = [
-     'about',
+ def _parse_search_term(s: str) -> Tuple[Optional[str], Optional[str]]:
+     """Get a search engine name and search term from a string.
+ 

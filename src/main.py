@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from src.artifacts import instance_to_artifact_text
+from src.memory import ensure_running as ensure_ltm_running
 from src.orchestrator.engine import run_orchestrator
 
 
@@ -73,6 +74,14 @@ def prepare_repo(repo_dir: Path, base_commit: str) -> None:
         base_commit: Git commit hash to reset to.
     """
     print(f"[repo-init] Resetting repo to clean state at {base_commit[:8]}...")
+
+    # Disable fileMode tracking — Windows/NTFS cannot preserve Unix execute
+    # bits, causing spurious mode-only diffs that pollute patch.diff and can
+    # break git stash pop during build verification.
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "config", "core.fileMode", "false"],
+        capture_output=True, text=True, check=False,
+    )
 
     # Reset to base_commit (discards any uncommitted changes)
     result = subprocess.run(
@@ -187,6 +196,12 @@ def main() -> None:
         print(f"ERROR: repo_dir not found: {repo_dir}")
         sys.exit(1)
 
+    # --- Long-term memory: ensure experience_server is running -------------
+    # Required dependency. Blocks until /health is OK; first launch may take
+    # 1-3 minutes while the Qwen embedding model loads (and downloads on
+    # cold cache).
+    ensure_ltm_running()
+
     # --- Prepare repo: reset to clean base_commit state ---
     if base_commit:
         prepare_repo(repo_dir, base_commit)
@@ -240,6 +255,7 @@ def main() -> None:
         repo_dir=repo_dir,
         artifact_text=artifact_text,
         output_dir=output_dir,
+        problem_statement=instance.get("problem_statement", "") or artifact_text,
     )
 
     print(f"\n=== COMPLETE ===")

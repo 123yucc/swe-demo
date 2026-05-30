@@ -76,6 +76,43 @@ class SharedWorkingMemory(BaseModel):
             "this via the cache_retrieved_code tool when they find critical code."
         ),
     )
+    ltm_search_summaries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Progressive long-term-memory search summaries selected by code. "
+            "Each entry is a compact outer-layer summary shown to the agent as "
+            "candidate prior experience."
+        ),
+    )
+    ltm_reference_block: str = Field(
+        default="",
+        description=(
+            "Long-term-memory detail block (rendered text) containing browsed "
+            "experience details. Populated only after code selects concrete "
+            "experience ids to open. Empty when no detailed experience has "
+            "been browsed yet."
+        ),
+    )
+    custom_repair_block: str = Field(
+        default="",
+        description=(
+            "Rendered text block of hand-written repair-discipline rules "
+            "matched against the current case via the custom-rule tag "
+            "router (see src/memory/custom_route.py). Independent of the "
+            "ChromaDB-driven ltm_* fields above. Empty when no rule "
+            "matches."
+        ),
+    )
+    build_error_feedback: str = Field(
+        default="",
+        description=(
+            "Rendered compile/collection errors from the post-patch build "
+            "verification gate (src/orchestrator/build_verify.py). Set when "
+            "the gate detects NEW build errors and the pipeline re-opens "
+            "patch planning (repatch). Read by the patch-planner so the next "
+            "plan fixes the broken build. Empty on the first planning pass."
+        ),
+    )
     action_history: list[ActionEvent] = Field(
         default_factory=list,
         description=(
@@ -140,8 +177,41 @@ class SharedWorkingMemory(BaseModel):
                 f"```json\n{self.patch_plan.model_dump_json(indent=2)}\n```\n\n"
             )
 
+        ltm_section = ""
+        if self.ltm_search_summaries:
+            summaries = "\n".join(f"- {item}" for item in self.ltm_search_summaries)
+            ltm_section += (
+                "## Long-Term Memory Search Summaries\n"
+                f"{summaries}\n\n"
+            )
+        if self.ltm_reference_block:
+            ltm_section += f"{self.ltm_reference_block}\n\n"
+
+        custom_section = ""
+        if self.custom_repair_block:
+            custom_section = (
+                "## Custom Repair Discipline (matched by tag-route)\n"
+                f"{self.custom_repair_block}\n\n"
+            )
+
+        build_section = ""
+        if self.build_error_feedback:
+            build_section = (
+                "## Build Verification Errors to Fix\n"
+                "The previous patch was applied but the tree FAILED to "
+                "compile / collect. Fix these errors WITHOUT reverting the "
+                "intended fix. Errors may implicate files that were not in the "
+                "previous plan (e.g. a sibling call site of a renamed symbol, "
+                "or a type that must be defined). Plan edits for every "
+                "implicated file.\n"
+                f"{self.build_error_feedback}\n\n"
+            )
+
         return (
             "═══ SHARED WORKING MEMORY ═══\n\n"
+            f"{ltm_section}"
+            f"{custom_section}"
+            f"{build_section}"
             "## Evidence Cards (current state)\n"
             f"```json\n{self.evidence_cards.model_dump_json(indent=2)}\n```\n\n"
             f"{patch_section}"

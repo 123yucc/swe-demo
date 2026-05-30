@@ -58,6 +58,7 @@ DEEP_SEARCH_OWNED_FIELDS: tuple[str, ...] = (
     "dataflow_relevant_uses",
     "must_co_edit_relations",
     "dependency_propagation",
+    "consistency_anchors",
     "behavioral_constraints",
     "semantic_boundaries",
     "backward_compatibility",
@@ -82,6 +83,7 @@ _LOCALIZATION_FIELDS = (
 _STRUCTURAL_FIELDS = (
     "must_co_edit_relations",
     "dependency_propagation",
+    "consistency_anchors",
 )
 _CONSTRAINT_FIELDS = (
     "behavioral_constraints",
@@ -190,12 +192,59 @@ def reset_requirement_for_rework(
 
 # ── Path normalization ────────────────────────────────────────────────────
 
+# Recognize the path token at the start of an entry. Matches forward-slash /
+# alphanumeric / dot / dash / underscore characters up to the first separator
+# (colon for line/locator, whitespace, end of string).
+_PATH_TOKEN_RE = re.compile(r"^([A-Za-z0-9_./-]+)(?=$|[:\s])")
+# Same shape, but anchored after ` <-> ` so the RHS path of an anchor entry
+# is also reachable. ``<->`` is the consistency-anchor separator.
+_ANCHOR_RHS_RE = re.compile(r"(<->\s*)([A-Za-z0-9_./-]+)(?=$|[:\s])")
+_MAX_STRIP_SEGMENTS = 6
+
+
+def _strip_phantom_prefix(rel_path: str) -> str:
+    """Drop hallucinated leading segments (e.g. ``app/``) until the path
+    resolves under the configured repo root.
+
+    LLMs occasionally prepend the cwd basename (``/app`` -> ``app/``) or
+    similar synthetic prefixes when emitting evidence locations. This
+    breaks every downstream step that resolves the path on disk
+    (apply_search_replace, git diff, hash check). The fix is local to the
+    path-ingestion choke point: if the verbatim path does not exist under
+    repo root, peel one leading segment at a time and try again. Return
+    the original input if no candidate resolves — never invent a path.
+    """
+    if not _repo_root or not rel_path:
+        return rel_path
+    repo = Path(_repo_root)
+    if (repo / rel_path).exists():
+        return rel_path
+    parts = rel_path.split("/")
+    for i in range(1, min(_MAX_STRIP_SEGMENTS, len(parts)) + 1):
+        candidate = "/".join(parts[i:])
+        if candidate and (repo / candidate).exists():
+            return candidate
+    return rel_path
+
+
 def _normalize_path(text: str) -> str:
     """Normalize path references inside a free-form evidence string."""
     normalized = text.replace("\\", "/")
     if _repo_root:
         normalized = normalized.replace(_repo_root, "")
     normalized = re.sub(r"(?<![A-Za-z0-9_/])(?:\./)?repo/", "", normalized)
+    # Phantom-prefix peel: applied to the leading path token and (when
+    # present) the RHS path of a consistency anchor. Only the path portion
+    # is touched; line/locator suffixes are preserved verbatim.
+    m = _PATH_TOKEN_RE.match(normalized)
+    if m:
+        cleaned = _strip_phantom_prefix(m.group(1))
+        if cleaned != m.group(1):
+            normalized = cleaned + normalized[m.end():]
+    normalized = _ANCHOR_RHS_RE.sub(
+        lambda mm: mm.group(1) + _strip_phantom_prefix(mm.group(2)),
+        normalized,
+    )
     return normalized
 
 
@@ -465,7 +514,7 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
             }]
         }
 
-    if verdict != "AS_IS_COMPLIANT" and not evidence_locations:
+    if verdict not in ("AS_IS_COMPLIANT", "TO_BE_MISSING") and not evidence_locations:
         return {
             "content": [{
                 "type": "text",

@@ -18,6 +18,7 @@ class PipelineState(str, Enum):
     EVIDENCE_REFINING = "EvidenceRefining"
     CLOSED = "Closed"
     PATCH_PLANNING = "PatchPlanning"
+    PATCH_VERIFYING = "PatchVerifying"
     PATCH_SUCCESS = "PatchSuccess"
     PATCH_FAILED = "PatchFailed"
     CLOSURE_FORCED_FAIL = "ClosureForcedFail"
@@ -40,8 +41,13 @@ ALLOWED_TRANSITIONS: dict[PipelineState, set[PipelineState]] = {
         PipelineState.PATCH_PLANNING,
     },
     PipelineState.PATCH_PLANNING: {
-        PipelineState.PATCH_SUCCESS,
+        PipelineState.PATCH_VERIFYING,
         PipelineState.PATCH_FAILED,
+    },
+    PipelineState.PATCH_VERIFYING: {
+        PipelineState.PATCH_SUCCESS,        # build passes (or pre-existing-only)
+        PipelineState.PATCH_FAILED,         # new build errors, rework budget gone
+        PipelineState.CLOSED,               # new build errors → re-plan (repatch)
     },
     PipelineState.PATCH_SUCCESS: set(),         # terminal
     PipelineState.PATCH_FAILED: set(),          # terminal
@@ -56,6 +62,7 @@ STATE_ACTIONS: dict[PipelineState, set[str]] = {
     PipelineState.EVIDENCE_REFINING: {"closure-checker"},
     PipelineState.CLOSED: {"patch-planner"},
     PipelineState.PATCH_PLANNING: {"patch-generator"},
+    PipelineState.PATCH_VERIFYING: set(),       # code-only build check; no subagent
     PipelineState.PATCH_SUCCESS: set(),
     PipelineState.PATCH_FAILED: set(),
     PipelineState.CLOSURE_FORCED_FAIL: set(),

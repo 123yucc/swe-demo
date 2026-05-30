@@ -5,6 +5,7 @@ structured PatchPlan with preserved_findings for constraint propagation.
 
 import asyncio
 import re
+from pathlib import Path
 
 from src.agents._structured import run_structured_query
 from src.models.memory import SharedWorkingMemory
@@ -112,6 +113,8 @@ PATCH_PLANNER_SYSTEM_PROMPT = """\
 You are a Senior Staff Engineer planning a precise bug fix.
 
 Review evidence cards and cached code, then produce a strategic edit plan.
+You may also use long-term memory progressively: search summary cards first,
+then browse selected experience ids in detail if they seem analogous.
 Focus on: exact_code_regions, call_chain_context, behavioral_constraints,
 backward_compatibility, missing_elements_to_implement,
 must_co_edit_relations, dependency_propagation.
@@ -136,15 +139,66 @@ this sentence say some file must be changed?"  If yes, that file goes
 into edits.  Do this regardless of language, framework, or directory
 convention.
 
+CRITICAL — thematic split: one filepath may appear MULTIPLE TIMES in `edits`.
+The unit `FileEditPlan` is "one focused change to a file", not "all
+changes to a file".  When a single file needs unrelated changes, emit
+multiple FileEditPlan entries that share the same `filepath`.
+
+Heuristic for whether to split:
+- Function-driven changes (1-3 related functions sharing a single
+  rationale) → ONE FileEditPlan listing those functions in
+  target_functions.
+- Horizontal rule-sets across the whole file (e.g. "rename field X to Y
+  in all references", "replace ctx with f.ctx in every audit-emit call")
+  → ONE FileEditPlan with `target_functions` left empty (or with a
+  short tag like "(file-wide rename pass)") and the rule listed
+  explicitly in change_rationale and preserved_findings.
+- Two unrelated themes in the same file → TWO FileEditPlan entries.
+
+Why this matters: a single FileEditPlan that mixes 20 functions and 19
+findings makes the downstream patch-generator load a 25k-char prompt for
+every retry attempt, exhausting turn budget before producing any edit.
+A focused FileEditPlan with 1-3 functions or a single horizontal rule
+keeps prompts under 10k chars and lets the generator finish in one pass.
+
+Counter-example to AVOID (issue 009 forwarder.go shape):
+  ONE FileEditPlan with 21 target_functions and 19 preserved_findings
+  mixing field renames + audit context fix + cert validation +
+  router privatisation.
+
+Correct shape (same fix, split):
+  - FileEditPlan(filepath=forwarder.go, target_functions=[],
+      change_rationale="Field rename pass: Auth->Authz, Client->AuthClient,
+      AccessPoint->CachingAuthClient, Tunnel->ReverseTunnelSrv,
+      PingPeriod->ConnPingPeriod across the whole file",
+      preserved_findings=[<the 5 rename rules>])
+  - FileEditPlan(filepath=forwarder.go,
+      target_functions=[Forwarder.exec, Forwarder.portForward, Forwarder.catchAll],
+      change_rationale="Audit context leak: replace req.Context() with f.ctx
+      in audit-emit call sites",
+      preserved_findings=[<the audit-context findings>])
+  - FileEditPlan(filepath=forwarder.go,
+      target_functions=[Forwarder.requestCertificate, Forwarder.setClusterSession],
+      change_rationale="Cert NotAfter validation before caching",
+      preserved_findings=[<the cert findings>])
+  - ... etc
+
 CRITICAL — preserved_findings (phase 18.D):
 For each FileEditPlan, you MUST populate the `preserved_findings` field
 with verbatim prescriptive snippets from RequirementItem.findings that
-apply to this file.  Copy these EXACTLY — do not summarize or paraphrase.
+apply to this FileEditPlan's specific theme.  Copy these EXACTLY — do
+not summarize or paraphrase.
+
+Distribute findings by theme, do NOT broadcast all findings to every
+FileEditPlan.  Every prescriptive finding must end up in at least one
+FileEditPlan (a code-level coverage gate will detect orphans and
+auto-attach them, but relying on this is poor planning).
 
 Prescriptive snippets include:
 - Backtick-enclosed code tokens (e.g. `db.mget`, `ttl || Date.now()`)
 - Lines containing "correct is", "should be", "must be", "instead of"
 - Specific formula or comparison expressions
+- Rename rules of the form "X should be Y" / "X -> Y"
 
 Example GOOD preserved_findings:
   ["`ttl || Date.now() + interval > max`", "correct comparison: (ttl || Date.now()) + interval > max"]
@@ -157,17 +211,18 @@ Rules:
 - COMPLETE: include every co-edit target declared in
   must_co_edit_relations / dependency_propagation with an action verb
 - MINIMAL & SUFFICIENT: smallest change set that fully fixes the defect
+- SPLIT BY THEME: same filepath may appear in multiple FileEditPlans
 - ORDER: list edits in dependency order (dependencies first)
 - NO CODE: describe *what* and *why*, not actual code
 - TO-BE items in constraints describe behaviors to ADD, not existing ones
-- preserved_findings: copy verbatim, never summarize
+- preserved_findings: copy verbatim, never summarize, distribute by theme
 
 Return a structured JSON object matching the required schema.
 """
 
 
 def _backfill_declared_coedit_files(
-    plan: PatchPlan, memory: SharedWorkingMemory
+    plan: PatchPlan, memory: SharedWorkingMemory, repo_dir: Path | None = None
 ) -> list[str]:
     """Ensure every file declared as a co-edit target in evidence is in the plan.
 
@@ -176,15 +231,32 @@ def _backfill_declared_coedit_files(
     file path that co-occurs with a co-edit action verb, and appends a
     FileEditPlan for any such path that is missing from ``plan.edits``.
 
+    When *repo_dir* is provided, paths that do not resolve to an existing
+    file in the repo are skipped with a warning.  This guards against the
+    failure mode observed on issue 010: deep-search wrote co-edit sentences
+    with truncated paths (``lastfm/client.go`` instead of
+    ``core/agents/lastfm/client.go``) and the regex picked them up; the
+    auto-added edits then failed at patch-generation time because the file
+    didn't exist on disk.  Filtering at backfill time prevents that 14-edit
+    waste.
+
     Returns the list of filepaths that were appended (for logging).  Mutates
     ``plan.edits`` in place.
     """
     existing_paths = {edit.filepath for edit in plan.edits}
     appended: list[str] = []
+    skipped_missing: list[str] = []
     seen_new: set[str] = set()
 
     for path, sentence in _extract_coedit_targets(memory):
         if path in existing_paths or path in seen_new:
+            continue
+        if repo_dir is not None and not (repo_dir / path).is_file():
+            # Path mentioned in evidence but absent from disk — almost
+            # always a truncated/malformed path from deep-search prose
+            # rather than a real co-edit target.  Skip rather than blindly
+            # append (which would create a guaranteed PATCH_FAILED edit).
+            skipped_missing.append(path)
             continue
         seen_new.add(path)
         plan.edits.append(
@@ -205,10 +277,213 @@ def _backfill_declared_coedit_files(
         )
         appended.append(path)
 
+    if skipped_missing:
+        print(
+            f"[patch-planner] backfill skipped {len(skipped_missing)} path(s) "
+            f"absent from repo: {skipped_missing}",
+            flush=True,
+        )
+
     return appended
 
 
-async def _run_patch_planner_async(memory: SharedWorkingMemory) -> PatchPlan:
+def _collect_all_prescriptive_findings(
+    memory: SharedWorkingMemory,
+) -> list[tuple[str, str]]:
+    """Return ``(req_id, snippet)`` pairs for every prescriptive snippet
+    found across all requirements' findings.
+
+    Used by the coverage gate to detect findings the planner failed to
+    distribute to any FileEditPlan.
+
+    Skips ``AS_IS_COMPLIANT`` requirements: their findings describe code
+    that already satisfies the spec (e.g. "no external caller references
+    `lastfm.Client`"), not constraints to enforce in the patch. Treating
+    them as prescriptive turned every backticked identifier in such a
+    finding into an orphan, which the coverage gate then dumped wholesale
+    into the FileEditPlan whose path happened to match — converting a
+    cleanly-themed 9-edit plan into one 30-finding heavy plan.
+    """
+    if memory.evidence_cards is None:
+        return []
+    pairs: list[tuple[str, str]] = []
+    seen_per_req: dict[str, set[str]] = {}
+    for req in memory.evidence_cards.requirements:
+        if req.verdict == "AS_IS_COMPLIANT":
+            continue
+        if not req.findings:
+            continue
+        seen = seen_per_req.setdefault(req.id, set())
+        for snippet in _extract_prescriptive_snippets(req.findings):
+            if snippet in seen:
+                continue
+            seen.add(snippet)
+            pairs.append((req.id, snippet))
+    return pairs
+
+
+def _snippet_is_present(snippet: str, plan: PatchPlan) -> bool:
+    """Return True if *snippet* appears as a substring of any FileEditPlan's
+    preserved_findings.  Substring rather than equality because the planner
+    may make minor whitespace/punctuation tweaks; a strict match would fire
+    too many false-positive orphans.
+    """
+    needle = snippet.strip()
+    if not needle:
+        return True
+    for edit in plan.edits:
+        for kept in edit.preserved_findings:
+            if needle in kept:
+                return True
+    return False
+
+
+def _assign_orphan_finding(
+    snippet: str,
+    req_id: str,
+    plan: PatchPlan,
+    memory: SharedWorkingMemory,
+) -> tuple[str, list[str]]:
+    """Decide where an orphan prescriptive snippet should be attached.
+
+    Priority:
+    (a) the snippet text itself names a filepath that exists in plan.edits
+    (b) the source RequirementItem (findings + evidence_locations) names a
+        filepath that exists in plan.edits — pick the first one found
+    (c) no path match — broadcast to every FileEditPlan (caller decides)
+
+    Returns ``(strategy, target_filepaths)``.  ``strategy`` is one of
+    ``"snippet_path"``, ``"req_path"``, ``"broadcast"``.
+    """
+    plan_paths = [edit.filepath for edit in plan.edits]
+    plan_paths_norm = {p.replace("\\", "/"): p for p in plan_paths}
+
+    # (a) snippet itself names a planned filepath
+    for match in _FILE_PATH_RE.finditer(snippet):
+        cand = match.group(1).replace("\\", "/")
+        if cand in plan_paths_norm:
+            return "snippet_path", [plan_paths_norm[cand]]
+
+    # (b) source req names a planned filepath
+    if memory.evidence_cards is not None:
+        for req in memory.evidence_cards.requirements:
+            if req.id != req_id:
+                continue
+            haystack = "\n".join([req.findings, *req.evidence_locations])
+            for match in _FILE_PATH_RE.finditer(haystack):
+                cand = match.group(1).replace("\\", "/")
+                if cand in plan_paths_norm:
+                    return "req_path", [plan_paths_norm[cand]]
+            break
+
+    # (c) broadcast
+    return "broadcast", list(plan_paths)
+
+
+def _enforce_preserved_findings_coverage(
+    plan: PatchPlan, memory: SharedWorkingMemory
+) -> None:
+    """Code-level gate: every prescriptive finding from the evidence must end
+    up in at least one FileEditPlan.preserved_findings.
+
+    The planner LLM is encouraged to distribute findings thematically (see
+    PATCH_PLANNER_SYSTEM_PROMPT) but is not perfectly reliable.  This gate
+    detects orphans and auto-attaches them; without it, a missing
+    prescriptive constraint would silently become invisible to the
+    patch-generator.
+
+    Mutates ``plan.edits[*].preserved_findings`` in place.  Logs every
+    orphan attachment so batch runs can spot when the planner is
+    chronically dropping findings.
+    """
+    orphans = [
+        (req_id, snippet)
+        for req_id, snippet in _collect_all_prescriptive_findings(memory)
+        if not _snippet_is_present(snippet, plan)
+    ]
+    if not orphans:
+        return
+
+    print(
+        f"[patch-planner] preserved_findings coverage gate: "
+        f"{len(orphans)} orphan snippet(s) detected; auto-attaching",
+        flush=True,
+    )
+
+    for req_id, snippet in orphans:
+        strategy, targets = _assign_orphan_finding(snippet, req_id, plan, memory)
+        target_set = set(targets)
+        # When multiple FileEditPlan entries share a filepath (the planner
+        # split the file by theme), attach the orphan to ONLY the first
+        # matching plan. Iterating across all of them dumps the same snippet
+        # 8x into 8 distinct plans, ballooning every plan's prompt past the
+        # patch-generator turn budget. Once is enough — the snippet is now
+        # in the working set, satisfying the coverage gate's existence
+        # invariant. Themed re-attachment is the planner's job, not ours.
+        attached_paths: set[str] = set()
+        for edit in plan.edits:
+            if edit.filepath not in target_set:
+                continue
+            if edit.filepath in attached_paths:
+                continue
+            if snippet not in edit.preserved_findings:
+                edit.preserved_findings.append(snippet)
+            attached_paths.add(edit.filepath)
+        snippet_preview = snippet if len(snippet) <= 80 else snippet[:77] + "..."
+        print(
+            f"[patch-planner]   orphan: req={req_id} strategy={strategy} "
+            f"-> {targets}: {snippet_preview!r}",
+            flush=True,
+        )
+
+
+def _deduplicate_shared_findings(plan: PatchPlan) -> None:
+    """For each group of FileEditPlan entries that share the same filepath,
+    remove findings that are duplicated across the group.
+
+    When the planner splits one file into multiple themed FileEditPlans it
+    should distribute preserved_findings by theme. In practice the LLM tends
+    to broadcast every finding to every plan for the same file ("to be safe"),
+    which makes each plan's prompt 3-5× larger than necessary and causes the
+    patch-generator to time out or return empty responses on large files.
+
+    This post-processing pass keeps each finding in the FIRST plan of the
+    group (preserving at least one copy, satisfying the coverage invariant)
+    and removes it from all subsequent plans for the same filepath.
+
+    Mutates ``plan.edits`` in place. Runs after the LLM returns and before
+    the preserved-findings coverage gate (so the gate doesn't re-add them).
+    """
+    from collections import defaultdict
+    filepath_to_edits: dict[str, list[FileEditPlan]] = defaultdict(list)
+    for edit in plan.edits:
+        filepath_to_edits[edit.filepath].append(edit)
+
+    for filepath, edits in filepath_to_edits.items():
+        if len(edits) < 2:
+            continue
+        # Find findings present in every plan (the broadcast set)
+        all_sets = [set(e.preserved_findings) for e in edits]
+        broadcast = set.intersection(*all_sets)
+        if not broadcast:
+            continue
+        removed = 0
+        for edit in edits[1:]:  # keep in first plan, remove from rest
+            before = len(edit.preserved_findings)
+            edit.preserved_findings = [f for f in edit.preserved_findings if f not in broadcast]
+            removed += before - len(edit.preserved_findings)
+        print(
+            f"[patch-planner] dedup {filepath}: removed {removed} broadcast "
+            f"finding(s) from {len(edits)-1} secondary plan(s) "
+            f"({len(broadcast)} unique broadcast snippets)",
+            flush=True,
+        )
+
+
+async def _run_patch_planner_async(
+    memory: SharedWorkingMemory,
+    repo_dir: Path | None = None,
+) -> PatchPlan:
     prompt = (
         "Plan a bug fix based on the following context:\n\n"
         f"{memory.format_for_prompt()}\n\n"
@@ -221,42 +496,51 @@ async def _run_patch_planner_async(memory: SharedWorkingMemory) -> PatchPlan:
         response_model=PatchPlan,
         component="patch-planner",
         allowed_tools=[],
-        max_turns=10,
+        max_turns=20,
         max_budget_usd=1.5,
     )
 
     # ── Framework-agnostic co-edit backfill ──
     # Any file path declared in must_co_edit_relations / dependency_propagation
     # with an action verb that is absent from plan.edits is auto-added.
-    appended = _backfill_declared_coedit_files(plan, memory)
+    # When repo_dir is provided, paths absent from disk are skipped — see
+    # _backfill_declared_coedit_files for the rationale (issue 010).
+    appended = _backfill_declared_coedit_files(plan, memory, repo_dir)
     if appended:
         print(
             f"[patch-planner] backfilled declared co-edit files: {appended}",
             flush=True,
         )
 
-    # ── Phase 18.D: Ensure preserved_findings populated from findings ──
-    # If the model did not fill preserved_findings, backfill from requirements.
-    for edit in plan.edits:
-        if not edit.preserved_findings:
-            for req in memory.evidence_cards.requirements:
-                if req.findings:
-                    snippets = _extract_prescriptive_snippets(req.findings)
-                    for snippet in snippets:
-                        if snippet not in edit.preserved_findings:
-                            edit.preserved_findings.append(snippet)
+    # ── Dedup broadcast findings across plans for the same filepath ──
+    # The planner LLM tends to copy all findings to every themed plan for
+    # the same file. Remove the shared (broadcast) ones from secondary plans
+    # so each plan stays focused and patch-generator prompts stay small.
+    _deduplicate_shared_findings(plan)
+
+    # ── Coverage gate: every prescriptive finding must reach at least one
+    # FileEditPlan.  Replaces the older "fill empty preserved_findings with
+    # everything" backfill — that was a broadcast that only fired when the
+    # whole list was empty, leaving partial coverage silently broken.
+    _enforce_preserved_findings_coverage(plan, memory)
 
     memory.patch_plan = plan
     return plan
 
 
-def run_patch_planner(memory: SharedWorkingMemory) -> PatchPlan:
+def run_patch_planner(
+    memory: SharedWorkingMemory,
+    repo_dir: Path | None = None,
+) -> PatchPlan:
     """Synchronous wrapper.
 
     Args:
         memory: SharedWorkingMemory with evidence cards and cached code.
+        repo_dir: Optional repo root. When provided, backfill skips
+            FileEditPlan auto-additions whose paths don't exist on disk
+            (guards against truncated paths in deep-search prose).
 
     Returns:
         PatchPlan with per-file edit intents.
     """
-    return asyncio.run(_run_patch_planner_async(memory))
+    return asyncio.run(_run_patch_planner_async(memory, repo_dir))
