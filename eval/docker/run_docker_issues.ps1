@@ -1,46 +1,49 @@
 #!/usr/bin/env pwsh
-# Run issues 008-010 sequentially inside their SWE-bench Pro Docker images.
+# Run selected issues sequentially inside their SWE-bench Pro Docker images.
 # Requires: ANTHROPIC_API_KEY set, and eval\docker\setup_wheels.ps1 run first.
+#
+# The harness runs INSIDE the instance's docker image with --repo-dir /app, so
+# the language toolchain (go, python, ...) is present and the post-patch build
+# gate (src/orchestrator/build_verify.py) can actually compile. Running the
+# harness on the Windows host instead leaves Go unverifiable (no `go` on PATH),
+# which is exactly the BUILD_UNVERIFIABLE condition the gate now reports.
+#
+# The image tag is read from each case's instance_metadata.json (dockerhub_tag),
+# so adding a new case only requires appending its issue number to $ISSUE_NUMS.
 
 $ErrorActionPreference = "Stop"
 
 $DEMO_DIR = "D:\demo"
 $DOCKERHUB_USER = "jefzda"
 
-$ISSUES = @(
-    @{
-        num = "008"
-        tag = "qutebrowser.qutebrowser-qutebrowser__qutebrowser-f631cd4422744160d9dcf7a0455da532ce973315-v35616345bb8052ea303186706cec663146f0f"
-        # Has /usr/bin/python3.11; pip missing — bootstrap with get-pip.py
-        python_bin = "/usr/bin/python3.11"
-        pip_setup  = @"
-/usr/bin/python3.11 /demo/eval/docker/wheels/get-pip.py --break-system-packages --no-index --find-links /demo/eval/docker/wheels -q
-/usr/bin/python3.11 -m pip install --break-system-packages --find-links /demo/eval/docker/wheels --no-index -q -r /demo/requirements.lock
-"@
-    },
-    @{
-        num = "009"
-        tag = "gravitational.teleport-gravitational__teleport-3fa6904377c006497169945428e8197158667910-v626ec2a48416b10a88641359a169d99e935ff03"
-        # Debian 11, Python 3.9 only — extract standalone Python 3.11 tarball
-        python_bin = "/opt/python311/bin/python3.11"
-        pip_setup  = @"
-if [ ! -x /opt/python311/bin/python3.11 ]; then
-  mkdir -p /opt/python311
-  tar -xzf /demo/eval/docker/wheels/python311-linux.tar.gz -C /opt/python311 --strip-components=1
+# Just the issue numbers — everything else is derived from instance_metadata.json.
+# 009/010/013 are the Go cases whose build gate only runs with a real toolchain.
+$ISSUE_NUMS = @("008", "009", "010", "013")
+
+# Bootstrap Python 3.11 inside the image. The base systems differ, so probe:
+#   - /usr/bin/python3.11 present + pip works  → use it (qutebrowser, navidrome)
+#   - /usr/bin/python3.11 present, pip missing → bootstrap via get-pip.py
+#   - no system 3.11 (Debian 11 / teleport)    → extract standalone tarball
+# A single probing snippet covers all three so we don't hardcode per case.
+$PIP_SETUP = @"
+set -e
+WHEELS=/demo/eval/docker/wheels
+if [ -x /usr/bin/python3.11 ]; then
+  PYBIN=/usr/bin/python3.11
+  if ! \$PYBIN -m pip --version >/dev/null 2>&1; then
+    \$PYBIN \$WHEELS/get-pip.py --break-system-packages --no-index --find-links \$WHEELS -q
+  fi
+  \$PYBIN -m pip install --break-system-packages --find-links \$WHEELS --no-index -q -r /demo/requirements.lock
+else
+  if [ ! -x /opt/python311/bin/python3.11 ]; then
+    mkdir -p /opt/python311
+    tar -xzf \$WHEELS/python311-linux.tar.gz -C /opt/python311 --strip-components=1
+  fi
+  PYBIN=/opt/python311/bin/python3.11
+  \$PYBIN -m pip install --find-links \$WHEELS --no-index -q -r /demo/requirements.lock
 fi
-/opt/python311/bin/python3.11 -m pip install --find-links /demo/eval/docker/wheels --no-index -q -r /demo/requirements.lock
+echo "PYBIN=\$PYBIN"
 "@
-    },
-    @{
-        num = "010"
-        tag = "navidrome.navidrome-navidrome__navidrome-7073d18b54da7e53274d11c9e2baef1242e8769e"
-        # Python 3.11, pip 23, PEP 668 enforced
-        python_bin = "/usr/bin/python3.11"
-        pip_setup  = @"
-/usr/bin/python3.11 -m pip install --break-system-packages --find-links /demo/eval/docker/wheels --no-index -q -r /demo/requirements.lock
-"@
-    }
-)
 
 if (-not $env:ANTHROPIC_API_KEY) {
     Write-Error "ANTHROPIC_API_KEY is not set. Aborting."
@@ -52,12 +55,21 @@ if (-not (Test-Path "$DEMO_DIR\eval\docker\wheels")) {
     exit 1
 }
 
-foreach ($issue in $ISSUES) {
-    $num     = $issue.num
-    $tag     = $issue.tag
-    $image   = "${DOCKERHUB_USER}/sweap-images:${tag}"
-    $python  = $issue.python_bin
-    $pip_setup = $issue.pip_setup
+foreach ($num in $ISSUE_NUMS) {
+    $metadata_host = "$DEMO_DIR\workdir\swe_issue_${num}\artifacts\instance_metadata.json"
+    if (-not (Test-Path $metadata_host)) {
+        Write-Warning "issue ${num}: $metadata_host not found; skipping."
+        continue
+    }
+
+    # Read the image tag from metadata — no hardcoded tags.
+    $meta = Get-Content $metadata_host -Raw | ConvertFrom-Json
+    $tag  = $meta.dockerhub_tag
+    if (-not $tag) {
+        Write-Warning "issue ${num}: no 'dockerhub_tag' in metadata; skipping."
+        continue
+    }
+    $image = "${DOCKERHUB_USER}/sweap-images:${tag}"
 
     $metadata_path = "/demo/workdir/swe_issue_${num}/artifacts/instance_metadata.json"
     $output_dir    = "/demo/workdir/swe_issue_${num}/outputs"
@@ -74,10 +86,10 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 python3 -c "import http.server; h=type('H',(http.server.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.send_header('Content-Type','application/json'),s.end_headers(),s.wfile.write(b'{\"status\":\"ok\",\"results\":[]}')),  'log_message':lambda *a:None}); http.server.HTTPServer(('127.0.0.1',9030),h).serve_forever()" &
 sleep 2
 
-$pip_setup
+$PIP_SETUP
 
 cd /demo
-$python -m src.main \
+"\$PYBIN" -m src.main \
   --instance-json $metadata_path \
   --repo-dir /app \
   --output-dir $output_dir
@@ -89,7 +101,7 @@ $python -m src.main \
 
     Write-Host ""
     Write-Host "============================================================"
-    Write-Host "  Issue $num"
+    Write-Host "  Issue $num  ($($meta.repo_language))  ->  $tag"
     Write-Host "============================================================"
 
     Write-Host "[pull] $image"

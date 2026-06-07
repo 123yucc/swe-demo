@@ -6,6 +6,7 @@ from src.models.evidence import (
     ConstraintCard,
     LocalizationCard,
     RequirementItem,
+    RequirementStatus,
     StructuralCard,
     SymptomCard,
 )
@@ -38,9 +39,18 @@ class EvidenceCards(BaseModel):
     requirements: list[RequirementItem] = Field(
         default_factory=list,
         description=(
-            "Task-driving list of behavioral requirements. Parser initializes "
-            "with verdict=UNCHECKED; deep-search updates verdict / "
-            "evidence_locations / findings per requirement."
+            "Active repair queue. Parser initializes all extracted "
+            "requirements here with verdict=UNCHECKED; deep-search keeps "
+            "violated/missing/partial items here and moves verified "
+            "AS_IS_COMPLIANT items to requirement_status."
+        ),
+    )
+    requirement_status: list[RequirementStatus] = Field(
+        default_factory=list,
+        description=(
+            "Lightweight coverage records for requirements verified as "
+            "AS_IS_COMPLIANT. These records intentionally avoid long findings "
+            "and are not default patch-planning material."
         ),
     )
     schema_version: SchemaVersion = Field(

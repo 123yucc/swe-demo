@@ -22,6 +22,7 @@ import asyncio
 import json
 import re
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,48 @@ def _extract_req_ids(text_parts: list[str]) -> list[str]:
                 seen.add(match)
                 out.append(match)
     return out
+
+
+# ── Phase 25: dimension → operator → reset-scope mapping ───────────────────
+
+# The closed enum of conflicting fields the LLM may name, mapped to the reset
+# scope the deterministic reset tool actually supports ({"findings"} or full).
+# Anything other than a pure findings-level conflict is a full reset.
+_FINDINGS_ONLY_FIELDS = frozenset({"findings"})
+
+
+@dataclass
+class RworkSpec:
+    """One requirement's rework instruction derived from a closure verdict.
+
+    operator distinguishes the two failure classes the phase-25 design encodes:
+      * ``deepen``    — Sufficiency FAIL: the investigation is too thin; redo it
+                        fully (explore/converge to close the evidence gap).
+      * ``reconcile`` — Consistency / prescriptive FAIL: the evidence conflicts;
+                        re-ground the implicated requirement(s) with a reasoning
+                        path different from the rejected verdict.
+    Both physically reuse ``reset_requirement_for_rework`` — only fields_to_reset
+    and the feedback template differ.
+    """
+
+    operator: str  # "deepen" | "reconcile"
+    fields_to_reset: set[str] | None  # None = full reset, {"findings"} = conclusion only
+    feedback: str
+
+    def merge(self, other: "RworkSpec") -> "RworkSpec":
+        """Combine two specs for the same requirement; prefer the wider reset."""
+        # Full reset (None) dominates findings-only; deepen dominates reconcile.
+        wider = None if (self.fields_to_reset is None or other.fields_to_reset is None) else self.fields_to_reset
+        op = "deepen" if "deepen" in (self.operator, other.operator) else "reconcile"
+        fb = self.feedback if self.feedback == other.feedback else f"{self.feedback}\n{other.feedback}"
+        return RworkSpec(operator=op, fields_to_reset=wider, feedback=fb)
+
+
+def _conflicting_field_to_scope(conflicting_field: str | None) -> set[str] | None:
+    """Map a DimensionFinding.conflicting_field enum value to a reset scope."""
+    if conflicting_field in _FINDINGS_ONLY_FIELDS:
+        return {"findings"}
+    return None
 
 
 def _build_per_req_audit_feedback(
@@ -88,6 +131,74 @@ def _build_per_req_audit_feedback(
         )
     return out
 
+
+def _derive_rework_specs(
+    verdict: "ClosureVerdict",
+) -> dict[str, RworkSpec]:
+    """Map a closure verdict's dimension findings to per-requirement rework specs.
+
+    Phase 25 mapping (deterministic — the LLM reports only dimension + enum
+    field + relevant reqs; code decides reset scope and operator):
+
+      | dimension    | operator   | reset scope                              |
+      |--------------|------------|------------------------------------------|
+      | sufficiency  | deepen     | full reset (None) of each named req      |
+      | consistency  | reconcile  | <cross-req> or multi-req → full reset    |
+      |              |            | all named; else map conflicting_field    |
+      | prescriptive | reconcile  | {"findings"} (conclusion only)           |
+      | (audited)    |            |                                          |
+
+    Returns ``{requirement_id: RworkSpec}``.
+    """
+    specs: dict[str, RworkSpec] = {}
+
+    def _add(rid: str, spec: RworkSpec) -> None:
+        if not rid or rid == "<cross-req>":
+            return
+        specs[rid] = specs[rid].merge(spec) if rid in specs else spec
+
+    for finding in verdict.dimension_findings:
+        if finding.status != "FAIL":
+            continue
+        explanation = (finding.explanation or "").strip() or "(no explanation)"
+        field_label = finding.conflicting_field or "evidence"
+        if finding.dimension == "sufficiency":
+            feedback = (
+                "Sufficiency FAIL — the evidence does not yet support a single "
+                f"correct repair commit: {explanation}. Deepen the investigation "
+                f"(localization / constraints) for {field_label}."
+            )
+            targets = finding.requirement_ids or []
+            for rid in targets:
+                _add(rid, RworkSpec("deepen", None, feedback))
+        elif finding.dimension == "consistency":
+            cross = (
+                finding.conflicting_field == "<cross-req>"
+                or len(finding.requirement_ids) > 1
+            )
+            scope = None if cross else _conflicting_field_to_scope(finding.conflicting_field)
+            feedback = (
+                f"Consistency FAIL on {field_label}: {explanation}. This round "
+                "you MUST produce a reasoning path different from the prior "
+                "verdict so the contradiction resolves."
+            )
+            for rid in finding.requirement_ids:
+                _add(rid, RworkSpec("reconcile", scope, feedback))
+
+    # Prescriptive boundary check (per-task AuditResult) → findings-only reconcile.
+    for result in verdict.audited:
+        checks = result.per_check or {}
+        if checks.get("prescriptive_boundary_self_check") == "FAIL":
+            fb = (
+                "Prescriptive boundary FAIL — the proposed fix fails an edge "
+                "case. Re-verify the prescriptive findings against boundary "
+                "conditions and rewrite the conclusion."
+            )
+            _add(result.requirement_id, RworkSpec("reconcile", {"findings"}, fb))
+
+    return specs
+
+
 from src.agents.closure_checker_agent import _run_closure_checker_async
 from src.agents.custom_router_agent import run_custom_router
 from src.agents.deep_search_agent import _run_deep_search_async
@@ -121,6 +232,8 @@ from src.orchestrator.consistency_checks import (
     check_rename_residue,
     render_residue_for_feedback,
 )
+from src.orchestrator.grounding import run_static_grounding
+from src.orchestrator.dynamic_grounding import run_dynamic_grounding
 from src.orchestrator.guards import (
     DeepSearchBudget,
     check_consistency_anchors_format,
@@ -441,7 +554,11 @@ async def _persist_report_findings(report, scope_requirement_id: str) -> None:
                 flush=True,
             )
 
-    # 2) AS-IS code observations (scoped)
+    # 2) AS-IS code observations (scoped).  Compliant requirements are stored
+    # as lightweight coverage status, not as patch-planning material.
+    if report.requirement_verdict == "AS_IS_COMPLIANT":
+        return
+
     loc_args: dict[str, Any] = {"scope_requirement_id": target_id or "unscoped"}
     for attr in (
         "suspect_entities",
@@ -715,7 +832,8 @@ async def run_pipeline_from_evidence(
     """Resume the pipeline from pre-populated evidence + working memory.
 
     Skips parser/init: the caller is responsible for having populated
-    ``ingestion_tools._working_memory`` and ``_scoped_store`` beforehand.
+    ``ingestion_tools._working_memory`` beforehand (scoped evidence lives on
+    each RequirementItem.scoped_evidence).
     Enters the state machine in EVIDENCE_REFINING so the closure-checker
     runs first (which is where a resume is typically useful).
     """
@@ -793,6 +911,13 @@ async def _run_state_machine(
     # Prevents infinite retry when a requirement keeps failing before verdict is set.
     _ds_fail_counts: dict[str, int] = {}
     _DS_FAIL_MAX = 3
+
+    # Dynamic grounding (phase 26): opt-in, runs at most once per case at the
+    # evidence stage (before the closure-checker LLM). Tracks whether the single
+    # pass has been consumed, plus the per-requirement reachability notes it
+    # produced (injected into the closure-checker as a soft consistency input).
+    _dynamic_grounding_done = False
+    dynamic_notes: list[str] = []
 
     _terminal_states = (
         PipelineState.PATCH_SUCCESS,
@@ -1053,6 +1178,128 @@ async def _run_state_machine(
                     state = PipelineState.UNDER_SPECIFIED
                     continue
 
+            # ── Static grounding gate (phase 25, ③ Correct attribution) ──
+            # Deterministic code/grep/AST check that every cited region,
+            # suspect symbol, findings snippet, call-chain edge, symptom symbol
+            # and missing_element is actually grounded in the repository. This
+            # LOWERS the closure-checker's old factual audit into code. Definite
+            # refutations reset the owning requirement; global-card failures are
+            # attributed back to a req (path/token/scoped) or fall back to a
+            # whole-pipeline UNDER_SPECIFIED bounce when truly <global>.
+            grounding_failures = run_static_grounding(current_evidence, repo_dir)
+            if grounding_failures and not budget.is_exhausted():
+                per_req_g: dict[str, list[str]] = {}
+                global_lines_g: list[str] = []
+                for gf in grounding_failures:
+                    if gf.requirement_id == "<global>":
+                        global_lines_g.append(gf.render())
+                    else:
+                        per_req_g.setdefault(gf.requirement_id, []).append(gf.render())
+                reset_ids_g: list[str] = []
+                for rid, lines in per_req_g.items():
+                    feedback = (
+                        "Static grounding gate found evidence that does NOT "
+                        "resolve in the repository:\n"
+                        + "\n".join(f"  - {line}" for line in lines)
+                        + "\n\nRe-investigate: open the files yourself and either "
+                        "correct the cited regions/symbols/findings to match the "
+                        "actual code, or change the verdict if the code does not "
+                        "support it."
+                    )
+                    if reset_requirement_for_rework(rid, audit_feedback=feedback):
+                        reset_ids_g.append(rid)
+                if reset_ids_g:
+                    print(
+                        f"[orchestrator] static-grounding gate → reset "
+                        f"{reset_ids_g}; returning to deep-search.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="evidence-refining",
+                        outcome=f"grounding_failed:{len(reset_ids_g)}_reqs",
+                    )
+                    assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
+                    state = PipelineState.UNDER_SPECIFIED
+                    continue
+                if global_lines_g:
+                    # Unattributable failures: 3-tier attribution already missed,
+                    # so there is no single requirement to reset. Bouncing the
+                    # whole pipeline here would deadloop when no requirement is
+                    # UNCHECKED (UNDER_SPECIFIED returns immediately, the gate
+                    # re-fails, budget never moves). Mirror the existing <global>
+                    # anchor precedent: surface them for the next deep-search
+                    # round via memory, but do NOT block closure.
+                    memory.build_error_feedback = (
+                        (memory.build_error_feedback + "\n\n"
+                         if memory.build_error_feedback else "")
+                        + "Static grounding gate (unattributed global fields):\n"
+                        + "\n".join(f"  - {line}" for line in global_lines_g)
+                    )
+                    print(
+                        "[orchestrator] static-grounding gate: unattributable "
+                        f"<global> failures (non-blocking): {global_lines_g[:3]}",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="evidence-refining",
+                        outcome=f"grounding_global_failed:{len(global_lines_g)}",
+                    )
+
+            # ── Dynamic grounding gate (phase 26, ③ runtime layer) ───────
+            # Opt-in, at most ONCE per case. Reproduces the bug on base_commit,
+            # applies the symptom gate, and mechanically matches the observed
+            # failure path against each requirement's cited regions. NEVER
+            # gates flow on its own (no reset): dynamic_reached is positive
+            # confidence context; dynamic_not_reached is a soft consistency
+            # note for the closure-checker; unverifiable is a no-op. The static
+            # results above stand regardless. Working tree is restored inside
+            # run_dynamic_grounding (base_commit hygiene).
+            if not _dynamic_grounding_done:
+                _dynamic_grounding_done = True
+                try:
+                    dyn_results = await run_dynamic_grounding(
+                        current_evidence,
+                        repo_dir,
+                        problem_statement=memory.issue_context,
+                    )
+                except Exception as exc:
+                    dyn_results = []
+                    print(
+                        "[orchestrator] dynamic-grounding raised "
+                        f"{type(exc).__name__}: {exc} — treating as unverifiable",
+                        flush=True,
+                    )
+                reached = [d for d in dyn_results if d.grounded_by == "dynamic_reached"]
+                not_reached = [
+                    d for d in dyn_results if d.grounded_by == "dynamic_not_reached"
+                ]
+                if reached:
+                    pos_block = "\n".join(f"  - {d.render()}" for d in reached)
+                    memory.build_error_feedback = (
+                        (memory.build_error_feedback + "\n\n"
+                         if memory.build_error_feedback else "")
+                        + "Dynamic grounding (runtime confidence — failure path "
+                        "traversed these cited locations):\n" + pos_block
+                    )
+                    print(
+                        f"[orchestrator] dynamic-grounding: {len(reached)} req(s) "
+                        "on reproduced failure path (positive context).",
+                        flush=True,
+                    )
+                # not_reached notes are injected into the closure-checker as a
+                # soft consistency input (never auto-reset — repro may be
+                # incomplete).
+                for d in not_reached:
+                    dynamic_notes.append(d.render())
+                if dyn_results:
+                    memory.record_action(
+                        phase="evidence-refining",
+                        outcome=(
+                            f"dynamic_grounding:reached={len(reached)},"
+                            f"not_reached={len(not_reached)}"
+                        ),
+                    )
+
             # ── Structural invariants (phase 18.A) ───────────────────────
             # I2 violations (new_interface + AS_IS_COMPLIANT) are mechanical
             # contradictions → reset to UNCHECKED and re-dispatch deep-search
@@ -1115,6 +1362,7 @@ async def _run_state_machine(
                 try:
                     verdict = await _run_closure_checker_async(
                         current_evidence, manifest, repo_dir,
+                        dynamic_notes=dynamic_notes,
                     )
                     closure_exc = None
                     break
@@ -1238,22 +1486,41 @@ async def _run_state_machine(
                     )
                     state = PipelineState.CLOSURE_FORCED_FAIL
                 else:
-                    # Rework path: extract req IDs cited in the closure's
-                    # `missing` / `suggested_tasks`, reset those requirements
-                    # to UNCHECKED, stash the rationale so the next
-                    # deep-search can see the contradiction context.
-                    conflict_req_ids = _extract_req_ids(
+                    # Rework path (phase 25): derive per-requirement specs from
+                    # the closure-checker's dimension findings.  sufficiency
+                    # FAIL → deepen (full reset); consistency / prescriptive
+                    # FAIL → reconcile (cross-req full reset or findings-only).
+                    rework_specs = _derive_rework_specs(verdict)
+                    # Req ids cited in missing/suggested_tasks but absent from
+                    # the dimension findings (e.g. coverage-fail synthesized ids)
+                    # have no spec → fall back to a deepen full reset.
+                    cited_req_ids = _extract_req_ids(
                         verdict.missing + verdict.suggested_tasks
                     )
+                    for rid in cited_req_ids:
+                        if rid not in rework_specs:
+                            rework_specs[rid] = RworkSpec(
+                                "deepen", None,
+                                "Flagged for rework without a specific dimension "
+                                "finding; re-investigate this requirement fully.",
+                            )
+
+                    conflict_req_ids = list(rework_specs.keys())
                     if rework_rounds_used < rework_rounds_max and conflict_req_ids:
                         per_req_feedback = _build_per_req_audit_feedback(
                             verdict, conflict_req_ids,
                         )
                         reset_ids: list[str] = []
                         for rid in conflict_req_ids:
+                            spec = rework_specs[rid]
+                            combined_feedback = (
+                                f"[operator={spec.operator}] {spec.feedback}\n\n"
+                                + per_req_feedback.get(rid, "")
+                            )
                             if reset_requirement_for_rework(
                                 rid,
-                                audit_feedback=per_req_feedback.get(rid, ""),
+                                audit_feedback=combined_feedback,
+                                fields_to_reset=spec.fields_to_reset,
                             ):
                                 reset_ids.append(rid)
                     else:
@@ -1261,17 +1528,25 @@ async def _run_state_machine(
 
                     if reset_ids:
                         rework_rounds_used += 1
+                        scope_note = ", ".join(
+                            f"{rid}:{rework_specs[rid].operator}="
+                            f"{'findings' if rework_specs[rid].fields_to_reset == {'findings'} else 'full'}"
+                            for rid in reset_ids
+                        )
                         print(
                             "[orchestrator] EVIDENCE_MISSING → rework: "
-                            f"re-opened {reset_ids} "
+                            f"re-opened {reset_ids} [{scope_note}] "
                             f"(round {rework_rounds_used}/{rework_rounds_max})",
                             flush=True,
+                        )
+                        operators = ",".join(
+                            sorted({rework_specs[rid].operator for rid in reset_ids})
                         )
                         memory.record_action(
                             phase="closure-check",
                             subagent="closure-checker",
                             outcome=(
-                                f"rework:reopen={len(reset_ids)}_reqs:"
+                                f"rework:{operators}:reopen={len(reset_ids)}_reqs:"
                                 f"round={rework_rounds_used}/{rework_rounds_max}"
                             ),
                         )
@@ -1426,6 +1701,36 @@ async def _run_state_machine(
                 )
             else:
                 print("[build-verify] rename-residue gate: clean.", flush=True)
+
+            # Toolchain unavailable (e.g. no `go` on this host) → the build gate
+            # could not run and has NO opinion on the patch. We must NOT treat
+            # this as a verified pass (the old code did: rc=127 produced empty
+            # errors that baseline-subtraction cancelled to "no new errors",
+            # silently green-lighting every Go patch on a host without Go).
+            # The rename-residue gate is git-only and still valid, so honour it;
+            # the build verdict itself is recorded as BUILD_UNVERIFIABLE. The
+            # patch is still written — the real arbiter is the docker eval.
+            if post.unverifiable and not residues:
+                print(
+                    "[build-verify] BUILD_UNVERIFIABLE: toolchain unavailable or "
+                    f"build could not be attributed (cmd='{post.command}'); "
+                    "skipping baseline diff and accepting patch unverified. "
+                    "Run the docker eval for a real build/test verdict.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome="unverifiable",
+                )
+                build_verify_log.append(
+                    {"round": patch_verify_rounds_used, "system": system,
+                     "ok": False, "unverifiable": True,
+                     "command": post.command, "timed_out": post.timed_out}
+                )
+                patch_outcome = "BUILD_UNVERIFIABLE"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
+                continue
 
             if post.ok and not residues:
                 memory.record_action(phase="build-verify", outcome="ok")

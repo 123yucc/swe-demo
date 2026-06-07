@@ -118,14 +118,3 @@ def run_parser(md_contents: str) -> EvidenceCards:
         Populated EvidenceCards instance.
     """
     return asyncio.run(_run_parser_async(md_contents))
-
-
-def load_artifacts(artifacts_dir: str | Path) -> str:
-    """Read all .md files in *artifacts_dir* and concatenate them."""
-    artifacts_dir = Path(artifacts_dir)
-    parts: list[str] = []
-    for md_file in sorted(artifacts_dir.glob("*.md")):
-        parts.append(f"=== {md_file.name} ===\n{md_file.read_text(encoding='utf-8')}\n")
-    if not parts:
-        raise FileNotFoundError(f"No .md files found in {artifacts_dir}")
-    return "\n".join(parts)

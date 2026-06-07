@@ -10,7 +10,10 @@ Run:  python -m pytest tests/test_build_verify.py -v
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
+
+import pytest
 
 from src.orchestrator.build_verify import (
     BuildCheckResult,
@@ -20,6 +23,7 @@ from src.orchestrator.build_verify import (
     parse_go_errors,
     parse_python_errors,
     render_errors_for_feedback,
+    run_build_check,
 )
 
 # ── Real captured output (verbatim from eval logs) ──────────────────────────
@@ -141,9 +145,77 @@ def test_diff_new_errors_treats_all_as_new_when_baseline_missing():
     assert diff_new_errors(None, post) == post.errors
 
 
-# ── Detection ───────────────────────────────────────────────────────────────
+# ── Unverifiable (toolchain missing) ────────────────────────────────────────
+# These guard the silent-pass bug: a Go repo on a host without `go` produced
+# rc=127 + empty errors, which baseline-subtraction cancelled to "no new
+# errors", green-lighting every Go patch. The gate must now report
+# unverifiable instead of a verified pass.
 
-def test_detect_build_system(tmp_path: Path):
+def test_run_go_without_toolchain_is_unverifiable_not_ok(tmp_path: Path):
+    """A go.mod repo built on a host with no `go` → unverifiable, not ok.
+
+    No mock: this relies on the real absence of `go` on the test host. If `go`
+    happens to be installed, the premise does not hold and we skip — we never
+    fake the toolchain.
+    """
+    if shutil.which("go") is not None:
+        pytest.skip("go toolchain present; cannot exercise the missing-toolchain path")
+    (tmp_path / "go.mod").write_text("module x\n", encoding="utf-8")
+    (tmp_path / "main.go").write_text("package main\nfunc main() {}\n", encoding="utf-8")
+
+    result = run_build_check(tmp_path, system="go")
+
+    assert result.unverifiable is True
+    assert result.ok is False
+    # The 127 / FileNotFoundError text must NOT have been parsed as a compile
+    # error — otherwise baseline-subtraction logic re-enters the buggy path.
+    assert result.errors == []
+    assert result.skipped is False
+
+
+def test_unverifiable_result_is_not_treated_as_ok():
+    """An unverifiable result is distinct from every ok shape."""
+    unver = BuildCheckResult(system="go", ok=False, unverifiable=True)
+    # It is not ok, not skipped, and carries no errors to diff.
+    assert not unver.ok
+    assert not unver.skipped
+    assert unver.errors == []
+    # Baseline subtraction over two empty-error results yields nothing — which
+    # is precisely why `ok`/`errors` alone could not catch the bug and the
+    # explicit `unverifiable` flag is required to refuse the pass.
+    assert diff_new_errors(unver, unver) == []
+
+
+def test_real_go_errors_are_not_flagged_unverifiable():
+    """A result with parsed compile errors is a real failure, not unverifiable.
+
+    Bidirectional counterpart: a populated `errors` list (toolchain ran and
+    rejected the code) must keep `unverifiable=False`.
+    """
+    errors = parse_go_errors(TELEPORT_STDERR)
+    assert errors  # sanity: the fixture does contain errors
+    result = BuildCheckResult(system="go", ok=False, errors=errors, unverifiable=False)
+    assert result.unverifiable is False
+    assert result.ok is False
+    assert len(result.errors) == len(errors)
+
+
+def test_python_present_is_not_unverifiable(tmp_path: Path):
+    """pytest --collect-only on an empty Python repo → not unverifiable.
+
+    The test host has python; an empty collection (pytest rc=5) is a benign
+    non-zero exit and must NOT be misclassified as unverifiable.
+    """
+    if shutil.which("python") is None:
+        pytest.skip("python interpreter not on PATH under this name")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\nversion='0'\n", encoding="utf-8")
+
+    result = run_build_check(tmp_path, system="python")
+
+    assert result.unverifiable is False
+
+
+# ── Detection ───────────────────────────────────────────────────────────────
     go = tmp_path / "go"
     go.mkdir()
     (go / "go.mod").write_text("module x\n", encoding="utf-8")

@@ -34,7 +34,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-BuildSystem = Literal["go", "python", "node", "unknown"]
+BuildSystem = Literal["go", "python", "node", "java", "unknown"]
+
+# Return code from ``_run`` when the toolchain executable itself was not found
+# (FileNotFoundError / OSError on subprocess spawn). Distinct from a non-zero
+# rc produced by a toolchain that *did* run and rejected the code.
+_RC_TOOLCHAIN_MISSING = 127
 
 
 # ── Detection ──────────────────────────────────────────────────────────────
@@ -42,16 +47,26 @@ BuildSystem = Literal["go", "python", "node", "unknown"]
 def detect_build_system(repo_dir: Path) -> BuildSystem:
     """Classify the repo's build system by marker files.
 
-    Precedence: go.mod > python (pyproject/setup.py/setup.cfg) > package.json.
-    Go takes precedence because a Go repo's static compile is the highest-value
-    check; Python next; ``package.json`` only when no compiled toolchain marker
-    is present.
+    Precedence: go.mod > python (pyproject/setup.py/setup.cfg) > java
+    (pom.xml/build.gradle) > package.json.  Go takes precedence because a Go
+    repo's static compile is the highest-value check; Python next; Java's
+    marker is checked before ``package.json`` because a JVM repo with a
+    ``package.json`` for front-end assets is still a JVM repo. ``package.json``
+    only when no compiled-toolchain marker is present.
+
+    NOTE — java is recognised here only so the phase-26 dynamic-grounding gate
+    can dispatch to the JVM reproduction adapter. The post-patch build gate
+    (``run_build_check``) deliberately does NOT compile java yet (it returns
+    ``skipped`` like node); that is a separate decision.
     """
     if (repo_dir / "go.mod").is_file():
         return "go"
     for marker in ("pyproject.toml", "setup.py", "setup.cfg"):
         if (repo_dir / marker).is_file():
             return "python"
+    for marker in ("pom.xml", "build.gradle", "build.gradle.kts"):
+        if (repo_dir / marker).is_file():
+            return "java"
     if (repo_dir / "package.json").is_file():
         return "node"
     return "unknown"
@@ -86,7 +101,20 @@ class BuildError:
 
 @dataclass
 class BuildCheckResult:
-    """Outcome of one build verification pass."""
+    """Outcome of one build verification pass.
+
+    Four mutually-meaningful shapes:
+      * ``ok=True``                  — the command ran and reported no errors.
+      * ``ok=False`` + ``errors``    — the command ran and produced parseable
+                                       compile/collection errors.
+      * ``skipped=True``             — no compile step for this build system
+                                       (node / unknown); not a failure.
+      * ``unverifiable=True``        — the command could NOT be run (toolchain
+                                       missing, rc=127) or exited non-zero with
+                                       no parseable error.  This is NOT a pass:
+                                       the gate has no opinion on the patch and
+                                       the caller must not treat it as success.
+    """
 
     system: BuildSystem
     ok: bool
@@ -95,6 +123,7 @@ class BuildCheckResult:
     command: str = ""
     skipped: bool = False
     timed_out: bool = False
+    unverifiable: bool = False
 
     def signatures(self) -> set[str]:
         return {e.signature() for e in self.errors}
@@ -254,6 +283,7 @@ def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
     raw_parts: list[str] = []
     ok = True
     timed_out = False
+    toolchain_missing = False
     seen_sig: set[str] = set()
 
     for cmd in commands:
@@ -261,6 +291,8 @@ def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
         raw_parts.append(f"$ {' '.join(cmd)} (rc={rc})\n{out}")
         if t_out:
             timed_out = True
+        if rc == _RC_TOOLCHAIN_MISSING:
+            toolchain_missing = True
         if rc != 0:
             ok = False
         for err in parse_go_errors(out):
@@ -269,6 +301,14 @@ def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
             seen_sig.add(err.signature())
             all_errors.append(err)
 
+    # Unverifiable when the toolchain could not be spawned, or a command failed
+    # but produced no parseable error (a failure we cannot attribute to code).
+    # A timeout is a distinct, honestly-reported condition — not unverifiable.
+    unverifiable = (
+        not timed_out
+        and (toolchain_missing or (not ok and not all_errors))
+    )
+
     return BuildCheckResult(
         system="go",
         ok=ok and not all_errors,
@@ -276,6 +316,7 @@ def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
         raw_output="\n\n".join(raw_parts),
         command=" && ".join(" ".join(c) for c in commands),
         timed_out=timed_out,
+        unverifiable=unverifiable,
     )
 
 
@@ -284,6 +325,11 @@ def _run_python(repo_dir: Path, timeout: int) -> BuildCheckResult:
     cmd = ["python", "-m", "pytest", "--collect-only", "-q"]
     rc, out, t_out = _run(cmd, repo_dir, timeout)
     errors = parse_python_errors(out)
+    # Only a missing interpreter is unverifiable here. pytest has benign
+    # non-zero exits (rc=5 = no tests collected, rc=4 = usage) that must NOT
+    # be misread as unverifiable; genuine collection failures always emit
+    # parseable ``ERROR`` lines, which land in ``errors`` above.
+    unverifiable = (rc == _RC_TOOLCHAIN_MISSING) and not t_out
     return BuildCheckResult(
         system="python",
         ok=(rc == 0) and not errors,
@@ -291,6 +337,7 @@ def _run_python(repo_dir: Path, timeout: int) -> BuildCheckResult:
         raw_output=f"$ {' '.join(cmd)} (rc={rc})\n{out}",
         command=" ".join(cmd),
         timed_out=t_out,
+        unverifiable=unverifiable,
     )
 
 

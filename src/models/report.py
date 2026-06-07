@@ -17,14 +17,11 @@ from src.models.evidence import ActiveVerdict
 class DeepSearchReport(BaseModel):
     """Structured report returned by the deep-search subagent.
 
-    Each field maps directly to an update_localization argument key,
-    so the orchestrator can persist findings without any parsing.
-
     Starting in phase 16, a single deep-search invocation is scoped to a
     single RequirementItem (target_requirement_id). The requirement_*
-    fields capture the verdict for that item, while the legacy
-    localization/structural fields carry AS-IS code observations that
-    are independent of any one requirement.
+    fields capture the verdict for that item. The remaining fields are
+    persisted AS-IS code observations; each maps directly to an
+    update_localization argument key.
     """
 
     target_requirement_id: str = Field(
@@ -51,23 +48,13 @@ class DeepSearchReport(BaseModel):
             "Do NOT include hypothetical boundary speculation or 'OPEN ISSUE' notes here."
         ),
     )
-    boundary_analysis: str = Field(
-        default="",
-        description=(
-            "Edge case enumeration for prescriptive fixes (phase 18.E reflection). "
-            "If requirement_findings contains a prescriptive fix, enumerate ≥2 boundary "
-            "cases here (null/undefined, empty set, max value, etc.) and verify each "
-            "against actual code behavior. This field is informational only and NOT "
-            "used for closure-checker validation. Keep hypothetical risks and 'OPEN ISSUE' "
-            "notes here, not in requirement_findings."
-        ),
-    )
     requirement_evidence_locations: list[str] = Field(
         default_factory=list,
         description=(
             "Code locations ('file.py:LINE' or 'file.py:LINE-LINE') that "
-            "substantiate the requirement_verdict. Required non-empty unless "
-            "requirement_verdict == 'AS_IS_COMPLIANT'."
+            "substantiate the requirement_verdict. Required for "
+            "AS_IS_COMPLIANT, AS_IS_VIOLATED, and TO_BE_PARTIAL; "
+            "TO_BE_MISSING may be empty when no definition exists."
         ),
     )
     exact_code_regions: list[str] = Field(
@@ -110,37 +97,34 @@ class DeepSearchReport(BaseModel):
             "Cross-cutting dependency paths (interface/package/config)."
         ),
     )
-    missing_elements_to_implement: list[str] = Field(
-        default_factory=list,
-        description=(
-            "TO-BE elements confirmed absent from the codebase. Only list "
-            "items whose DEFINITION is entirely absent (no matching "
-            "'def method_name' or 'class ClassName' found)."
-        ),
-    )
     similar_implementation_patterns: list[str] = Field(
         default_factory=list,
         description=(
             "Existing similar APIs found as reference for the fix."
         ),
     )
-    confirmed_defect_locations: list[str] = Field(
+    semantic_boundaries: list[str] = Field(
         default_factory=list,
         description=(
-            "Confirmed defect locations in 'file.py:LINE -- explanation' format."
+            "AS-IS semantic boundaries: what the existing code handles vs "
+            "does not handle (input ranges, preconditions, invariants). "
+            "Only populate when investigating existing code with AS_IS_VIOLATED verdict."
         ),
     )
-    new_suspects: list[str] = Field(
+    behavioral_constraints: list[str] = Field(
         default_factory=list,
-        description="New suspects discovered during investigation."
+        description=(
+            "AS-IS behavioral constraints observed in existing code: "
+            "ordering requirements, thread-safety assumptions, side-effect "
+            "rules, or implicit contracts callers depend on."
+        ),
     )
-    ruled_out_suspects: list[str] = Field(
+    backward_compatibility: list[str] = Field(
         default_factory=list,
-        description="Leads that turned out to be dead ends."
-    )
-    open_questions: list[str] = Field(
-        default_factory=list,
-        description="Remaining open questions."
+        description=(
+            "Backward compatibility requirements inferred from existing callers: "
+            "APIs, signatures, or behaviors that must not change when fixing the bug."
+        ),
     )
 
     @field_validator("requirement_evidence_locations")

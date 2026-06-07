@@ -1,5 +1,5 @@
 """
-Audit manifest models for phase 18.B.
+Audit manifest models for phase 18.B (re-scoped in phase 25).
 
 AuditTask describes what checks the closure-checker must perform for a given
 requirement. AuditResult captures the outcome of each check.
@@ -7,6 +7,14 @@ requirement. AuditResult captures the outcome of each check.
 The orchestrator builds the manifest (list of AuditTask) via code rules,
 ensuring deterministic audit scope. The closure-checker only executes the
 checks listed in the manifest — it does not decide which requirements to audit.
+
+Phase 25 re-scope: the two FACTUAL checks (``verdict_vs_code`` and
+``findings_anti_hallucination``) were lowered into the deterministic grounding
+gate (``src/orchestrator/grounding.py`` + ``ast_grounding.py``). The only
+semantic check the LLM still owns at the per-task level is
+``prescriptive_boundary_self_check``; the closure-checker's primary job is now
+the two evidence-closure dimensions (sufficiency / consistency), carried on
+``ClosureVerdict.dimension_findings`` rather than per-task AuditResults.
 """
 
 from __future__ import annotations
@@ -16,9 +24,10 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+# Only the prescriptive boundary self-check remains a per-task LLM semantic
+# check. verdict_vs_code / findings_anti_hallucination were downstreamed to the
+# code grounding gate in phase 25.
 CheckType = Literal[
-    "verdict_vs_code",
-    "findings_anti_hallucination",
     "prescriptive_boundary_self_check",
 ]
 
@@ -37,8 +46,7 @@ class AuditTask(BaseModel):
         default_factory=list,
         description=(
             "Why this requirement is in the audit manifest. Examples: "
-            "'non_compliant_defect', 'new_interface_origin', 'overlap_group', "
-            "'findings_has_backtick_tokens', 'findings_has_prescriptive'."
+            "'findings_has_prescriptive'."
         ),
     )
     cited_locations: list[str] = Field(
@@ -51,9 +59,9 @@ class AuditTask(BaseModel):
     checks_required: list[CheckType] = Field(
         default_factory=list,
         description=(
-            "Which semantic checks to perform. Subset of: "
-            "{verdict_vs_code, findings_anti_hallucination, "
-            "prescriptive_boundary_self_check}."
+            "Which semantic checks to perform. Only "
+            "{prescriptive_boundary_self_check} remains an LLM check; the "
+            "factual checks were downstreamed to the code grounding gate."
         ),
     )
 
@@ -108,4 +116,63 @@ class AuditManifest(BaseModel):
             "I1/I3 structural invariant warnings (from check_structural_invariants) "
             "that the closure-checker should be aware of but does not need to act on."
         ),
+    )
+
+
+# ── Phase 25: dimension-level closure findings ─────────────────────────────
+
+# The fixed enum of fields the LLM may name as the locus of a dimension
+# failure. Keeping it a closed set prevents the model from inventing illegal
+# field names; the engine maps each value to a deterministic reset scope.
+ConflictingField = Literal[
+    "verdict",
+    "findings",
+    "evidence_locations",
+    "repair_targets",
+    "missing_elements",
+    "<cross-req>",
+]
+
+
+class DimensionFinding(BaseModel):
+    """One LLM judgement on a single evidence-closure dimension (phase 25).
+
+    The closure-checker is re-scoped to question the two semantic dimensions of
+    a valid evidence closure:
+
+      * ``sufficiency``  — can a repair commit be made from this evidence, or is
+        localization/constraint coverage still too thin?
+      * ``consistency``  — do the active requirement verdicts, the compliant
+        group, and the findings agree, or do they contradict each other?
+
+    A FAIL drives the rework loop; the engine maps (dimension, conflicting_field)
+    to a deterministic reset scope (see engine._derive_rework_specs).
+    """
+
+    dimension: Literal["sufficiency", "consistency"] = Field(
+        description="Which evidence-closure dimension this finding judges.",
+    )
+    status: Literal["PASS", "FAIL"] = Field(
+        description="PASS if the dimension holds; FAIL if it is violated.",
+    )
+    requirement_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Requirement ids implicated by this finding. consistency findings "
+            "may name several (the contradicting reqs); sufficiency findings "
+            "usually name a single req or none. Every id MUST exist in the "
+            "input evidence."
+        ),
+    )
+    conflicting_field: ConflictingField | None = Field(
+        default=None,
+        description=(
+            "The field at the locus of the failure, chosen from the fixed "
+            "enum. Use '<cross-req>' when the conflict spans requirements "
+            "rather than a single field. Null for PASS findings."
+        ),
+    )
+    explanation: str = Field(
+        default="",
+        description="One-sentence reason, written verbatim into rework_context.",
     )

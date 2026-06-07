@@ -31,6 +31,18 @@ python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_meta
 - `patch_outcome.json` — closure-checker approval status and patch result (for long-term memory)
 - `build_verification.json` — per-round post-patch build gate results (Phase 19): build system, command, new (patch-induced) errors
 
+## Running Tests
+
+Always scope to the harness's own suite — **never run a bare `pytest` from the repo root**:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/ -q
+```
+
+Two gotchas this avoids:
+- A bare `pytest` recurses into `workdir/swe_issue_*/repo/` — the checked-out target repos (ansible, hypothesis, …) — and fails collection on their missing deps (`ModuleNotFoundError: ansible` etc.). Those are evaluation fixtures, not harness code. Always pass `tests/`.
+- The environment has a `pytest-qt` plugin with no Qt backend installed; it errors at startup. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` disables plugin autoloading so the suite runs clean.
+
 ## API Credentials
 
 Config is loaded from `.env` at project root (no extra deps — simple key=value parser in `src/config.py`):
@@ -102,17 +114,20 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
 | Config | `src/config.py` | Loads `.env` into `os.environ` for the SDK |
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output |
 | Deep Search Agent | `src/agents/deep_search_agent.py` | Receives a TODO from orchestrator; uses `Grep`, `Read`, `Glob` for multi-dimensional exploration; returns `DeepSearchReport` via SDK structured output. **Phase 18.E**: two-round design — Round 1 (primary investigation) + Round 2 (self-reflection checking token traceability, boundary enumeration, verdict consistency) |
-| Closure Checker Agent | `src/agents/closure_checker_agent.py` | Manifest-driven audit gate (phase 18.B/C): receives pre-computed `AuditManifest`, executes each `AuditTask` with Grep/Read/Glob; returns `ClosureVerdict` with per-task `AuditResult`. Three semantic check types: verdict_vs_code, findings_anti_hallucination, prescriptive_boundary_self_check |
+| Closure Checker Agent | `src/agents/closure_checker_agent.py` | **Phase 25**: re-scoped from factual auditor to **evidence-closure questioner**. Owns the two SEMANTIC dimensions — ① Sufficiency (can a repair commit be made?) and ② Consistency (do active verdicts + the compliant group + findings agree?) — plus the surviving `prescriptive_boundary_self_check`. The factual checks (`verdict_vs_code`, `findings_anti_hallucination`) were lowered into the code grounding gate. Returns `ClosureVerdict.dimension_findings` (per-dimension PASS/FAIL with a fixed `conflicting_field` enum) + per-task `AuditResult`. The compliant group (`requirement_status`) is explicitly re-injected for consistency auditing. |
 | Orchestrator | `src/orchestrator/engine.py` | Code-driven while-loop pipeline; calls sub-agents directly at semantic nodes; enforces state transitions via `PipelineState` enum. **Phase 18**: integrates `check_structural_invariants`, `build_audit_manifest`, validates manifest coverage, differentiated rework feedback. **Phase 19**: `PatchVerifying` build gate + build-error-feedback repatch loop. **Phase 23**: anchor-format/factual gates before closure-checker; rename-residue gate folded into PatchVerifying so old-symbol leftovers feed the same repatch loop as build errors |
 | State Machine | `src/orchestrator/states.py` | `PipelineState` enum (including terminal `CLOSURE_FORCED_FAIL` and the `PATCH_VERIFYING` build gate), `ALLOWED_TRANSITIONS` table, `STATE_ACTIONS` per-state allowed subagent types |
 | Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). **Phase 23**: `check_consistency_anchors_format`. `DeepSearchBudget` iteration limiter. |
 | Build Verifier | `src/orchestrator/build_verify.py` | **Phase 19**: deterministic post-patch build gate. `detect_build_system`, `run_build_check` (go build/vet, pytest --collect-only), `parse_go_errors`/`parse_python_errors`, `diff_new_errors` (baseline subtraction). No LLM. |
 | Consistency Gates | `src/orchestrator/consistency_checks.py` | **Phase 23**: `check_consistency_anchors` (verifies each anchor's two endpoints exist as line ranges or grep-visible symbols) at closure stage; `check_rename_residue` (extracts `(old, new)` pairs from working-tree diff, greps for surviving old refs in unmodified files) at PatchVerifying stage. Failures feed the existing rework / repatch loops. No LLM. |
+| Static Grounding Gate | `src/orchestrator/grounding.py` | **Phase 25** (③ Correct attribution, no LLM): lowers the closure-checker's old factual audit into code. `ground_exact_code_regions` / `ground_suspect_entities` / `ground_findings_snippets` / `ground_missing_elements` (grep/Read), `ground_call_chain` / `ground_symptom_symbols` (AST-backed). Definite refutations reset the owning requirement; global card-field failures are attributed back to a req via `attribute_field_failure_to_req` (path → token → scoped_evidence 3-tier), else `<global>` non-blocking. Phase 26: each `GroundingFailure` carries a unified `grounded_by` tag (`static_grep` / `ast`). |
+| Dynamic Grounding Gate | `src/orchestrator/dynamic_grounding.py` | **Phase 26** (③ runtime layer): reproduces the bug ONCE on `base_commit` and mechanically matches the observed failure path against cited regions. `LANG_ADAPTERS` registry (python/go/java/js: `detect/drive_cmd/parse_trace/probe_coverage/parse_coverage`); `observed_symptom` symptom gate (the sole precondition for a strong signal — a silent pass never counts); `match_path_reached` (stack frames ∪ coverage ∩ cited regions, AST def-span granularity, only called when symptom observed); `synthesize_reproduction_script` (restricted LLM: `existing_test_template` first for go/java, else `synthetic_script`; translates repro steps only, never asserts correct behavior). Three states `dynamic_reached` / `dynamic_not_reached` / `dynamic_unverifiable_fallback` — reached → positive memory context, not_reached → soft closure-checker note (NEVER auto-reset), unverifiable → no-op. Restores the working tree after every run. |
+| AST Grounding | `src/orchestrator/ast_grounding.py` | **Phase 25** (gap A, no LLM): cross-language structural index. `build_symbol_index` dispatches by extension — Python via stdlib `ast` (zero-dep baseline), `.go/.js/.ts/.java` via optional tree-sitter (soft-fall-back to grep if unavailable). Queries: `has_call_edge`, `resolves_def_use`, `has_symbol_def`, `has_exception_class`. Only **definite structural refutation** is a fail; parse failure / unsupported language is always soft-pass. |
 | Audit Builder | `src/orchestrator/audit.py` | **Phase 18.B**: `build_audit_manifest()` produces deterministic `AuditManifest` from evidence. All audit scope decisions are code-driven. |
 | Patch Planner Agent | `src/agents/patch_planner_agent.py` | Reads evidence cards, returns `PatchPlan` via SDK structured output. **Phase 18.D**: populates `preserved_findings` per file — verbatim prescriptive snippets from findings that are hard constraints for patch-generator. |
 | Patch Generator Agent | `src/agents/patch_generator_agent.py` | Reads PatchPlan and target files, applies SEARCH/REPLACE edits via MCP tool. **Phase 18.D**: respects `preserved_findings` as hard constraints, receives original requirements text in prompt. |
 | Evidence MCP Tools | `src/tools/ingestion_tools.py` | In-process MCP server exposing `update_localization` (scope-based replace), `update_requirement_verdict`, and `cache_retrieved_code`; also provides `reset_requirement_for_rework(rid, audit_feedback)` for the phase-17 rework path (clears verdict/locations/findings, stashes audit feedback on `RequirementItem.rework_context`) |
-| Patch MCP Tools | `src/tools/patch_tools.py` | In-process MCP server exposing `submit_patch_plan` and `apply_search_replace` |
+| Patch MCP Tools | `src/tools/patch_tools.py` | In-process MCP server exposing `apply_search_replace` for patch-generator edits |
 | Data Models | `src/models/evidence.py`, `context.py`, `memory.py`, `patch.py`, `verdict.py`, `report.py`, `audit.py` | Pydantic v2 models for evidence cards, `ClosureVerdict`, `DeepSearchReport`, `PatchPlan`, **Phase 18.B**: `AuditManifest`, `AuditTask`, `AuditResult` |
 
 ### `src/` File Structure (with annotations)
@@ -150,11 +165,14 @@ src/
         audit.py                       # build_audit_manifest() for deterministic audit scope (phase 18.B)
         build_verify.py                # Post-patch build gate: go build/vet, pytest --collect-only, baseline diff (phase 19)
         consistency_checks.py          # Anchor factual gate + rename-residue gate (phase 23)
+        grounding.py                   # Static grounding gate: region/symbol/findings/missing-element + call-chain/symptom (phase 25)
+        ast_grounding.py               # Cross-language AST index (Python ast + optional tree-sitter) for structural grounding (phase 25)
+        dynamic_grounding.py           # Runtime grounding: reproduce bug on base_commit, symptom gate + path match vs cited regions (phase 26)
 
     tools/
         __init__.py                    # Subpackage marker
         ingestion_tools.py             # Evidence MCP tools: update_localization and cache_retrieved_code
-        patch_tools.py                 # Patch MCP tools: submit_patch_plan and apply_search_replace
+        patch_tools.py                 # Patch MCP tools: apply_search_replace
 ```
 
 ### Evidence Cards + RequirementItem[]

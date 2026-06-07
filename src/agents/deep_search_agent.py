@@ -30,10 +30,25 @@ Your job, for that single requirement:
    TO_BE_PARTIAL (meaning partial evidence exists but full verification is
    inconclusive).
 3. Populate target_requirement_id, requirement_verdict, requirement_findings,
-   requirement_evidence_locations. evidence_locations must be non-empty
-   unless the verdict is AS_IS_COMPLIANT.
+   requirement_evidence_locations. evidence_locations must be non-empty for
+   AS_IS_COMPLIANT, AS_IS_VIOLATED, and TO_BE_PARTIAL. TO_BE_MISSING may be
+   empty when the relevant definition is entirely absent.
 4. Also fill any AS-IS observations (localization.*, structural.*, similar
    implementation patterns) you uncovered along the way.
+5. When investigating EXISTING code (verdict AS_IS_VIOLATED or AS_IS_COMPLIANT),
+   populate these constraint fields if you observe them:
+   - semantic_boundaries: what the current code handles vs does not handle
+     (input ranges, preconditions, invariants, edge cases it ignores).
+   - behavioral_constraints: ordering requirements, thread-safety assumptions,
+     side-effect rules, or implicit contracts callers depend on.
+   - backward_compatibility: APIs, signatures, or behaviors that existing
+     callers rely on and that must not change.
+   Leave these empty for TO_BE_MISSING/TO_BE_PARTIAL (no existing code to observe).
+
+AS_IS_COMPLIANT is a lightweight coverage status, not patch-planning material.
+Only use it when the code was directly verified and the findings contain no
+traceability failure, unverifiable, must be verified, not backed by Read, or
+cannot be confirmed language. Otherwise use TO_BE_PARTIAL.
 
 CRITICAL: requirement_evidence_locations MUST use format 'file.py:LINE' or
 'file.py:LINE-LINE'. NEVER use bare file paths without line numbers.
@@ -116,15 +131,14 @@ SELF-REFLECTION CHECKS:
      - null / undefined / zero vs non-null / defined / non-zero
      - empty collection vs non-empty collection
      - boundary values (e.g. exactly at max, just over max)
-   Substitute your prescriptive fix into each case.  If any case fails
-   the requirement description, record this as an open issue.
+   Substitute your prescriptive fix into each case. If any case fails
+   the requirement description, remove the prescription or use TO_BE_PARTIAL.
 
-   IMPORTANT (Phase 22): Write boundary enumeration results to the
-   `boundary_analysis` field, NOT in `requirement_findings`. The findings
-   field should contain ONLY verified code defects and observations from
-   actual code. Keep hypothetical edge case speculation, "OPEN ISSUE" notes,
-   and "what if X is undefined" analysis in boundary_analysis. This separation
-   ensures closure-checker validates actual defects, not hypothetical risks.
+   Use this only to decide whether your prescriptive statement is safe.
+   Do NOT write hypothetical edge-case speculation, "OPEN ISSUE" notes, or
+   unverified concerns into requirement_findings. If the prescription is not
+   fully supported by verified code evidence, remove it or downgrade the
+   verdict to TO_BE_PARTIAL.
 
 3. VERDICT CONSISTENCY — If findings mention overlapping code with other
    requirements, ensure your verdict is consistent with the code's
