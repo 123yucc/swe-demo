@@ -99,6 +99,41 @@ def test_parse_go_errors_ignores_package_headers_and_fail_lines():
     assert all("build failed" not in e.message for e in errors)
 
 
+# issue 009 — `go vet` prefixes its diagnostics with a literal `vet: `. The
+# original regex anchored the filename to the start of line, so these real
+# vet errors parsed to ZERO records and the gate mislabeled a hard compile
+# failure as `unverifiable` (then accepted the patch). The parser must strip
+# the optional `vet: ` prefix and capture the error identically to a build one.
+GO_VET_STDERR = """\
+# github.com/gravitational/teleport/lib/kube/proxy
+vet: lib/kube/proxy/forwarder_test.go:49:4: unknown field Client in struct literal
+"""
+
+
+def test_parse_go_errors_handles_vet_prefix():
+    errors = parse_go_errors(GO_VET_STDERR)
+    assert len(errors) == 1
+    err = errors[0]
+    # The `vet: ` prefix is stripped from the filename, not folded into it.
+    assert err.file == "lib/kube/proxy/forwarder_test.go"
+    assert err.line == 49
+    assert err.message == "unknown field Client in struct literal"
+    assert not err.file.startswith("vet")
+
+
+def test_vet_prefixed_and_plain_errors_parse_identically():
+    """A vet-prefixed line and the same line without the prefix are the same
+    defect — same file, line, message, and therefore same signature."""
+    prefixed = parse_go_errors(
+        "vet: a/b_test.go:10:4: unknown field X in struct literal"
+    )
+    plain = parse_go_errors(
+        "a/b_test.go:10:4: unknown field X in struct literal"
+    )
+    assert len(prefixed) == len(plain) == 1
+    assert prefixed[0].signature() == plain[0].signature()
+
+
 # ── Python parser ─────────────────────────────────────────────────────────
 
 def test_parse_python_errors_extracts_file_and_message():
@@ -171,6 +206,10 @@ def test_run_go_without_toolchain_is_unverifiable_not_ok(tmp_path: Path):
     # error — otherwise baseline-subtraction logic re-enters the buggy path.
     assert result.errors == []
     assert result.skipped is False
+    # A genuinely missing toolchain is flagged distinctly so the caller can
+    # tell it apart from an un-attributable failure (toolchain ran, failed,
+    # produced no parseable error). Only the former earns an unverified pass.
+    assert result.toolchain_missing is True
 
 
 def test_unverifiable_result_is_not_treated_as_ok():

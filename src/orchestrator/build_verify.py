@@ -124,6 +124,15 @@ class BuildCheckResult:
     skipped: bool = False
     timed_out: bool = False
     unverifiable: bool = False
+    # Distinguishes the TWO causes of ``unverifiable``:
+    #   * ``toolchain_missing=True``  — the executable could not be spawned
+    #     (rc=127). The gate genuinely has no opinion (e.g. no `go` on a
+    #     Windows host); the caller may accept the patch unverified.
+    #   * ``toolchain_missing=False`` (but ``unverifiable=True``) — a command
+    #     that DID run exited non-zero yet produced no parseable error. This is
+    #     a real failure we could not attribute, NOT a free pass: the caller
+    #     must treat it conservatively as a build failure.
+    toolchain_missing: bool = False
 
     def signatures(self) -> set[str]:
         return {e.signature() for e in self.errors}
@@ -132,8 +141,13 @@ class BuildCheckResult:
 # ── Parsers ────────────────────────────────────────────────────────────────
 
 # Go compiler/vet error: ``path/to/file.go:line:col: message`` (col optional).
+# ``go vet`` prefixes its diagnostics with a literal ``vet: `` (e.g.
+# ``vet: lib/kube/proxy/forwarder_test.go:49:4: unknown field Client``); strip
+# that optional prefix so vet errors are parsed identically to build errors —
+# otherwise a real vet failure parses to ZERO errors and the gate misreports
+# the failure as ``unverifiable`` instead of ``BUILD_FAILED``.
 _GO_ERROR_RE = re.compile(
-    r"^(?P<file>[^\s:]+\.go):(?P<line>\d+):(?:\d+:)?\s+(?P<msg>.+)$"
+    r"^(?:vet:\s+)?(?P<file>[^\s:]+\.go):(?P<line>\d+):(?:\d+:)?\s+(?P<msg>.+)$"
 )
 
 # pytest summary line: ``ERROR path/to/test_x.py`` possibly followed by a
@@ -317,6 +331,7 @@ def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
         command=" && ".join(" ".join(c) for c in commands),
         timed_out=timed_out,
         unverifiable=unverifiable,
+        toolchain_missing=toolchain_missing,
     )
 
 
@@ -338,6 +353,7 @@ def _run_python(repo_dir: Path, timeout: int) -> BuildCheckResult:
         command=" ".join(cmd),
         timed_out=t_out,
         unverifiable=unverifiable,
+        toolchain_missing=(rc == _RC_TOOLCHAIN_MISSING),
     )
 
 

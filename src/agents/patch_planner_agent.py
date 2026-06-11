@@ -32,6 +32,19 @@ _PRESCRIPTIVE_PATTERNS = (
 # Works for .py, .js, .ts, .go, .rs, .java, .cpp, .rb, .php, etc.
 _FILE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6})\b")
 
+# Structured-config extensions whose values conventionally name a code symbol
+# resolved at load time (qutebrowser ``configdata.yml`` ``type: Foo``; Django
+# settings; DI wiring). Used by the cross-edit symbol contract to know which
+# FileEditPlans are "reference sites" for a symbol another edit must define.
+_CONFIG_EDIT_SUFFIXES = (".yml", ".yaml", ".json", ".jsonc", ".toml", ".ini", ".cfg")
+
+# A standalone CamelCase identifier (class/type-name shape): an internal
+# lower→upper transition, no surrounding dot (so dotted enum *values* like
+# ``VersionChange.major`` are not captured as a type reference).
+_CAMEL_SYMBOL_RE = re.compile(
+    r"(?<![.\w])([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*)(?![\w.])"
+)
+
 # Verbs that, when co-occurring with a file path inside a single co-edit
 # relation, signal the file is a required edit target (as opposed to a
 # reference/mention).  Language- and framework-neutral.
@@ -118,6 +131,15 @@ then browse selected experience ids in detail if they seem analogous.
 Focus on: exact_code_regions, call_chain_context, behavioral_constraints,
 backward_compatibility, missing_elements_to_implement,
 must_co_edit_relations, dependency_propagation.
+
+CRITICAL — NEVER plan edits to test files. The evaluator owns the test suite
+and applies its OWN test patch on top of yours. Any edit you plan to a test
+file (paths under tests/ or test/, files named *_test.go, test_*.py,
+*_test.py, *.test.js, *.spec.ts, *.spec.js, __tests__/...) is reverted before
+verification and can only collide with the evaluator's gold tests. Plan ONLY
+production-code changes. If a requirement says tests "should be relocated" or
+"moved", that describes the evaluator's work, not yours: your job is to put
+the production symbol in its new home so the relocated tests can resolve it.
 
 CRITICAL — co-edit completeness (framework-agnostic):
 Every file path that appears in `structural.must_co_edit_relations`
@@ -273,6 +295,7 @@ def _backfill_declared_coedit_files(
                 ),
                 preserved_findings=[],
                 co_edit_dependencies=[],
+                reference_only=True,
             )
         )
         appended.append(path)
@@ -480,10 +503,92 @@ def _deduplicate_shared_findings(plan: PatchPlan) -> None:
         )
 
 
+def _edit_symbol_text(edit: FileEditPlan) -> str:
+    """Concatenate the free-text fields of an edit where a shared symbol name
+    would be mentioned (rationale, findings, target functions)."""
+    return "\n".join(
+        [edit.change_rationale, *edit.preserved_findings, *edit.target_functions]
+    )
+
+
+def _is_config_edit(edit: FileEditPlan) -> bool:
+    suffix = edit.filepath.lower().rsplit(".", 1)
+    return len(suffix) == 2 and ("." + suffix[1]) in _CONFIG_EDIT_SUFFIXES
+
+
+def _enforce_cross_edit_symbol_contract(plan: PatchPlan) -> None:
+    """Pin a shared identifier into every edit that references it when the
+    symbol spans a config/data file and a code file.
+
+    Root cause this addresses (issue 008): the patch-generator runs one
+    independent sub-agent per FileEditPlan. When a symbol is *referenced* in
+    one file (``configdata.yml`` → ``type: VersionChangeFilter``) and must be
+    *defined* in another (``configtypes.py`` → ``class ...``), the two
+    sub-agents each invent a name and drift — the yml said
+    ``VersionChangeFilter`` while the class was written as
+    ``ChangelogAfterUpgrade``. ``pytest --collect-only`` cannot see the
+    mismatch (the lookup is load-time), so the patch ships broken.
+
+    Fix: detect every CamelCase symbol that appears in ≥2 edits with different
+    filepaths where at least one side is a structured-config file, and inject a
+    verbatim "SYMBOL NAME CONTRACT" line into each referencing edit's
+    preserved_findings. Both sub-agents then receive the same authoritative
+    spelling and cannot diverge.
+
+    Framework-agnostic: keys off CamelCase shape + config-extension, not any
+    specific project layout. Mutates ``plan.edits`` in place.
+    """
+    # symbol -> set of filepaths whose edit text mentions it
+    symbol_files: dict[str, set[str]] = {}
+    # symbol -> list of edits that mention it (for injection)
+    symbol_edits: dict[str, list[FileEditPlan]] = {}
+    edit_is_config: dict[int, bool] = {}
+
+    for edit in plan.edits:
+        edit_is_config[id(edit)] = _is_config_edit(edit)
+        mentioned = {m.group(1) for m in _CAMEL_SYMBOL_RE.finditer(_edit_symbol_text(edit))}
+        for sym in mentioned:
+            symbol_files.setdefault(sym, set()).add(edit.filepath)
+            symbol_edits.setdefault(sym, []).append(edit)
+
+    pinned = 0
+    for sym, files in sorted(symbol_files.items()):
+        if len(files) < 2:
+            continue  # symbol confined to one file — no cross-edit drift risk
+        edits = symbol_edits[sym]
+        # Only enforce when at least one referencing edit is a config/data
+        # file. Pure code↔code shared symbols are already protected by the
+        # build gate (import/compile errors surface there); the load-time
+        # config blind spot is what needs the contract.
+        if not any(edit_is_config[id(e)] for e in edits):
+            continue
+        sorted_files = sorted(files)
+        contract = (
+            f"SYMBOL NAME CONTRACT: the identifier `{sym}` is shared across "
+            f"{', '.join(sorted_files)}. Use this EXACT spelling in every "
+            f"file — the definition site and every reference site must match "
+            f"character-for-character. Do not rename, abbreviate, or re-case "
+            f"it on either side; a mismatch fails at config-load time and is "
+            f"invisible to import-only checks."
+        )
+        for e in edits:
+            if contract not in e.preserved_findings:
+                e.preserved_findings.append(contract)
+                pinned += 1
+
+    if pinned:
+        print(
+            f"[patch-planner] cross-edit symbol contract: pinned {pinned} "
+            f"shared-symbol constraint(s) across config/code edits.",
+            flush=True,
+        )
+
+
 async def _run_patch_planner_async(
     memory: SharedWorkingMemory,
     repo_dir: Path | None = None,
-) -> PatchPlan:
+    allow_none: bool = False,
+) -> PatchPlan | None:
     prompt = (
         "Plan a bug fix based on the following context:\n\n"
         f"{memory.format_for_prompt()}\n\n"
@@ -498,7 +603,21 @@ async def _run_patch_planner_async(
         allowed_tools=[],
         max_turns=20,
         max_budget_usd=1.5,
+        # The planner prompt is the largest in the pipeline (full evidence +
+        # prior plan + build feedback on a repatch round), so it is the most
+        # prone to the "success but empty structured_output" failure mode that
+        # crashed issue 010. Empty output is probabilistic under a big prompt;
+        # more re-runs (each appends the structured-only nudge) materially
+        # raise the odds of recovering a valid plan before falling back.
+        max_attempts=5,
+        allow_none=allow_none,
     )
+    # Empty structured_output under allow_none (issue 010: repatch-round prompt
+    # bloat). Return None so the orchestrator can degrade to BUILD_FAILED
+    # instead of crashing. Do NOT touch memory.patch_plan — the prior (pruned)
+    # plan stays as the last good state for diagnostics.
+    if plan is None:
+        return None
 
     # ── Framework-agnostic co-edit backfill ──
     # Any file path declared in must_co_edit_relations / dependency_propagation
@@ -517,6 +636,17 @@ async def _run_patch_planner_async(
     # the same file. Remove the shared (broadcast) ones from secondary plans
     # so each plan stays focused and patch-generator prompts stay small.
     _deduplicate_shared_findings(plan)
+
+    # ── Cross-edit symbol contract ──
+    # When a CamelCase symbol is shared between a config/data file and a code
+    # file (one references it, the other defines it), pin its exact spelling
+    # into every referencing edit. The patch-generator runs one independent
+    # sub-agent per FileEditPlan; without this, the two sides can drift to
+    # different names (issue 008: yml said `VersionChangeFilter`, class was
+    # written `ChangelogAfterUpgrade`) — a load-time failure invisible to the
+    # import-only build check. Runs after dedup (it spans distinct filepaths,
+    # so same-file dedup never strips it) and before the coverage gate.
+    _enforce_cross_edit_symbol_contract(plan)
 
     # ── Coverage gate: every prescriptive finding must reach at least one
     # FileEditPlan.  Replaces the older "fill empty preserved_findings with

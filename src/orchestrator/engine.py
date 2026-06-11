@@ -218,10 +218,12 @@ from src.memory import (
 from src.models.context import EvidenceCards
 from src.models.custom_rules import RouteTags
 from src.models.evidence import RequirementItem
+from src.models.patch import PatchPlan
 from src.models.verdict import ClosureVerdict
 from src.orchestrator.audit import build_audit_manifest
 from src.orchestrator.build_verify import (
     BuildCheckResult,
+    BuildError,
     detect_build_system,
     diff_new_errors,
     render_errors_for_feedback,
@@ -229,8 +231,21 @@ from src.orchestrator.build_verify import (
 )
 from src.orchestrator.consistency_checks import (
     check_consistency_anchors,
+    check_config_entry_shape,
+    check_contract_drift,
+    check_go_unexport_consistency,
+    check_parallel_impl_consistency,
+    check_removed_symbol_test_refs,
     check_rename_residue,
+    check_undefined_config_symbol,
+    render_config_entry_shape_for_feedback,
+    render_contract_drift_for_feedback,
+    render_go_unexport_for_feedback,
+    render_parallel_impl_for_feedback,
+    render_removed_symbol_test_refs_for_feedback,
     render_residue_for_feedback,
+    render_undefined_config_symbol_for_feedback,
+    revert_test_file_edits,
 )
 from src.orchestrator.grounding import run_static_grounding
 from src.orchestrator.dynamic_grounding import run_dynamic_grounding
@@ -238,14 +253,17 @@ from src.orchestrator.guards import (
     DeepSearchBudget,
     check_consistency_anchors_format,
     check_correct_attribution,
+    check_plan_covers_violations,
     check_structural_invariants,
     check_sufficiency,
+    render_plan_coverage_feedback,
 )
 from src.orchestrator.states import (
     PipelineState,
     is_valid_transition,
 )
 from src.tools.ingestion_tools import (
+    DEEP_SEARCH_OWNED_FIELDS,
     get_submitted_evidence,
     get_working_memory,
     init_working_memory,
@@ -440,6 +458,70 @@ def _compute_baseline_build(
             )
 
 
+_GO_SIG_ERROR_RE = re.compile(
+    r"assignment mismatch|unknown field|undefined|not enough arguments|"
+    r"too many arguments|cannot use"
+)
+_GO_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+
+def _enrich_go_errors_with_definitions(
+    repo_dir: Path,
+    errors: list[BuildError],
+    limit: int = 8,
+) -> str:
+    """For Go build errors about signature/shape mismatches, grep the cited
+    identifier's definition line and return a compact text block.
+
+    Issue-013 shape: the generator wrote ``x, err := f()`` against a function
+    returning a single value, and two repatch rounds repeated the mistake
+    because the feedback never showed the real signature. Attaching the
+    actual ``func``/``type``/field definition line gives the planner the
+    ground truth it kept guessing at. Pure git grep — no LLM. Best-effort:
+    any identifier we cannot resolve is silently skipped.
+    """
+    blocks: list[str] = []
+    seen_idents: set[str] = set()
+    for err in errors:
+        if not _GO_SIG_ERROR_RE.search(err.message):
+            continue
+        # Pull candidate identifiers out of the error message; resolve the
+        # first few that look like definitions somewhere in the tree.
+        for ident in _GO_IDENT_RE.findall(err.message):
+            if len(ident) < 3 or ident in seen_idents:
+                continue
+            if ident in {"assignment", "mismatch", "unknown", "field",
+                         "undefined", "not", "enough", "arguments", "too",
+                         "many", "cannot", "use", "type", "struct", "func",
+                         "variable", "variables", "value", "values", "in",
+                         "of", "the", "has", "no", "method", "literal"}:
+                continue
+            seen_idents.add(ident)
+            pattern = (
+                rf"(^|\s)(func\s+(\([^)]*\)\s*)?{re.escape(ident)}\s*\(|"
+                rf"type\s+{re.escape(ident)}\b|"
+                rf"{re.escape(ident)}\s+[\*\[\]\w.]+\s*(//.*)?$)"
+            )
+            rc, out, _ = _run_git(
+                repo_dir, "grep", "-nE", "--no-color", pattern, "--", "*.go"
+            )
+            if rc != 0 or not out.strip():
+                continue
+            hit_lines = [l for l in out.splitlines() if l.strip()][:2]
+            for hl in hit_lines:
+                blocks.append(f"  {hl.strip()[:160]}")
+            if len(blocks) >= limit:
+                break
+        if len(blocks) >= limit:
+            break
+    if not blocks:
+        return ""
+    return (
+        "Actual definitions of the symbols in the errors above (match your "
+        "call sites to these signatures exactly):\n" + "\n".join(blocks)
+    )
+
+
 def _pick_next_requirement(evidence: EvidenceCards) -> RequirementItem | None:
     """Return the first RequirementItem whose verdict is still UNCHECKED."""
     for req in evidence.requirements:
@@ -448,9 +530,168 @@ def _pick_next_requirement(evidence: EvidenceCards) -> RequirementItem | None:
     return None
 
 
+# ── Phase-27 heuristic-gate plumbing ────────────────────────────────────────
+
+def _gate_signature(err: BuildError) -> str:
+    """Stable identity for a heuristic gate finding across repatch rounds."""
+    return f"{err.file.replace(chr(92), '/').strip()}::{err.raw.strip()[:120]}"
+
+
+def _partition_by_fuse(
+    errors: list[BuildError],
+    fed_back: set[str],
+) -> tuple[list[BuildError], set[str]]:
+    """Split *errors* into (active, downgraded-signatures).
+
+    A finding whose signature was already fed back to the planner in a prior
+    round and reappeared unchanged is downgraded to a warning: the planner saw
+    it and deliberately kept the edit, so we stop blocking on it. This caps the
+    worst-case cost of any heuristic false positive at a single extra repatch
+    round and gives the model a "insist and pass" channel for legitimate edits.
+    """
+    active: list[BuildError] = []
+    downgraded: set[str] = set()
+    for err in errors:
+        sig = _gate_signature(err)
+        if sig in fed_back:
+            downgraded.add(sig)
+        else:
+            active.append(err)
+    return active, downgraded
+
+
+def _record_fed_back(errors: list[BuildError], fed_back: set[str]) -> None:
+    for err in errors:
+        fed_back.add(_gate_signature(err))
+
+
+def _errs_to_log(errors: list[BuildError]) -> list[dict[str, Any]]:
+    return [
+        {"file": e.file, "line": e.line, "message": e.message}
+        for e in errors
+    ]
+
+
+def _prune_plan_to_error_files(
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+) -> tuple["PatchPlan | None", int]:
+    """Shrink a prior PatchPlan to only the edits implicated by build errors.
+
+    On a repatch round the full prior plan (every FileEditPlan with all its
+    preserved_findings) is otherwise re-inlined into the planner prompt via
+    ``memory.format_for_prompt()``. For a broad change that is tens of
+    thousands of JSON characters, which (a) bloats the prompt enough to push
+    the SDK into the "success but empty structured_output" failure mode that
+    crashed issue 010, and (b) is unlabeled in the prompt, so the planner is
+    as likely to anchor on it as to revise it.
+
+    "Keep only the error parts": retain just the edits whose ``filepath``
+    matches a file named in this round's build errors (compile errors +
+    deterministic findings). Files the prior plan got RIGHT (no error points
+    at them) are dropped — the planner need not re-plan them, and the
+    build_error_feedback section carries the actual "what to fix" signal.
+
+    Returns (pruned_plan_or_None, dropped_count). When no edit matches (e.g.
+    all errors are in test files the plan never touched), returns (None, n)
+    so the caller clears the section entirely rather than keeping noise.
+    """
+    if plan is None or not plan.edits:
+        return plan, 0
+
+    def _norm(p: str) -> str:
+        return p.replace("\\", "/").strip().lstrip("./")
+
+    error_files = {_norm(e.file) for e in errors if e.file and e.file != "(build)"}
+    if not error_files:
+        # Un-attributable failure (synthetic "(build)" error): we cannot tell
+        # which edits are implicated, so keep the plan as-is rather than guess.
+        return plan, 0
+
+    kept = [e for e in plan.edits if _norm(e.filepath) in error_files]
+    dropped = len(plan.edits) - len(kept)
+    if not kept:
+        return None, dropped
+    if dropped == 0:
+        return plan, 0
+    return PatchPlan(overview=plan.overview, edits=kept), dropped
+
+
+def _render_heuristic_feedback(
+    contract_drift: list[BuildError],
+    parallel_impl: list[BuildError],
+    removed_sym_refs: list[BuildError],
+    go_unexport: list[BuildError],
+    config_shape: list[BuildError],
+    active: list[BuildError],
+    residues: list[BuildError] | None = None,
+    config_sym_errors: list[BuildError] | None = None,
+) -> str:
+    """Render only the *active* (non-downgraded) findings, grouped by gate."""
+    active_sigs = {_gate_signature(e) for e in active}
+
+    def _keep(errs: list[BuildError]) -> list[BuildError]:
+        return [e for e in errs if _gate_signature(e) in active_sigs]
+
+    parts: list[str] = []
+    if residues:
+        kept = _keep(residues)
+        if kept:
+            parts.append(render_residue_for_feedback(kept))
+    if config_sym_errors:
+        kept = _keep(config_sym_errors)
+        if kept:
+            parts.append(render_undefined_config_symbol_for_feedback(kept))
+    for errs, renderer in (
+        (contract_drift, render_contract_drift_for_feedback),
+        (parallel_impl, render_parallel_impl_for_feedback),
+        (removed_sym_refs, render_removed_symbol_test_refs_for_feedback),
+        (go_unexport, render_go_unexport_for_feedback),
+        (config_shape, render_config_entry_shape_for_feedback),
+    ):
+        kept = _keep(errs)
+        if kept:
+            parts.append(renderer(kept))
+    return "\n\n".join(p for p in parts if p)
+
+
+def _grounded_requirement_ids(evidence: EvidenceCards | None) -> list[str]:
+    """Return req IDs that a degraded (best-effort) patch could safely act on.
+
+    A requirement is "grounded" when it has an actionable verdict
+    (AS_IS_VIOLATED / TO_BE_MISSING / TO_BE_PARTIAL) AND at least one
+    ``evidence_location`` — i.e. a concrete file:line the patch-planner can
+    target.  Compliant and still-UNCHECKED requirements contribute nothing to
+    a patch and are excluded.
+
+    This is the discriminator between the two EVIDENCE_INCOMPLETE failure
+    shapes observed in eval:
+
+    - issue 004 (qutebrowser): every requirement carried zero verified
+      evidence_locations — deep-search kept claiming Reads it never performed,
+      so token-traceability self-correction wiped the locations each round.
+      Nothing is grounded → a degraded patch would be pure guesswork → stay
+      EVIDENCE_INCOMPLETE (correct to skip).
+
+    - issue 009 (teleport): req-006 was fully verified (20 locations, the
+      whole ForwarderConfig field-rename set), and req-002/req-004 also had
+      real locations.  Plenty is grounded → a patch covering just the verified
+      renames is far better than a guaranteed-zero EVIDENCE_INCOMPLETE.
+    """
+    if evidence is None:
+        return []
+    actionable = {"AS_IS_VIOLATED", "TO_BE_MISSING", "TO_BE_PARTIAL"}
+    grounded: list[str] = []
+    for req in evidence.requirements:
+        if req.verdict in actionable and req.evidence_locations:
+            grounded.append(req.id)
+    return grounded
+
+
 def _build_deep_search_todo(
     target: RequirementItem,
     rework_context: str = "",
+    force_read_directive: str = "",
 ) -> str:
     """Build a scoped TODO for one RequirementItem.
 
@@ -459,6 +700,13 @@ def _build_deep_search_todo(
     (closure rationale + conflicting locations + other implicated requirement
     IDs) is appended so the model can deliberately resolve the contradiction
     rather than repeating the prior verdict.
+
+    If *force_read_directive* is non-empty, a prior round for this requirement
+    produced a verdict without actually calling Read on any source file
+    (retrieved_code did not grow).  The directive is injected at the TOP of the
+    TODO — the most salient position — to break the "claim a Read that never
+    happened → token-traceability strips the locations → loop" failure mode
+    observed on issues 004/011.
     """
     base = (
         f"Verify RequirementItem against the current codebase.\n\n"
@@ -470,6 +718,8 @@ def _build_deep_search_todo(
         "AS_IS_VIOLATED, TO_BE_MISSING, TO_BE_PARTIAL and cite "
         "evidence_locations."
     )
+    if force_read_directive:
+        base = force_read_directive + "\n\n" + base
     if rework_context:
         base += (
             "\n\n── REWORK CONTEXT ─────────────────────────────\n"
@@ -560,18 +810,11 @@ async def _persist_report_findings(report, scope_requirement_id: str) -> None:
         return
 
     loc_args: dict[str, Any] = {"scope_requirement_id": target_id or "unscoped"}
-    for attr in (
-        "suspect_entities",
-        "exact_code_regions",
-        "call_chain_context",
-        "dataflow_relevant_uses",
-        "must_co_edit_relations",
-        "dependency_propagation",
-        "similar_implementation_patterns",
-        "behavioral_constraints",
-        "semantic_boundaries",
-        "backward_compatibility",
-    ):
+    # The persisted AS-IS observation fields are exactly the deep-search-owned
+    # fields (single source of truth in ingestion_tools). Reusing the tuple here
+    # guarantees a new field added to update_localization is also forwarded from
+    # the DeepSearchReport — the gap that previously stranded consistency_anchors.
+    for attr in DEEP_SEARCH_OWNED_FIELDS:
         values = getattr(report, attr, [])
         if values:
             loc_args[attr] = list(values)
@@ -875,9 +1118,24 @@ async def _run_state_machine(
     """Core state-machine loop shared by run_pipeline and run_pipeline_from_evidence."""
     state = initial_state
     budget = DeepSearchBudget(max_iterations=30)
+    # Hard wall-clock cap per deep-search round. The SDK already has per-query
+    # max_turns / max_budget_usd, but a wedged subprocess (e.g. an OOM-killed
+    # child the parent never reaps) can hang the await forever. wait_for turns
+    # that into a recorded iteration failure so the budget keeps advancing.
+    deep_search_timeout_s = 1200.0
     last_verdict: ClosureVerdict | None = None
     patch_outcome: str | None = None
     forced_closure_done: bool = False
+    # Degraded (best-effort) patch mode (improvement 3): when the pipeline would
+    # otherwise terminate as EVIDENCE_INCOMPLETE (closure never approved, budget
+    # spent / rework exhausted), but enough requirements are *grounded* (have an
+    # actionable verdict AND ≥1 evidence_location), we route to patch planning
+    # anyway and emit a PARTIAL_PATCH instead of a guaranteed-zero
+    # EVIDENCE_INCOMPLETE.  Gated on grounded-evidence COUNT, not closure
+    # approval, so issue-004-style hollow evidence (zero verified locations
+    # anywhere) still correctly skips patching rather than guessing.
+    degraded_patch_mode: bool = False
+    _DEGRADED_MIN_GROUNDED = 1
     closure_retry_limit = 2
     closure_failure_streak = 0
     max_closure_failure_streak = 3
@@ -897,7 +1155,20 @@ async def _run_state_machine(
     # pipeline re-opens patch planning (CLOSED) with the errors fed back via
     # memory.build_error_feedback. Capped at patch_verify_rounds_max.
     patch_verify_rounds_used = 0
-    patch_verify_rounds_max = 2
+    patch_verify_rounds_max = 3
+    # True once a build command demonstrably ran this session — a later
+    # "unverifiable" verdict is then likely transient and retried once.
+    toolchain_seen_working = False
+    # Phase-27 heuristic-gate false-positive fuse: signatures of gate findings
+    # already fed back to the planner. If a finding survives a repatch round
+    # unchanged (the planner saw it and deliberately kept the edit), it is
+    # downgraded to a warning instead of consuming budget again.
+    fed_back_gate_signatures: set[str] = set()
+    # Spec-priority firewall: how many times we re-planned because the plan
+    # failed to cover an AS_IS_VIOLATED requirement's cited file. Capped to
+    # avoid a loop when the planner genuinely cannot/won't cover it.
+    plan_coverage_rounds_used = 0
+    plan_coverage_rounds_max = 1
     # LTM/custom-rule retrieval for planning is expensive; run it once on the
     # first CLOSED entry and reuse the cached blocks on repatch rounds.
     planner_ltm_loaded = False
@@ -912,6 +1183,30 @@ async def _run_state_machine(
     _ds_fail_counts: dict[str, int] = {}
     _DS_FAIL_MAX = 3
 
+    # Per-requirement stall detection (improvement 2): deep-search on issues
+    # 004/009 burned the entire 30-iteration budget re-investigating the same
+    # requirements without ever adding a verified evidence_location — each round
+    # the agent claimed a Read it never performed, token-traceability wiped the
+    # locations, the verdict reverted, and the loop repeated.  We detect this by
+    # snapshotting a per-requirement progress signature (verdict + #locations +
+    # #cached snippets) each time it is investigated; if the signature does not
+    # improve for _DS_STALL_MAX consecutive visits, the requirement is frozen
+    # (left at its current verdict, removed from the rework pool) so the saved
+    # budget can flow to patch planning instead of an unwinnable spin.
+    _ds_stall_signatures: dict[str, tuple] = {}
+    _ds_stall_counts: dict[str, int] = {}
+    _ds_frozen_reqs: set[str] = set()
+    _DS_STALL_MAX = 3
+    # Consecutive "hollow" rounds per requirement: a round is hollow when it
+    # lands ZERO verified evidence_locations (the 004/011 signature — claimed
+    # verdict, attribution/traceability strips the cites to empty).  After one
+    # hollow round we arm a forced-Read directive on the NEXT todo for that
+    # requirement, instructing the agent to actually open files before
+    # asserting a verdict.  retrieved_code can't be used to detect this (it is
+    # dead — wired to no agent), so the location count is the only signal.
+    _ds_hollow_counts: dict[str, int] = {}
+    _DS_HOLLOW_FORCE_READ = 1
+
     # Dynamic grounding (phase 26): opt-in, runs at most once per case at the
     # evidence stage (before the closure-checker LLM). Tracks whether the single
     # pass has been consumed, plus the per-requirement reachability notes it
@@ -924,6 +1219,40 @@ async def _run_state_machine(
         PipelineState.PATCH_FAILED,
         PipelineState.CLOSURE_FORCED_FAIL,
     )
+
+    def _route_forced_fail() -> PipelineState:
+        """Decide where a forced-fail exit goes.
+
+        Returns CLOSED (degraded patch) when enough requirements are grounded,
+        else CLOSURE_FORCED_FAIL (skip patching). Sets degraded_patch_mode and
+        patch_outcome as a side effect. Centralizes improvement 3 so every
+        forced-fail site shares one policy.
+        """
+        nonlocal degraded_patch_mode, patch_outcome
+        grounded = _grounded_requirement_ids(get_submitted_evidence())
+        if len(grounded) >= _DEGRADED_MIN_GROUNDED:
+            degraded_patch_mode = True
+            print(
+                "[orchestrator] closure not approved, but "
+                f"{len(grounded)} grounded requirement(s) {grounded} have "
+                "verified evidence_locations — routing to DEGRADED (best-effort) "
+                "patch instead of EVIDENCE_INCOMPLETE.",
+                flush=True,
+            )
+            memory.record_action(
+                phase="closure-check",
+                subagent="closure-checker",
+                outcome=f"degraded_patch:grounded={len(grounded)}",
+            )
+            return PipelineState.CLOSED
+        print(
+            "[orchestrator] closure not approved and no grounded requirements "
+            "(zero verified evidence_locations) — skipping patch as "
+            "EVIDENCE_INCOMPLETE rather than guessing.",
+            flush=True,
+        )
+        patch_outcome = "EVIDENCE_INCOMPLETE"
+        return PipelineState.CLOSURE_FORCED_FAIL
 
     while state not in _terminal_states:
         print(f"[orchestrator] State: {state.value}", flush=True)
@@ -973,9 +1302,34 @@ async def _run_state_machine(
                 state = PipelineState.EVIDENCE_REFINING
                 continue
 
+            # Arm a forced-Read directive when the PRIOR round(s) for this
+            # requirement were hollow (asserted a verdict but landed zero
+            # evidence_locations).  This breaks the 004/011 spin where the agent
+            # repeatedly claims Reads it never performed.
+            force_read = ""
+            if _ds_hollow_counts.get(target.id, 0) >= _DS_HOLLOW_FORCE_READ:
+                force_read = (
+                    "⚠ MANDATORY READ-FIRST DIRECTIVE ⚠\n"
+                    f"A prior investigation of {target.id} returned a verdict but "
+                    "cited ZERO evidence_locations that survived traceability "
+                    "checks — i.e. it asserted a conclusion without grounding it "
+                    "in code actually opened.\n"
+                    "Before deciding any verdict this round you MUST:\n"
+                    "1. Use Glob/Grep to locate the file(s) named in the "
+                    "requirement text.\n"
+                    "2. Use Read to open each candidate region and confirm the "
+                    "exact lines with your own eyes.\n"
+                    "3. Cite every evidence_location as `path:line` ONLY for "
+                    "lines you actually Read this round. Do not carry over or "
+                    "infer locations from prior rounds or from the requirement "
+                    "prose.\n"
+                    "A verdict with an empty evidence_locations list will be "
+                    "rejected again — grounding is the whole task."
+                )
             todo_task = _build_deep_search_todo(
                 target,
                 rework_context=target.rework_context,
+                force_read_directive=force_read,
             )
             # Inject the rendered SharedWorkingMemory section (LTM summaries,
             # custom repair discipline, build-error feedback) so the deep-search
@@ -987,15 +1341,23 @@ async def _run_state_machine(
                 flush=True,
             )
             try:
-                report = await _run_deep_search_async(
-                    todo_task, current_evidence, repo_dir,
-                    working_memory_block=working_memory_block,
+                report = await asyncio.wait_for(
+                    _run_deep_search_async(
+                        todo_task, current_evidence, repo_dir,
+                        working_memory_block=working_memory_block,
+                    ),
+                    timeout=deep_search_timeout_s,
                 )
-            except Exception as exc:
+            except (Exception, asyncio.TimeoutError) as exc:
                 budget.record_iteration()
+                reason = (
+                    f"timeout>{deep_search_timeout_s}s"
+                    if isinstance(exc, asyncio.TimeoutError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
                 print(
                     "[orchestrator] deep-search failed for "
-                    f"{target.id}: {type(exc).__name__}: {exc}",
+                    f"{target.id}: {reason}",
                     flush=True,
                 )
                 memory.record_action(
@@ -1054,6 +1416,78 @@ async def _run_state_machine(
                     )
             else:
                 per_req_unchecked_count.pop(target.id, None)
+
+            # Progress-stall breaker (improvement 2): detect a requirement that
+            # is being re-investigated round after round without ever gaining a
+            # verified evidence_location.  This is the 004/011 spin: deep-search
+            # claims a verdict each round, but token-traceability / attribution
+            # strips the locations to empty, the verdict reverts, and the loop
+            # repeats for all 30 iterations.
+            #
+            # Signal note: retrieved_code is NOT usable here — cache_retrieved_code
+            # is wired to no agent (run_structured_query registers no MCP server),
+            # so it is empty even on productive rounds (verified: issue 009 had 20
+            # real locations yet retrieved_code == {}).  The only signal that
+            # actually separates productive (009) from hollow (004/011) rounds is
+            # the count of persisted evidence_locations.
+            persisted_locs = (
+                len(target_after.evidence_locations) if target_after else 0
+            )
+            persisted_verdict = (
+                target_after.verdict if target_after else "UNCHECKED"
+            )
+            # A round is "hollow" when it asserts an actionable verdict but lands
+            # zero evidence_locations — i.e. it did no grounding that survived.
+            hollow_round = persisted_locs == 0
+            if hollow_round:
+                _ds_hollow_counts[target.id] = (
+                    _ds_hollow_counts.get(target.id, 0) + 1
+                )
+            else:
+                _ds_hollow_counts[target.id] = 0
+
+            sig = (persisted_verdict, persisted_locs)
+            prev_sig = _ds_stall_signatures.get(target.id)
+            # Progress = more evidence_locations than before, or first time we
+            # reach a non-UNCHECKED verdict that actually carries locations.
+            improved = (
+                prev_sig is None
+                or sig[1] > prev_sig[1]
+            )
+            _ds_stall_signatures[target.id] = sig
+            if improved:
+                _ds_stall_counts[target.id] = 0
+            else:
+                _ds_stall_counts[target.id] = _ds_stall_counts.get(target.id, 0) + 1
+                if (
+                    _ds_stall_counts[target.id] >= _DS_STALL_MAX
+                    and target.id not in _ds_frozen_reqs
+                ):
+                    _ds_frozen_reqs.add(target.id)
+                    # Ensure it carries SOME non-UNCHECKED verdict so the
+                    # sufficiency gate stops bouncing the pipeline back here.
+                    if target_after and target_after.verdict == "UNCHECKED":
+                        target_after.verdict = (
+                            report.requirement_verdict or "TO_BE_PARTIAL"
+                        )
+                        if not target_after.findings:
+                            target_after.findings = (
+                                "[frozen: deep-search stalled — no verified "
+                                f"evidence_locations after {_ds_stall_counts[target.id]} visits]"
+                            )
+                    print(
+                        f"[orchestrator] {target.id} frozen after "
+                        f"{_ds_stall_counts[target.id]} stalled visits "
+                        f"(zero verified evidence_locations gained) — removing "
+                        f"from rework pool to preserve budget for patch planning.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="deep-search",
+                        subagent="deep-search",
+                        outcome=f"frozen_stalled:{_ds_stall_counts[target.id]}_visits",
+                        requirement_id=target.id,
+                    )
 
             # Transition to EvidenceRefining
             assert is_valid_transition(state, PipelineState.EVIDENCE_REFINING)
@@ -1394,11 +1828,11 @@ async def _run_state_machine(
                     flush=True,
                 )
                 if budget.is_exhausted() or closure_failure_streak >= max_closure_failure_streak:
-                    patch_outcome = "EVIDENCE_INCOMPLETE"
                     assert is_valid_transition(
                         state, PipelineState.CLOSURE_FORCED_FAIL
                     )
-                    state = PipelineState.CLOSURE_FORCED_FAIL
+                    assert is_valid_transition(state, PipelineState.CLOSED)
+                    state = _route_forced_fail()
                 else:
                     # Retry closure in-place on next loop without forcing a new deep-search.
                     assert closure_exc is not None
@@ -1479,12 +1913,13 @@ async def _run_state_machine(
                 )
                 if forced:
                     # Budget already exhausted and closure still failed —
-                    # do NOT loop back to deep-search. Terminate cleanly.
-                    patch_outcome = "EVIDENCE_INCOMPLETE"
+                    # do NOT loop back to deep-search. Route to degraded patch
+                    # if grounded, else terminate as EVIDENCE_INCOMPLETE.
                     assert is_valid_transition(
                         state, PipelineState.CLOSURE_FORCED_FAIL
                     )
-                    state = PipelineState.CLOSURE_FORCED_FAIL
+                    assert is_valid_transition(state, PipelineState.CLOSED)
+                    state = _route_forced_fail()
                 else:
                     # Rework path (phase 25): derive per-requirement specs from
                     # the closure-checker's dimension findings.  sufficiency
@@ -1505,7 +1940,16 @@ async def _run_state_machine(
                                 "finding; re-investigate this requirement fully.",
                             )
 
-                    conflict_req_ids = list(rework_specs.keys())
+                    conflict_req_ids = [
+                        rid for rid in rework_specs.keys()
+                        if rid not in _ds_frozen_reqs
+                    ]
+                    if _ds_frozen_reqs & set(rework_specs.keys()):
+                        print(
+                            "[orchestrator] excluding frozen (stalled) reqs from "
+                            f"rework pool: {sorted(_ds_frozen_reqs & set(rework_specs.keys()))}",
+                            flush=True,
+                        )
                     if rework_rounds_used < rework_rounds_max and conflict_req_ids:
                         per_req_feedback = _build_per_req_audit_feedback(
                             verdict, conflict_req_ids,
@@ -1568,11 +2012,11 @@ async def _run_state_machine(
                             subagent="closure-checker",
                             outcome=f"EVIDENCE_MISSING_terminal:{reason}",
                         )
-                        patch_outcome = "EVIDENCE_INCOMPLETE"
                         assert is_valid_transition(
                             state, PipelineState.CLOSURE_FORCED_FAIL
                         )
-                        state = PipelineState.CLOSURE_FORCED_FAIL
+                        assert is_valid_transition(state, PipelineState.CLOSED)
+                        state = _route_forced_fail()
 
         # ── Closed: dispatch patch-planner ────────────────────────────
         elif state == PipelineState.CLOSED:
@@ -1613,12 +2057,79 @@ async def _run_state_machine(
                 )
 
             print("[orchestrator] Dispatching patch-planner...", flush=True)
-            plan = await _run_patch_planner_async(memory, repo_dir)
+            # On a repatch round (entered from PATCH_VERIFYING), allow the
+            # planner to return None instead of crashing the whole run when the
+            # SDK yields success-but-empty structured_output (issue 010). The
+            # first plan keeps the hard guarantee (allow_none stays False) since
+            # there is no prior patch to fall back on. A None here degrades to
+            # BUILD_FAILED below, preserving the last applied patch.diff.
+            is_repatch = patch_verify_rounds_used > 0
+            plan = await _run_patch_planner_async(
+                memory, repo_dir, allow_none=is_repatch
+            )
+            # The sliced-evidence view was consumed by the planner prompt just
+            # built; clear it so any later full-context consumer (or a
+            # subsequent planning pass) sees the complete evidence again.
+            memory.evidence_focus_files = []
+            if plan is None:
+                print(
+                    "[orchestrator] patch-planner returned no plan on repatch "
+                    f"(round {patch_verify_rounds_used}); the prior patch is "
+                    "already applied. Terminating as BUILD_FAILED rather than "
+                    "crashing — run docker eval for the real verdict.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="patch-planning",
+                    subagent="patch-planner",
+                    outcome="repatch_no_structured_output:BUILD_FAILED",
+                )
+                patch_outcome = "BUILD_FAILED"
+                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                state = PipelineState.PATCH_FAILED
+                continue
             memory.record_action(
                 phase="patch-planning",
                 subagent="patch-planner",
                 outcome=f"{len(plan.edits)}_files_planned",
             )
+
+            # Spec-priority firewall (issue 011): every AS_IS_VIOLATED
+            # requirement owns a concrete change at its cited location. If the
+            # plan touches none of a violated req's cited files, the prescribed
+            # fix is being skipped — re-plan once with an explicit coverage
+            # demand fed back to the planner. Capped so a planner that
+            # genuinely cannot cover it (e.g. the citation was wrong) still
+            # makes progress instead of looping.
+            uncovered = check_plan_covers_violations(memory.evidence_cards, plan)
+            if uncovered and plan_coverage_rounds_used < plan_coverage_rounds_max:
+                plan_coverage_rounds_used += 1
+                coverage_msg = render_plan_coverage_feedback(
+                    memory.evidence_cards, uncovered
+                )
+                memory.build_error_feedback = (
+                    (memory.build_error_feedback + "\n\n" + coverage_msg)
+                    if memory.build_error_feedback else coverage_msg
+                )
+                print(
+                    f"[orchestrator] plan-coverage gap on {uncovered}; re-planning "
+                    f"(round {plan_coverage_rounds_used}/{plan_coverage_rounds_max}).",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="patch-planning",
+                    subagent="patch-planner",
+                    outcome=f"plan_coverage_gap:reopen={len(uncovered)}_reqs",
+                )
+                # Stay in CLOSED to re-dispatch the planner with the feedback.
+                continue
+            elif uncovered:
+                print(
+                    f"[orchestrator] plan-coverage gap on {uncovered} persists after "
+                    "re-plan; proceeding (planner could not cover — likely a bad "
+                    "citation, surfaced for the docker eval).",
+                    flush=True,
+                )
 
             assert is_valid_transition(state, PipelineState.PATCH_PLANNING)
             state = PipelineState.PATCH_PLANNING
@@ -1654,99 +2165,264 @@ async def _run_state_machine(
 
         # ── PatchVerifying: deterministic post-patch build gate ────────
         elif state == PipelineState.PATCH_VERIFYING:
+            # Test files belong to the evaluator (it applies its own test
+            # patch on top of ours). Any model edit to a test file is at best
+            # ignored and at worst shadows the gold tests (issue 002). Revert
+            # them before anything else so neither the build gate nor the
+            # final diff sees model-authored test changes.
+            reverted_tests = revert_test_file_edits(repo_dir, base_commit=None)
+            if reverted_tests:
+                print(
+                    f"[build-verify] reverted {len(reverted_tests)} model edit(s) "
+                    f"to test files (evaluator owns tests): "
+                    f"{', '.join(reverted_tests[:8])}"
+                    + (" ..." if len(reverted_tests) > 8 else ""),
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="build-verify",
+                    outcome=f"test_edits_reverted:{len(reverted_tests)}",
+                )
+
             system = detect_build_system(repo_dir)
             print(
                 f"[build-verify] build system detected: {system}",
                 flush=True,
             )
 
-            if system in ("node", "unknown"):
+            # Heuristic git-only gates (phase 27). These run regardless of
+            # build system — they are the ONLY line of defense on JS/unknown
+            # repos and on hosts where the toolchain is unavailable, exactly
+            # the paths where issues 001/008/009/010 slipped through.
+            contract_drift = check_contract_drift(repo_dir, base_commit=None)
+            parallel_impl = check_parallel_impl_consistency(repo_dir, base_commit=None)
+            removed_sym_refs = check_removed_symbol_test_refs(repo_dir, base_commit=None)
+            go_unexport = check_go_unexport_consistency(repo_dir, base_commit=None)
+            config_shape = check_config_entry_shape(repo_dir, base_commit=None)
+            for label, errs in (
+                ("contract-drift", contract_drift),
+                ("parallel-impl", parallel_impl),
+                ("removed-symbol-test-refs", removed_sym_refs),
+                ("go-unexport", go_unexport),
+                ("config-entry-shape", config_shape),
+            ):
                 print(
-                    f"[build-verify] no compile step for '{system}'; skipping "
-                    "build gate (accepting patch).",
+                    f"[build-verify] {label} gate: "
+                    + (f"{len(errs)} finding(s)." if errs else "clean."),
                     flush=True,
                 )
-                memory.record_action(
-                    phase="build-verify",
-                    outcome=f"skipped:{system}",
+
+            if system in ("node", "unknown"):
+                # No compile step — but the heuristic gates still apply.
+                heuristic_errors = (
+                    list(contract_drift) + list(parallel_impl)
+                    + list(removed_sym_refs) + list(go_unexport)
+                    + list(config_shape)
+                )
+                active, downgraded = _partition_by_fuse(
+                    heuristic_errors, fed_back_gate_signatures
                 )
                 build_verify_log.append(
                     {"round": patch_verify_rounds_used, "system": system,
-                     "skipped": True, "ok": True}
+                     "skipped_build": True,
+                     "reverted_tests": reverted_tests,
+                     "heuristic_findings": _errs_to_log(heuristic_errors),
+                     "downgraded_signatures": sorted(downgraded)}
                 )
-                patch_outcome = "PATCH_SUCCESS"
-                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
-                state = PipelineState.PATCH_SUCCESS
+                if not active:
+                    print(
+                        f"[build-verify] no compile step for '{system}' and no "
+                        "active heuristic findings; accepting patch.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="build-verify", outcome=f"accepted:{system}"
+                    )
+                    patch_outcome = "PATCH_SUCCESS"
+                    assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                    state = PipelineState.PATCH_SUCCESS
+                    continue
+                if patch_verify_rounds_used < patch_verify_rounds_max:
+                    patch_verify_rounds_used += 1
+                    memory.build_error_feedback = _render_heuristic_feedback(
+                        contract_drift, parallel_impl, removed_sym_refs,
+                        go_unexport, config_shape, active,
+                    )
+                    _record_fed_back(active, fed_back_gate_signatures)
+                    # Same prior-plan pruning as the compiled-language path: on
+                    # a node/unknown repatch, keep only edits implicated by the
+                    # active heuristic findings so the full plan does not bloat
+                    # the planner prompt (issue 010).
+                    pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                        memory.patch_plan, active
+                    )
+                    memory.patch_plan = pruned_plan
+                    if dropped_edits:
+                        print(
+                            f"[build-verify] pruned prior patch plan to finding "
+                            f"files: dropped {dropped_edits} edit(s), kept "
+                            f"{len(pruned_plan.edits) if pruned_plan else 0}.",
+                            flush=True,
+                        )
+                    print(
+                        f"[build-verify] heuristic findings on '{system}' repo → "
+                        f"repatch (round {patch_verify_rounds_used}/"
+                        f"{patch_verify_rounds_max}) with {len(active)} finding(s).",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="build-verify",
+                        outcome=f"repatch_heuristic:round={patch_verify_rounds_used}",
+                    )
+                    assert is_valid_transition(state, PipelineState.CLOSED)
+                    state = PipelineState.CLOSED
+                else:
+                    print(
+                        "[build-verify] heuristic findings persist and repatch "
+                        "budget exhausted; accepting patch with warnings "
+                        "(heuristic gates are advisory, not a hard build failure).",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="build-verify",
+                        outcome="accepted_with_heuristic_warnings",
+                    )
+                    patch_outcome = "PATCH_SUCCESS"
+                    assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                    state = PipelineState.PATCH_SUCCESS
                 continue
 
             post = run_build_check(repo_dir, system)
+            if not post.unverifiable and not post.skipped:
+                toolchain_seen_working = True
             print(
                 f"[build-verify] post-patch: ok={post.ok} "
                 f"errors={len(post.errors)} timed_out={post.timed_out} "
-                f"cmd='{post.command}'",
+                f"unverifiable={post.unverifiable} cmd='{post.command}'",
                 flush=True,
             )
 
-            # Rename-residue gate (phase 23): independent of build outcome.
-            # Old symbols left behind by an under-propagated rename frequently
-            # compile fine yet break grep-visible callers — the build gate
-            # alone misses them. We diff the working tree against HEAD; the
-            # repo was hard-reset to base_commit at startup, so HEAD == base.
+            # Rename-residue gate (phase 23) and undefined-config-symbol gate
+            # (phase 24): git-only, independent of build outcome.
             residues = check_rename_residue(repo_dir, base_commit=None)
-            if residues:
-                print(
-                    f"[build-verify] rename-residue gate: "
-                    f"{len(residues)} unupdated old-symbol references.",
-                    flush=True,
-                )
-            else:
-                print("[build-verify] rename-residue gate: clean.", flush=True)
+            print(
+                f"[build-verify] rename-residue gate: "
+                + (f"{len(residues)} unupdated old-symbol references."
+                   if residues else "clean."),
+                flush=True,
+            )
+            config_sym_errors = check_undefined_config_symbol(
+                repo_dir, base_commit=None
+            )
+            print(
+                f"[build-verify] undefined-config-symbol gate: "
+                + (f"{len(config_sym_errors)} unresolved reference(s)."
+                   if config_sym_errors else "clean."),
+                flush=True,
+            )
 
-            # Toolchain unavailable (e.g. no `go` on this host) → the build gate
-            # could not run and has NO opinion on the patch. We must NOT treat
-            # this as a verified pass (the old code did: rc=127 produced empty
-            # errors that baseline-subtraction cancelled to "no new errors",
-            # silently green-lighting every Go patch on a host without Go).
-            # The rename-residue gate is git-only and still valid, so honour it;
-            # the build verdict itself is recorded as BUILD_UNVERIFIABLE. The
-            # patch is still written — the real arbiter is the docker eval.
-            if post.unverifiable and not residues:
+            # All git-only deterministic findings, subject to the false-positive
+            # fuse (a finding the planner already saw and kept is downgraded).
+            raw_deterministic = (
+                list(residues) + list(config_sym_errors)
+                + list(contract_drift) + list(parallel_impl)
+                + list(removed_sym_refs) + list(go_unexport) + list(config_shape)
+            )
+            deterministic_errors, downgraded = _partition_by_fuse(
+                raw_deterministic, fed_back_gate_signatures
+            )
+
+            # Toolchain MISSING → the build gate has no opinion. Retry once
+            # if the toolchain demonstrably worked earlier this session (a
+            # transient hiccup), then fall back to BUILD_UNVERIFIABLE. Honour
+            # the git-only gates regardless; capture raw output for diagnosis.
+            if post.unverifiable and post.toolchain_missing and toolchain_seen_working:
                 print(
-                    "[build-verify] BUILD_UNVERIFIABLE: toolchain unavailable or "
-                    f"build could not be attributed (cmd='{post.command}'); "
-                    "skipping baseline diff and accepting patch unverified. "
-                    "Run the docker eval for a real build/test verdict.",
+                    "[build-verify] toolchain missing but it worked earlier; "
+                    "retrying build once.",
                     flush=True,
                 )
-                memory.record_action(
-                    phase="build-verify",
-                    outcome="unverifiable",
+                post = run_build_check(repo_dir, system)
+                if not post.unverifiable:
+                    toolchain_seen_working = True
+                print(
+                    f"[build-verify] retry: ok={post.ok} "
+                    f"unverifiable={post.unverifiable}",
+                    flush=True,
                 )
+
+            # Only a genuinely MISSING toolchain (rc=127) earns an unverified
+            # pass — the gate cannot compile, so it honestly has no opinion.
+            # A toolchain that DID run but exited non-zero with no parseable
+            # error (post.unverifiable and NOT toolchain_missing) is a real,
+            # un-attributable failure: do NOT accept it here. It falls through
+            # to the BUILD_FAILED path below, where a synthetic error carrying
+            # the raw output tail is fed back to the planner for a repatch.
+            if post.unverifiable and post.toolchain_missing and not deterministic_errors:
+                raw_tail = (post.raw_output or "")[-2000:]
+                print(
+                    "[build-verify] BUILD_UNVERIFIABLE: toolchain unavailable "
+                    f"(cmd='{post.command}'); accepting patch unverified. Run "
+                    "the docker eval for a real build/test verdict.",
+                    flush=True,
+                )
+                memory.record_action(phase="build-verify", outcome="unverifiable")
                 build_verify_log.append(
                     {"round": patch_verify_rounds_used, "system": system,
-                     "ok": False, "unverifiable": True,
-                     "command": post.command, "timed_out": post.timed_out}
+                     "ok": False, "unverifiable": True, "toolchain_missing": True,
+                     "command": post.command, "timed_out": post.timed_out,
+                     "reverted_tests": reverted_tests,
+                     "raw_output_tail": raw_tail,
+                     "downgraded_signatures": sorted(downgraded)}
                 )
                 patch_outcome = "BUILD_UNVERIFIABLE"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                 state = PipelineState.PATCH_SUCCESS
                 continue
 
-            if post.ok and not residues:
+            if post.ok and not deterministic_errors:
                 memory.record_action(phase="build-verify", outcome="ok")
                 build_verify_log.append(
                     {"round": patch_verify_rounds_used, "system": system,
-                     "ok": True, "command": post.command}
+                     "ok": True, "command": post.command,
+                     "reverted_tests": reverted_tests,
+                     "downgraded_signatures": sorted(downgraded)}
                 )
                 patch_outcome = "PATCH_SUCCESS"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                 state = PipelineState.PATCH_SUCCESS
                 continue
 
-            # Build failed — distinguish patch-induced from pre-existing.
+            # Build failed (or unverifiable-with-deterministic-findings) —
+            # distinguish patch-induced compile errors from pre-existing ones.
             if post.ok:
                 baseline = None
                 new_errors = []
+            elif post.unverifiable:
+                # Reached only when the toolchain RAN but exited non-zero with
+                # no parseable error (toolchain_missing was handled above). We
+                # cannot attribute the failure to a line, but it is a real
+                # failure — synthesize one error carrying the raw output tail so
+                # it enters combined_errors and drives a repatch / BUILD_FAILED
+                # instead of being silently accepted as "pre-existing only".
+                baseline = None
+                raw_tail = (post.raw_output or "")[-1500:]
+                new_errors = [
+                    BuildError(
+                        file="(build)",
+                        line=None,
+                        message=(
+                            "build command failed but produced no parseable "
+                            "error line; raw tail:\n" + raw_tail
+                        ),
+                        raw=raw_tail,
+                    )
+                ]
+                print(
+                    "[build-verify] command failed un-attributably (toolchain "
+                    "present); treating as a build failure, not unverifiable.",
+                    flush=True,
+                )
             else:
                 baseline = _compute_baseline_build(repo_dir, system)
                 new_errors = diff_new_errors(baseline, post)
@@ -1757,39 +2433,39 @@ async def _run_state_machine(
                     flush=True,
                 )
 
-            # Combine residue records with build errors so the repatch loop
-            # sees one unified feedback channel.
-            combined_errors = list(new_errors) + list(residues)
+            combined_errors = list(new_errors) + deterministic_errors
             build_verify_log.append(
                 {
                     "round": patch_verify_rounds_used,
                     "system": system,
                     "ok": post.ok,
+                    "unverifiable": post.unverifiable,
                     "command": post.command,
                     "timed_out": post.timed_out,
                     "baseline_computed": baseline is not None,
-                    "new_errors": [
-                        {"file": e.file, "line": e.line, "message": e.message}
-                        for e in new_errors
-                    ],
-                    "rename_residues": [
-                        {"file": e.file, "line": e.line, "message": e.message}
-                        for e in residues
-                    ],
+                    "reverted_tests": reverted_tests,
+                    "new_errors": _errs_to_log(new_errors),
+                    "rename_residues": _errs_to_log(residues),
+                    "undefined_config_symbols": _errs_to_log(config_sym_errors),
+                    "contract_drift": _errs_to_log(contract_drift),
+                    "parallel_impl": _errs_to_log(parallel_impl),
+                    "removed_symbol_test_refs": _errs_to_log(removed_sym_refs),
+                    "go_unexport": _errs_to_log(go_unexport),
+                    "config_entry_shape": _errs_to_log(config_shape),
+                    "downgraded_signatures": sorted(downgraded),
+                    "raw_output_tail": (post.raw_output or "")[-2000:]
+                    if post.unverifiable else "",
                 }
             )
 
             if not combined_errors:
-                # All failures pre-existed at base_commit — not the patch's
-                # fault. Accept the patch.
                 print(
-                    "[build-verify] all build errors pre-existed at base "
-                    "and no rename residues; accepting patch.",
+                    "[build-verify] all build errors pre-existed at base and no "
+                    "active deterministic findings; accepting patch.",
                     flush=True,
                 )
                 memory.record_action(
-                    phase="build-verify",
-                    outcome="ok_preexisting_only",
+                    phase="build-verify", outcome="ok_preexisting_only"
                 )
                 patch_outcome = "PATCH_SUCCESS"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
@@ -1801,14 +2477,62 @@ async def _run_state_machine(
                 feedback_parts: list[str] = []
                 if new_errors:
                     feedback_parts.append(render_errors_for_feedback(new_errors))
-                if residues:
-                    feedback_parts.append(render_residue_for_feedback(residues))
-                memory.build_error_feedback = "\n\n".join(p for p in feedback_parts if p)
+                    enriched = _enrich_go_errors_with_definitions(
+                        repo_dir, new_errors
+                    )
+                    if enriched:
+                        feedback_parts.append(enriched)
+                feedback_parts.append(
+                    _render_heuristic_feedback(
+                        contract_drift, parallel_impl, removed_sym_refs,
+                        go_unexport, config_shape, deterministic_errors,
+                        residues=residues, config_sym_errors=config_sym_errors,
+                    )
+                )
+                memory.build_error_feedback = "\n\n".join(
+                    p for p in feedback_parts if p
+                )
+                _record_fed_back(deterministic_errors, fed_back_gate_signatures)
+                # Keep only the prior-plan edits implicated by this round's
+                # errors. The full plan would otherwise be re-inlined into the
+                # planner prompt (issue 010: bloat → empty structured_output
+                # crash); the edits the plan got right are dropped, and
+                # build_error_feedback carries the "what to fix" signal.
+                pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                    memory.patch_plan, combined_errors
+                )
+                memory.patch_plan = pruned_plan
+                if dropped_edits:
+                    print(
+                        f"[build-verify] pruned prior patch plan to error files: "
+                        f"dropped {dropped_edits} edit(s), kept "
+                        f"{len(pruned_plan.edits) if pruned_plan else 0}.",
+                        flush=True,
+                    )
+                # Slice the evidence the planner sees to just the files that
+                # failed this round (issue 010): the full EvidenceCards dump
+                # was ~56% of a 72k-char prompt — half of it the aggregate
+                # cards duplicating each requirement's scoped_evidence — which
+                # pushed the planner SDK into empty-structured_output. The
+                # per-requirement scoped_evidence is the SOURCE; the aggregate
+                # is a redundant rebuild we drop on repatch.
+                focus_files = sorted({
+                    e.file.replace("\\", "/").strip().lstrip("./")
+                    for e in combined_errors
+                    if e.file and e.file != "(build)"
+                })
+                memory.evidence_focus_files = focus_files
+                if focus_files:
+                    print(
+                        f"[build-verify] sliced evidence to {len(focus_files)} "
+                        f"implicated file(s) for repatch planner prompt.",
+                        flush=True,
+                    )
                 print(
                     "[build-verify] BUILD_FAILED → repatch: re-opening planning "
                     f"(round {patch_verify_rounds_used}/{patch_verify_rounds_max}) "
                     f"with {len(new_errors)} build errors and "
-                    f"{len(residues)} rename residues.",
+                    f"{len(deterministic_errors)} deterministic finding(s).",
                     flush=True,
                 )
                 memory.record_action(
@@ -1816,7 +2540,8 @@ async def _run_state_machine(
                     outcome=(
                         f"repatch:round={patch_verify_rounds_used}/"
                         f"{patch_verify_rounds_max}:"
-                        f"{len(new_errors)}_errors+{len(residues)}_residues"
+                        f"{len(new_errors)}_errors+"
+                        f"{len(deterministic_errors)}_deterministic"
                     ),
                 )
                 assert is_valid_transition(state, PipelineState.CLOSED)
@@ -1828,8 +2553,7 @@ async def _run_state_machine(
                     flush=True,
                 )
                 memory.record_action(
-                    phase="build-verify",
-                    outcome="BUILD_FAILED_terminal",
+                    phase="build-verify", outcome="BUILD_FAILED_terminal"
                 )
                 patch_outcome = "BUILD_FAILED"
                 assert is_valid_transition(state, PipelineState.PATCH_FAILED)
@@ -1844,6 +2568,24 @@ async def _run_state_machine(
 
     if state == PipelineState.CLOSURE_FORCED_FAIL and patch_outcome is None:
         patch_outcome = "EVIDENCE_INCOMPLETE"
+
+    # Degraded-patch relabel (improvement 3): a patch produced under
+    # degraded_patch_mode was never closure-approved — it covers only the
+    # grounded subset of requirements.  Surface that honestly as PARTIAL_PATCH
+    # so eval/telemetry never mistakes a best-effort patch for a fully-verified
+    # one.  A clean build still beats EVIDENCE_INCOMPLETE (which scores zero),
+    # but it is not PATCH_SUCCESS.  BUILD_FAILED / PATCH_FAILED keep their own
+    # (worse) labels — degraded mode only downgrades the success labels.
+    if degraded_patch_mode and patch_outcome in (
+        "PATCH_SUCCESS", "BUILD_UNVERIFIABLE",
+    ):
+        print(
+            f"[orchestrator] degraded patch mode: relabeling {patch_outcome} "
+            f"-> PARTIAL_PATCH (best-effort patch over grounded requirements; "
+            f"closure was not approved).",
+            flush=True,
+        )
+        patch_outcome = "PARTIAL_PATCH"
 
     # Save final evidence
     current_evidence = get_submitted_evidence()
