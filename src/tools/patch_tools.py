@@ -5,8 +5,6 @@ Patch Planner returns PatchPlan via SDK structured output. This module only
 exposes the edit-application tool consumed by Patch Generator.
 """
 
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +14,7 @@ from src.tools.ingestion_tools import (
     _normalize_path,
     get_working_memory,
 )
+from src.orchestrator.repo_executor import run_repo_command
 
 
 _APPLY_SEARCH_REPLACE_SCHEMA = {
@@ -93,29 +92,37 @@ def _parse_search_replace_blocks(raw: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def _validate_syntax(path: Path) -> str:
+def _validate_syntax(path: Path, repo_dir: Path) -> str:
     """Run a language-appropriate syntax check on *path*.
 
     Returns an empty string on success, or an error message on failure.
     Files with unsupported extensions are skipped (return "").
     """
     suffix = path.suffix.lower()
+    try:
+        rel_path = str(path.relative_to(repo_dir)).replace("\\", "/")
+    except ValueError:
+        rel_path = str(path)
     if suffix == ".py":
-        result = subprocess.run(
-            [sys.executable, "-m", "py_compile", str(path)],
-            capture_output=True,
+        returncode, output, _ = run_repo_command(
+            ["python", "-m", "py_compile", rel_path],
+            repo_dir=repo_dir,
+            timeout=120,
         )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            return stderr or f"py_compile exited with code {result.returncode}"
+        if returncode == 127:
+            return ""
+        if returncode != 0:
+            return output.strip() or f"py_compile exited with code {returncode}"
     elif suffix in (".js", ".mjs", ".cjs", ".ts"):
-        result = subprocess.run(
-            ["node", "--check", str(path)],
-            capture_output=True,
+        returncode, output, _ = run_repo_command(
+            ["node", "--check", rel_path],
+            repo_dir=repo_dir,
+            timeout=120,
         )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            return stderr or f"node --check exited with code {result.returncode}"
+        if returncode == 127:
+            return ""
+        if returncode != 0:
+            return output.strip() or f"node --check exited with code {returncode}"
     return ""
 
 
@@ -218,7 +225,8 @@ async def apply_search_replace(args: dict[str, Any]) -> dict[str, Any]:
 
     abs_path.write_text(content, encoding="utf-8")
 
-    syntax_error = _validate_syntax(abs_path)
+    repo_dir = Path(repo_root_str.rstrip("/")) if repo_root_str else abs_path.parent
+    syntax_error = _validate_syntax(abs_path, repo_dir)
     if syntax_error:
         abs_path.write_text(original_content, encoding="utf-8")
         return {

@@ -254,6 +254,24 @@ def test_python_present_is_not_unverifiable(tmp_path: Path):
     assert result.unverifiable is False
 
 
+def test_python_changed_production_import_error_is_build_error(tmp_path: Path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("import does_not_exist_for_build_gate\n", encoding="utf-8")
+
+    result = run_build_check(
+        tmp_path,
+        system="python",
+        python_targets=["pkg/mod.py"],
+    )
+
+    assert result.ok is False
+    assert result.unverifiable is False
+    assert len(result.errors) == 1
+    assert result.errors[0].file == "pkg/mod.py"
+    assert "ModuleNotFoundError" in result.errors[0].message
+
+
 # ── Detection ───────────────────────────────────────────────────────────────
     go = tmp_path / "go"
     go.mkdir()

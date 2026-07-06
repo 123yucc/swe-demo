@@ -7,6 +7,7 @@ structured output schema because downstream agents do not consume them.
 """
 
 from src.models.report import DeepSearchReport
+from src.tools.ingestion_tools import DEEP_SEARCH_OWNED_FIELDS
 
 
 def test_deep_search_report_has_no_debug_only_fields():
@@ -29,18 +30,35 @@ def test_deep_search_report_persisted_observation_fields_are_explicit():
         "requirement_findings",
         "requirement_evidence_locations",
     }
-    persisted_observation_fields = {
-        "suspect_entities",
-        "exact_code_regions",
-        "call_chain_context",
-        "dataflow_relevant_uses",
-        "must_co_edit_relations",
-        "dependency_propagation",
-        "similar_implementation_patterns",
-        "behavioral_constraints",
-        "semantic_boundaries",
-        "backward_compatibility",
-    }
+    # The observation fields exposed by DeepSearchReport must match exactly the
+    # deep-search-owned fields that update_localization persists. Binding the
+    # expectation to DEEP_SEARCH_OWNED_FIELDS (the single source of truth) means
+    # a field added on one side but not the other fails here — the gap that
+    # previously left consistency_anchors generated-but-never-persisted.
+    persisted_observation_fields = set(DEEP_SEARCH_OWNED_FIELDS)
     report_observation_fields = set(DeepSearchReport.model_fields) - requirement_fields
 
     assert report_observation_fields == persisted_observation_fields
+
+
+def test_deep_search_report_normalizes_similar_implementation_pattern_objects():
+    report = DeepSearchReport.model_validate(
+        {
+            "target_requirement_id": "req-001",
+            "requirement_verdict": "TO_BE_MISSING",
+            "requirement_findings": "missing implementation",
+            "requirement_evidence_locations": [],
+            "similar_implementation_patterns": [
+                {
+                    "description": "Existing helper follows the desired flow",
+                    "location": "src/example.py:10-20",
+                },
+                "plain string pattern",
+            ],
+        }
+    )
+
+    assert report.similar_implementation_patterns == [
+        "Existing helper follows the desired flow | src/example.py:10-20",
+        "plain string pattern",
+    ]

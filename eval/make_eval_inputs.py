@@ -1,51 +1,51 @@
 #!/usr/bin/env python3
-"""生成评测所需的 patches.json 和 samples.jsonl。
+"""Generate SWE-bench Pro eval input files from per-issue harness outputs."""
 
-用法:
-  # 指定 issue 列表
-  python eval/make_eval_inputs.py --issues swe_issue_001 swe_issue_002
+from __future__ import annotations
 
-  # 自动扫描所有有 patch 的 issue
-  python eval/make_eval_inputs.py --all
-
-输出到 workdir/eval_result/ 下:
-  - patches.json
-  - samples.jsonl
-"""
 import argparse
 import json
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from src.output_paths import model_output_dir_name  # noqa: E402
+
 WORKDIR = REPO_ROOT / "workdir"
 OUTPUT_DIR = WORKDIR / "eval_result"
 
 
-def find_all_issues() -> list[str]:
-    """扫描 workdir 下所有含 patch 的 swe_issue_* 目录。"""
-    issues = []
+def resolve_outputs_dir(issue_dir: Path, output_subdir: str | None) -> Path:
+    return issue_dir / (output_subdir or model_output_dir_name())
+
+
+def find_all_issues(output_subdir: str | None) -> list[str]:
+    """Scan workdir for swe_issue_* directories with metadata and a patch/gold patch."""
+    issues: list[str] = []
     for d in sorted(WORKDIR.iterdir()):
         if not d.is_dir() or not d.name.startswith("swe_issue_"):
             continue
         inst_path = d / "artifacts" / "instance_metadata.json"
-        patch_path = d / "outputs" / "patch.diff"
+        patch_path = resolve_outputs_dir(d, output_subdir) / "patch.diff"
         if inst_path.exists() and (patch_path.exists() or inst_path.exists()):
             issues.append(d.name)
     return issues
 
 
-def build_inputs(issues: list[str]):
+def build_inputs(issues: list[str], output_subdir: str | None) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     patches_out = OUTPUT_DIR / "patches.json"
     samples_out = OUTPUT_DIR / "samples.jsonl"
 
-    patches = []
-    samples_lines = []
+    patches: list[dict[str, str]] = []
+    samples_lines: list[str] = []
 
     for issue in issues:
-        inst_path = WORKDIR / issue / "artifacts" / "instance_metadata.json"
-        patch_path = WORKDIR / issue / "outputs" / "patch.diff"
+        issue_dir = WORKDIR / issue
+        inst_path = issue_dir / "artifacts" / "instance_metadata.json"
+        patch_path = resolve_outputs_dir(issue_dir, output_subdir) / "patch.diff"
 
         if not inst_path.exists():
             print(f"WARN: missing {inst_path}, skipping")
@@ -92,19 +92,28 @@ def build_inputs(issues: list[str]):
         f.write("\n".join(samples_lines) + "\n")
 
     print(f"Generated {len(patches)} entries:")
+    print(f"  output subdir: {output_subdir or model_output_dir_name()}")
     print(f"  patches: {patches_out}")
     print(f"  samples: {samples_out}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="生成评测输入文件")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate SWE-bench Pro eval inputs")
+    parser.add_argument(
+        "--output-subdir",
+        default=None,
+        help=(
+            "Per-issue harness output subdirectory to read. "
+            "Defaults to outputs_<current-model>."
+        ),
+    )
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--issues", nargs="+", help="指定 issue 目录名列表")
-    group.add_argument("--all", action="store_true", help="自动扫描所有有 patch 的 issue")
+    group.add_argument("--issues", nargs="+", help="Issue directory names")
+    group.add_argument("--all", action="store_true", help="Scan all issues")
     args = parser.parse_args()
 
     if args.all:
-        issues = find_all_issues()
+        issues = find_all_issues(args.output_subdir)
         if not issues:
             print("ERROR: no issues with patches found in workdir/")
             sys.exit(1)
@@ -112,7 +121,7 @@ def main():
     else:
         issues = args.issues
 
-    build_inputs(issues)
+    build_inputs(issues, args.output_subdir)
 
 
 if __name__ == "__main__":

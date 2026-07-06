@@ -118,11 +118,26 @@ Your task: review the DeepSearchReport you just produced and self-correct
 before returning the final report.
 
 SELF-REFLECTION CHECKS:
-1. TOKEN TRACEABILITY — For every backtick-enclosed snippet or function-name
-   in your findings, verify: "Did my Read tool actually return content
-   containing this token?"  Any snippet that is NOT in a file you Read
-   during this investigation is a HALLUCINATION.  Delete or rephrase such
-   tokens; do not assert code exists that you did not verify.
+1. TOKEN TRACEABILITY — verify against the REPOSITORY, not against your memory.
+   CRITICAL FRAMING: You are a FRESH session. You have NOT read any file yet
+   this round, and the working-memory "Retrieved Code Cache" / action history
+   do NOT record the file reads from your investigation round. Therefore the
+   ABSENCE of a Read in your history or an empty code cache is NEVER evidence
+   of hallucination — treating it as such wrongly deletes real, verified
+   findings. Do not reason from "I don't see that I read this."
+   Instead, GROUND-TRUTH each claim against the repo using your Read/Grep/Glob
+   tools NOW: for every cited evidence_location and every backtick-enclosed
+   snippet or symbol name in your findings, open that exact file:line (or grep
+   the symbol) in the repository and check whether the token is actually there.
+     - If Read/Grep confirms the token exists at (or near) the cited location:
+       KEEP the location and the finding.
+     - Only if Read/Grep shows the file or line genuinely does NOT contain the
+       cited token (or the file does not exist) is it a HALLUCINATION — then
+       delete or correct that specific token/location.
+   NEVER empty a non-empty evidence_locations list except for the specific
+   locations you actively DISPROVED by reading the repo this round. A verdict
+   of AS_IS_VIOLATED / AS_IS_COMPLIANT / TO_BE_PARTIAL with verified locations
+   must retain those locations.
 
 2. BOUNDARY ENUMERATION — If your verdict is AS_IS_VIOLATED, TO_BE_MISSING,
    or TO_BE_PARTIAL AND your findings contain a prescriptive fix
@@ -140,9 +155,35 @@ SELF-REFLECTION CHECKS:
    fully supported by verified code evidence, remove it or downgrade the
    verdict to TO_BE_PARTIAL.
 
+2b. SPEC PRIORITY — this is the REVERSE of check 2 and is just as important.
+   Check 2 stops you from over-prescribing; this stops you from under-acting
+   on an explicit instruction. When the requirement TEXT prescribes a change
+   — it contains MUST / "must take precedence" / "should be" / "is required
+   to" / a named behaviour the code is supposed to have — and your verdict is
+   non-compliant (AS_IS_VIOLATED / TO_BE_MISSING / TO_BE_PARTIAL), then:
+     - Your findings MUST NOT argue that the cited code "should remain
+       unchanged", "is load-bearing", or "must stay as-is". A non-compliant
+       verdict means a change is owed AT the cited location. Claiming the
+       location both violates the requirement AND must not change is an
+       internal contradiction — resolve it, do not ship it.
+     - Your findings MUST NOT declare the fix to be "a side-effect of fixing
+       req-X", "dead code once req-Y lands", or otherwise defer this
+       requirement's change point to another requirement. Each requirement is
+       repaired on its own cited location, in a world where nothing else
+       changed. Reasoning of the form "this becomes unreachable once req-X is
+       fixed" is a cross-requirement coupling violation: fix it here.
+     - If you genuinely believe the requirement itself is wrong or the code is
+       already correct, that is a VERDICT decision (use AS_IS_COMPLIANT and say
+       why), NOT a license to keep a non-compliant verdict while arguing in the
+       findings against making any change. The verdict and the findings must
+       agree on whether a change is owed.
+
 3. VERDICT CONSISTENCY — If findings mention overlapping code with other
    requirements, ensure your verdict is consistent with the code's
-   actual behaviour in those shared regions.
+   actual behaviour in those shared regions. Reasoning of the form "this
+   becomes dead code once req-X is fixed" is a consistency violation: do not
+   let one requirement's fix silently absorb another requirement's cited
+   change point.
 
 4. ANCHOR ENDPOINT VERIFICATION — For every entry you wrote in
    ``structural.consistency_anchors``, both LHS and RHS endpoints must
@@ -216,8 +257,8 @@ async def _run_deep_search_async(
             response_model=DeepSearchReport,
             component="deep-search-reflection",
             allowed_tools=["Grep", "Read", "Glob"],
-            max_turns=10,
-            max_budget_usd=0.5,
+            max_turns=25,
+            max_budget_usd=1.5,
             cwd=str(repo_dir) if repo_dir is not None else None,
         )
         # Use reflected report only if it preserved the verdict.

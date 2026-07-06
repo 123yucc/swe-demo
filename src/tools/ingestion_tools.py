@@ -215,6 +215,16 @@ def reset_submitted_evidence() -> None:
     _working_memory = None
 
 
+def restore_working_memory(memory: SharedWorkingMemory) -> None:
+    """Set working memory directly from a deserialized checkpoint.
+
+    Used by run_pipeline_from_checkpoint to restore the full in-process
+    state without re-running the parser or calling init_working_memory.
+    """
+    global _working_memory
+    _working_memory = memory
+
+
 def _format_previous_state(target: RequirementItem) -> str:
     """Render a requirement's about-to-be-cleared state as a 'rejected state'
     block, prepended to rework_context so the next deep-search iteration sees

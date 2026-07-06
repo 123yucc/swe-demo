@@ -24,7 +24,7 @@ python -m src.main --instance-json workdir/swe_issue_001/artifacts/instance_meta
 
 **Repo Initialization**: The harness automatically resets the repo to a clean `base_commit` state before running (via `git reset --hard`, `git clean -fd`, `git checkout`). This ensures patches are generated against the original buggy code, not previously modified code.
 
-**Output** written to `<output-dir>/` (defaults to `workdir/<issue_name>/outputs/` in `--instance-json` mode, otherwise `workdir/<instance_id>/outputs/`):
+**Output** written to `<output-dir>/` (defaults to `workdir/<issue_name>/outputs_<model>/` in `--instance-json` mode, otherwise `workdir/<instance_id>/outputs_<model>/`; for example `outputs_gpt-5.2`):
 - `evidence.json` — structured evidence
 - `patch.diff` — git diff patch
 - `prediction.json` — SWE-bench eval format (`{instance_id, model_patch}`)
@@ -94,14 +94,28 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
   `patch_outcome = EVIDENCE_INCOMPLETE`).
 - No patch generation is allowed before `Closed`.
 - `PatchVerifying` is a deterministic code-only gate (no LLM): after the
-  generator applies edits, it compiles/collects the patched tree in `repo_dir`
-  (Go: `go build ./...` + `go vet ./...`; Python: `pytest --collect-only`) to
-  catch incomplete refactors that *apply* cleanly but don't *compile* (renamed
-  symbol left stale in a sibling file, a type referenced but never defined). A
-  lazy baseline at `base_commit` (via `git stash`) subtracts pre-existing
-  failures so only patch-induced errors count. New errors feed back to the
-  patch-planner via `memory.build_error_feedback` for up to
-  `patch_verify_rounds_max = 2` repatch rounds. **It never runs
+  generator applies edits, it first **reverts any model edits to test files**
+  (`revert_test_file_edits` — the evaluator owns the suite and applies its own
+  test patch; a model-authored test edit can only shadow/clash with the gold
+  tests, as in issue 002), then compiles/collects the patched tree in
+  `repo_dir` (Go: `go build ./...` + `go vet ./...`; Python:
+  `pytest --collect-only`) to catch incomplete refactors that *apply* cleanly
+  but don't *compile*. A lazy baseline at `base_commit` (via `git stash`)
+  subtracts pre-existing failures so only patch-induced errors count.
+  Alongside the compile step, a battery of **git-only gates** runs regardless
+  of build system (so they also fire on JS/unknown repos and on hosts without
+  the toolchain): rename-residue, undefined-config-symbol, contract-drift,
+  parallel-impl-consistency, removed-symbol-test-refs, go-unexport-consistency,
+  and config-entry-shape. All findings fold into one `deterministic_errors`
+  set. New build errors + active findings feed back to the patch-planner via
+  `memory.build_error_feedback` for up to `patch_verify_rounds_max = 3` repatch
+  rounds; Go signature-shape errors are enriched with the real definition line.
+  A **false-positive fuse** downgrades any heuristic finding the planner already
+  saw and deliberately kept (same signature across rounds) to an advisory
+  warning, capping each heuristic gate's worst-case cost at one extra round.
+  A `BUILD_UNVERIFIABLE` verdict (toolchain unavailable) is retried once if the
+  toolchain worked earlier this session, and the raw output tail is captured to
+  `build_verification.json` for diagnosis. **It never runs
   `before_repo_set_cmd` / pulls in gold test files** — only patched production
   code plus base_commit tests are compiled.
 
@@ -109,7 +123,7 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
 
 | Component | File | Role |
 |-----------|------|------|
-| CLI | `src/main.py` | Unified entry point: supports SWE-bench Pro instances, local JSON, and legacy artifacts dir |
+| CLI | `src/main.py` | Unified entry point: three input modes — `--index` (HuggingFace dataset), `--instance-id` (by id), `--instance-json` (local metadata JSON) |
 | Artifacts | `src/artifacts.py` | Converts SWE-bench `problem_statement` into 4 Markdown artifact files |
 | Config | `src/config.py` | Loads `.env` into `os.environ` for the SDK |
 | Parser Agent | `src/agents/parser_agent.py` | Reads artifacts, returns `EvidenceCards` via SDK structured output |
@@ -117,9 +131,9 @@ Init -> (Parser) -> UnderSpecified --(deep-search per RequirementItem)--> Eviden
 | Closure Checker Agent | `src/agents/closure_checker_agent.py` | **Phase 25**: re-scoped from factual auditor to **evidence-closure questioner**. Owns the two SEMANTIC dimensions — ① Sufficiency (can a repair commit be made?) and ② Consistency (do active verdicts + the compliant group + findings agree?) — plus the surviving `prescriptive_boundary_self_check`. The factual checks (`verdict_vs_code`, `findings_anti_hallucination`) were lowered into the code grounding gate. Returns `ClosureVerdict.dimension_findings` (per-dimension PASS/FAIL with a fixed `conflicting_field` enum) + per-task `AuditResult`. The compliant group (`requirement_status`) is explicitly re-injected for consistency auditing. |
 | Orchestrator | `src/orchestrator/engine.py` | Code-driven while-loop pipeline; calls sub-agents directly at semantic nodes; enforces state transitions via `PipelineState` enum. **Phase 18**: integrates `check_structural_invariants`, `build_audit_manifest`, validates manifest coverage, differentiated rework feedback. **Phase 19**: `PatchVerifying` build gate + build-error-feedback repatch loop. **Phase 23**: anchor-format/factual gates before closure-checker; rename-residue gate folded into PatchVerifying so old-symbol leftovers feed the same repatch loop as build errors |
 | State Machine | `src/orchestrator/states.py` | `PipelineState` enum (including terminal `CLOSURE_FORCED_FAIL` and the `PATCH_VERIFYING` build gate), `ALLOWED_TRANSITIONS` table, `STATE_ACTIONS` per-state allowed subagent types |
-| Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). **Phase 23**: `check_consistency_anchors_format`. `DeepSearchBudget` iteration limiter. |
+| Guards | `src/orchestrator/guards.py` | Mechanical gates: `check_sufficiency`, `check_correct_attribution`, **Phase 18.A**: `check_structural_invariants` (I1/I2/I3). **Phase 23**: `check_consistency_anchors_format`. **Phase 27**: `check_plan_covers_violations` (spec-priority firewall — every AS_IS_VIOLATED req's cited file must be in the patch plan; re-plans once otherwise). `DeepSearchBudget` iteration limiter. |
 | Build Verifier | `src/orchestrator/build_verify.py` | **Phase 19**: deterministic post-patch build gate. `detect_build_system`, `run_build_check` (go build/vet, pytest --collect-only), `parse_go_errors`/`parse_python_errors`, `diff_new_errors` (baseline subtraction). No LLM. |
-| Consistency Gates | `src/orchestrator/consistency_checks.py` | **Phase 23**: `check_consistency_anchors` (verifies each anchor's two endpoints exist as line ranges or grep-visible symbols) at closure stage; `check_rename_residue` (extracts `(old, new)` pairs from working-tree diff, greps for surviving old refs in unmodified files) at PatchVerifying stage. Failures feed the existing rework / repatch loops. No LLM. |
+| Consistency Gates | `src/orchestrator/consistency_checks.py` | **Phase 23**: `check_consistency_anchors` (closure stage) + `check_rename_residue` (PatchVerifying). **Phase 24**: `check_undefined_config_symbol`. **Phase 27** (all git-only, fold into `deterministic_errors`, run even when toolchain unavailable): `revert_test_file_edits` (tests are evaluator-owned — reverted before verify); `check_contract_drift` (empty-value return drift on unnamed branches); `check_parallel_impl_consistency` (N sibling impls with misaligned entry guards); `check_removed_symbol_test_refs` (deleted symbol still referenced by base-commit tests); `check_go_unexport_consistency` (case-flipped Go type with exported methods/ctor leftover); `check_config_entry_shape` (new config entry shape vs siblings). Failures feed the rework / repatch loops. No LLM. |
 | Static Grounding Gate | `src/orchestrator/grounding.py` | **Phase 25** (③ Correct attribution, no LLM): lowers the closure-checker's old factual audit into code. `ground_exact_code_regions` / `ground_suspect_entities` / `ground_findings_snippets` / `ground_missing_elements` (grep/Read), `ground_call_chain` / `ground_symptom_symbols` (AST-backed). Definite refutations reset the owning requirement; global card-field failures are attributed back to a req via `attribute_field_failure_to_req` (path → token → scoped_evidence 3-tier), else `<global>` non-blocking. Phase 26: each `GroundingFailure` carries a unified `grounded_by` tag (`static_grep` / `ast`). |
 | Dynamic Grounding Gate | `src/orchestrator/dynamic_grounding.py` | **Phase 26** (③ runtime layer): reproduces the bug ONCE on `base_commit` and mechanically matches the observed failure path against cited regions. `LANG_ADAPTERS` registry (python/go/java/js: `detect/drive_cmd/parse_trace/probe_coverage/parse_coverage`); `observed_symptom` symptom gate (the sole precondition for a strong signal — a silent pass never counts); `match_path_reached` (stack frames ∪ coverage ∩ cited regions, AST def-span granularity, only called when symptom observed); `synthesize_reproduction_script` (restricted LLM: `existing_test_template` first for go/java, else `synthetic_script`; translates repro steps only, never asserts correct behavior). Three states `dynamic_reached` / `dynamic_not_reached` / `dynamic_unverifiable_fallback` — reached → positive memory context, not_reached → soft closure-checker note (NEVER auto-reset), unverifiable → no-op. Restores the working tree after every run. |
 | AST Grounding | `src/orchestrator/ast_grounding.py` | **Phase 25** (gap A, no LLM): cross-language structural index. `build_symbol_index` dispatches by extension — Python via stdlib `ast` (zero-dep baseline), `.go/.js/.ts/.java` via optional tree-sitter (soft-fall-back to grep if unavailable). Queries: `has_call_edge`, `resolves_def_use`, `has_symbol_def`, `has_exception_class`. Only **definite structural refutation** is a fail; parse failure / unsupported language is always soft-pass. |
@@ -141,11 +155,14 @@ src/
 
     agents/
         __init__.py                    # Subpackage marker
+        _structured.py                 # run_structured_query: one query() per sub-agent with JSON-schema output
         parser_agent.py                # Parses 4 artifact markdown files into structured EvidenceCards
-        deep_search_agent.py           # Returns DeepSearchReport via SDK structured output
+        deep_search_agent.py           # Returns DeepSearchReport via SDK structured output (Round 1 + Round 2 reflection, incl. SPEC-PRIORITY check)
         closure_checker_agent.py       # Returns ClosureVerdict via SDK structured output
         patch_planner_agent.py         # Returns PatchPlan via SDK structured output
         patch_generator_agent.py       # Executes PatchPlan via SEARCH/REPLACE edits
+        ltm_agent.py                   # Agentic long-term-memory retrieval (search summaries + browse details)
+        custom_router_agent.py         # Classifies the case on 3 tag axes (RouteTags) for custom-rule routing
 
     models/
         __init__.py                    # Subpackage marker
@@ -156,23 +173,31 @@ src/
         verdict.py                     # ClosureVerdict model (Phase 18.B: audited list of AuditResult)
         report.py                      # DeepSearchReport model for deep-search structured output
         audit.py                       # AuditManifest, AuditTask, AuditResult (Phase 18.B)
+        custom_rules.py                # CustomRule / CustomRuleTags / RouteTags (tag-routed knowledge library)
 
     orchestrator/
         __init__.py                    # Subpackage marker
         engine.py                      # Code-driven while-loop pipeline with direct sub-agent calls
         states.py                      # PipelineState enum, ALLOWED_TRANSITIONS, STATE_ACTIONS
-        guards.py                      # Mechanical pre-checks (sufficiency, attribution, anchor-format, structural invariants I1/I2/I3)
+        guards.py                      # Mechanical pre-checks (sufficiency, attribution, anchor-format, structural invariants, plan-coverage firewall)
         audit.py                       # build_audit_manifest() for deterministic audit scope (phase 18.B)
         build_verify.py                # Post-patch build gate: go build/vet, pytest --collect-only, baseline diff (phase 19)
-        consistency_checks.py          # Anchor factual gate + rename-residue gate (phase 23)
+        consistency_checks.py          # Git-only gates: anchors + rename-residue (p23), undefined-config-symbol (p24), contract-drift/parallel-impl/removed-symbol-test-refs/go-unexport/config-entry-shape + test-file revert (p27)
         grounding.py                   # Static grounding gate: region/symbol/findings/missing-element + call-chain/symptom (phase 25)
         ast_grounding.py               # Cross-language AST index (Python ast + optional tree-sitter) for structural grounding (phase 25)
         dynamic_grounding.py           # Runtime grounding: reproduce bug on base_commit, symptom gate + path match vs cited regions (phase 26)
+
+    memory/
+        __init__.py                    # Re-exports the LTM client + custom-rule library surface
+        launcher.py                    # ensure_running: start/health-check the MemGovern experience_server
+        retrieve.py                    # HTTP client: search_ids/fetch_detail, search_experiences/browse_experience, prompt rendering, recommendations log
+        custom_route.py                # Custom-rule library: load_custom_rules, match_rule, format_custom_rules_for_prompt
 
     tools/
         __init__.py                    # Subpackage marker
         ingestion_tools.py             # Evidence MCP tools: update_localization and cache_retrieved_code
         patch_tools.py                 # Patch MCP tools: apply_search_replace
+        ltm_tools.py                   # LTM MCP tools: search_ltm_experiences / browse_ltm_experience
 ```
 
 ### Evidence Cards + RequirementItem[]
@@ -285,3 +310,4 @@ These deliberate deviations from SDK "default" shapes are documented so they are
 
 
 中文回答用户
+现在的总体目标是docs\实验计划.md

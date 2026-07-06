@@ -72,6 +72,20 @@ def test_region_out_of_bounds_fails(tmp_path: Path):
     assert failures[0].requirement_id == "req-001"
 
 
+def test_region_overshooting_end_is_soft_pass(tmp_path: Path):
+    """Start in-bounds + end just past EOF must NOT fail.
+
+    Regression for the issue013 infinite loop: deep-search cites the whole file
+    as the home for a TO_BE_MISSING interface (``file.go:1-82`` for an 81-line
+    file). The start anchors real code, so the overshooting end is benign
+    over-citation, not a definite refutation — failing it reset the same reqs
+    every closure round forever.
+    """
+    _write(tmp_path, "mod.py", _SAMPLE_PY)  # 11 lines
+    failures = ground_exact_code_regions("req-001", ["mod.py:1-12"], tmp_path)
+    assert failures == []
+
+
 def test_region_missing_file_fails(tmp_path: Path):
     failures = ground_exact_code_regions("req-001", ["ghost.py:1-2"], tmp_path)
     assert len(failures) == 1
@@ -127,6 +141,21 @@ def test_missing_element_actually_present_fails(tmp_path: Path):
     assert failures[0].kind == "missing_element_present"
 
 
+def test_missing_element_skips_referenced_types_in_signature(tmp_path: Path):
+    """Only the introduced symbol is grounded, not referenced existing types.
+
+    Regression for the issue013 reset loop: a new-interface signature names the
+    existing types it consumes (``func New(x FooError) (...)``). The introduced
+    function is genuinely absent, but ``FooError`` already exists — grounding
+    every backtick token wrongly fired ``missing_element_present`` on the
+    referenced type and reset the requirement forever.
+    """
+    _write(tmp_path, "mod.py", _SAMPLE_PY)  # defines FooError, helper, process
+    line = "Function: `NewThing(e FooError) (*helper, error)` in package `mod`"
+    failures = ground_missing_elements([line], tmp_path)
+    assert failures == []  # NewThing is absent; FooError/helper must be ignored
+
+
 # ── AST: call chain ────────────────────────────────────────────────────────
 
 def test_call_edge_present_passes(tmp_path: Path):
@@ -163,6 +192,20 @@ def test_symptom_unknown_symbol_fails(tmp_path: Path):
     failures = ground_symptom_symbols(["raises `TotallyMadeUpError`"], tmp_path)
     assert len(failures) == 1
     assert failures[0].kind == "symptom_symbol_absent"
+
+
+def test_symptom_soft_passes_on_language_blind_spot(tmp_path: Path):
+    """A symbol defined in an un-indexable language must not be refuted.
+
+    Regression for the issue013 infinite loop: a Go repo where tree-sitter-go
+    is unavailable leaves only a stray Python script indexed. The symptom gate
+    must treat the unparsed ``.go`` files as a coverage blind spot and soft-pass
+    rather than "refuting" a Go symbol against the lone Python index.
+    """
+    _write(tmp_path, "assets/convert.py", _SAMPLE_PY)
+    _write(tmp_path, "lib/clusterconfig.go", "package lib\n\ntype ClusterConfig struct{}\n")
+    failures = ground_symptom_symbols(["panic in `ClusterConfig`"], tmp_path)
+    assert failures == []
 
 
 # ── AST query units ────────────────────────────────────────────────────────

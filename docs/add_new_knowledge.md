@@ -73,23 +73,24 @@ tags 用于运行时检索匹配，决定哪些知识条目会被注入到 agent
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `repo_type` | `list[str] \| null` | 仓库语言/生态，如 `["go"]`, `["python","django"]`, `["rust"]`, `["javascript","typescript"]`。null 表示不限 |
-| `task_type` | `list[str] \| null` | 任务类型语义分类。null 表示不限 |
-| `change_shape` | `list[str] \| null` | 变更的代码形状。null 表示不限 |
+| `repo_type` | `list[str] \| null` | 仓库类型（**枚举**，见下）。null 表示不限 |
+| `task_type` | `list[str] \| null` | 任务类型（**枚举**，见下）。null 表示不限 |
+| `change_shape` | `list[str] \| null` | 变更的代码形状（**枚举**，见下）。null 表示不限 |
 
-### repo_type 参考值
-`go`, `python`, `rust`, `javascript`, `typescript`, `java`, `ruby`, `c`, `cpp`
-也可以带框架：`django`, `react`, `fastapi`, `gin`
+> ⚠️ 三个轴都是 `src/models/custom_rules.py` 里的严格 `Literal` 枚举。写入的标签值**必须**来自下面的列表，否则该条目会在 `load_custom_rules()` 里因 pydantic 校验失败而被**静默跳过**（不报错，但运行时永不命中）。写完后务必运行 `python -c "from src.memory.custom_route import load_custom_rules; print(len(load_custom_rules()))"` 确认条目数与预期一致。
 
-### task_type 参考值
-`api-contract`, `auth-and-session`, `data-access`, `test-and-tooling`,
-`ui-rendering`, `config-management`, `error-handling`, `concurrency`,
-`serialization`, `migration`, `documentation`
+### repo_type 枚举值
+`web-app`, `web-framework`, `cli-tool`, `library`, `service-platform`,
+`data-pipeline`, `language-tooling`
 
-### change_shape 参考值
-`rename`, `restructure`, `move-or-extract`, `add-field`, `add-method`,
-`add-endpoint`, `config`, `struct-shape-change`, `delete`, `visibility-change`,
-`type-change`, `error-path-change`
+### task_type 枚举值
+`auth-and-session`, `data-access`, `api-contract`, `ui-display`,
+`config-and-flags`, `business-logic`, `infra-integration`, `test-and-tooling`
+
+### change_shape 枚举值
+`add-field`, `add-method`, `add-endpoint`, `move-or-extract`,
+`fix-validation`, `fix-state-handling`, `restructure`, `rename`, `config`,
+`behavior-correction`, `struct-shape-change`
 
 tags 的匹配逻辑：条目的某个 tag 字段为 null 时表示"不限制"，
 当前 case 的属性会与非 null 的 tag 字段做交集匹配。

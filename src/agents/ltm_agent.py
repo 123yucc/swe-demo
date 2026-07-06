@@ -29,6 +29,7 @@ from claude_agent_sdk import (
 )
 from pydantic import BaseModel, Field
 
+from src.agents._backend import use_openai_backend
 from src.memory import Experience, browse_experience
 from src.tools.ltm_tools import browse_ltm_experience, search_ltm_experiences
 
@@ -91,6 +92,52 @@ async def run_agentic_ltm_retrieval(
     """
     if not query_text.strip():
         return [], [], []
+
+    if use_openai_backend():
+        from src.agents._openai_native import run_openai_tool_agent
+
+        prompt = (
+            f"Retrieval stage: {stage}\n\n"
+            "Current bug / task context:\n"
+            f"{query_text}\n\n"
+            "Find prior experiences that are analogically useful for this stage. "
+            "Search progressively, browse selectively, and return the final ids "
+            "worth injecting downstream."
+        )
+        result = await run_openai_tool_agent(
+            system_prompt=LTM_AGENT_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            allowed_tools=[
+                "mcp__ltm__search_ltm_experiences",
+                "mcp__ltm__browse_ltm_experience",
+            ],
+            cwd=None,
+            max_turns=max_turns,
+            response_model=AgenticRetrievalResult,
+        )
+        _, parsed = result
+
+        details: list[Experience] = []
+        seen: set[str] = set()
+        for unique_id in parsed.selected_ids:
+            if unique_id in seen:
+                continue
+            seen.add(unique_id)
+            detail = browse_experience(unique_id)
+            if detail is None:
+                continue
+            details.append(
+                Experience(
+                    id=detail.id,
+                    score=parsed.selected_scores.get(unique_id, 0.0),
+                    title=detail.title,
+                    symptom=detail.symptom,
+                    guidance=detail.guidance,
+                )
+            )
+
+        summaries = [item.strip() for item in parsed.search_summaries if item.strip()]
+        return summaries, parsed.selected_ids, details
 
     ltm_mcp = create_sdk_mcp_server(
         name="ltm",

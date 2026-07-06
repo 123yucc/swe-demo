@@ -238,6 +238,13 @@ Rules:
 - NO CODE: describe *what* and *why*, not actual code
 - TO-BE items in constraints describe behaviors to ADD, not existing ones
 - preserved_findings: copy verbatim, never summarize, distribute by theme
+- expected_diff_required: keep true for every non-reference edit that must
+  appear in patch.diff; only set false for genuine read-only/reference context.
+- creates_new_file: set true when the plan creates a file/module/package.
+- expected_symbols: when adding a new function/type/class/export, list the
+  exact symbol names so the artifact verifier can catch missing definitions.
+- required_by_requirement_ids: list the req-IDs that make the edit mandatory
+  when they are available from evidence.
 
 Return a structured JSON object matching the required schema.
 """
@@ -584,6 +591,61 @@ def _enforce_cross_edit_symbol_contract(plan: PatchPlan) -> None:
         )
 
 
+def _clean_expected_symbol(symbol: str) -> str:
+    symbol = symbol.strip()
+    if not symbol or symbol.startswith("("):
+        return ""
+    if ")." in symbol:
+        symbol = symbol.rsplit(").", 1)[-1]
+    if "." in symbol and not symbol.endswith(".py"):
+        symbol = symbol.rsplit(".", 1)[-1]
+    return symbol.strip()
+
+
+def _annotate_artifact_expectations(
+    plan: PatchPlan,
+    memory: SharedWorkingMemory,
+    repo_dir: Path | None,
+) -> None:
+    """Populate verifier-facing FileEditPlan fields conservatively."""
+    cached_paths = {
+        key.split(":", 1)[0].replace("\\", "/")
+        for key in memory.retrieved_code
+    }
+    for edit in plan.edits:
+        path = edit.filepath.replace("\\", "/").strip().lstrip("./")
+        edit.filepath = path
+        edit.expected_diff_required = not edit.reference_only
+        if repo_dir is not None and not (repo_dir / path).exists():
+            edit.creates_new_file = True
+        elif path not in cached_paths:
+            text = (
+                edit.change_rationale
+                + "\n"
+                + "\n".join(edit.preserved_findings)
+            ).lower()
+            if any(
+                phrase in text
+                for phrase in (
+                    "create the new",
+                    "create a new",
+                    "new file",
+                    "new module",
+                    "define the new",
+                )
+            ):
+                edit.creates_new_file = True
+        if edit.creates_new_file and not edit.expected_symbols:
+            symbols = [
+                cleaned
+                for cleaned in (
+                    _clean_expected_symbol(s) for s in edit.target_functions
+                )
+                if cleaned
+            ]
+            edit.expected_symbols = list(dict.fromkeys(symbols))
+
+
 async def _run_patch_planner_async(
     memory: SharedWorkingMemory,
     repo_dir: Path | None = None,
@@ -653,6 +715,8 @@ async def _run_patch_planner_async(
     # everything" backfill — that was a broadcast that only fired when the
     # whole list was empty, leaving partial coverage silently broken.
     _enforce_preserved_findings_coverage(plan, memory)
+
+    _annotate_artifact_expectations(plan, memory, repo_dir)
 
     memory.patch_plan = plan
     return plan

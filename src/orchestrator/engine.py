@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -221,9 +223,15 @@ from src.models.evidence import RequirementItem
 from src.models.patch import PatchPlan
 from src.models.verdict import ClosureVerdict
 from src.orchestrator.audit import build_audit_manifest
+from src.orchestrator.artifact_verify import (
+    ArtifactFinding,
+    render_artifact_feedback,
+    verify_patch_artifacts,
+)
 from src.orchestrator.build_verify import (
     BuildCheckResult,
     BuildError,
+    changed_python_production_files,
     detect_build_system,
     diff_new_errors,
     render_errors_for_feedback,
@@ -409,6 +417,7 @@ def _verify_plan_coverage(
 def _compute_baseline_build(
     repo_dir: Path,
     system: str,
+    python_targets: list[str] | None = None,
 ) -> BuildCheckResult | None:
     """Compute the build result at clean base_commit, restoring the patch after.
 
@@ -441,7 +450,11 @@ def _compute_baseline_build(
         return None
 
     try:
-        baseline = run_build_check(repo_dir, system)
+        baseline = run_build_check(
+            repo_dir,
+            system,
+            python_targets=python_targets,
+        )
         print(
             f"[build-verify] baseline build at base_commit: ok={baseline.ok} "
             f"errors={len(baseline.errors)}",
@@ -522,10 +535,20 @@ def _enrich_go_errors_with_definitions(
     )
 
 
-def _pick_next_requirement(evidence: EvidenceCards) -> RequirementItem | None:
-    """Return the first RequirementItem whose verdict is still UNCHECKED."""
+def _pick_next_requirement(
+    evidence: EvidenceCards,
+    frozen_ids: set[str] | None = None,
+) -> RequirementItem | None:
+    """Return the first RequirementItem whose verdict is still UNCHECKED.
+
+    frozen_ids: requirements whose stall-freeze prevented verified evidence;
+    they keep whatever non-UNCHECKED verdict was force-written and must not be
+    re-investigated even if the grounding gate later resets them to UNCHECKED.
+    """
     for req in evidence.requirements:
         if req.verdict == "UNCHECKED":
+            if frozen_ids and req.id in frozen_ids:
+                continue
             return req
     return None
 
@@ -570,6 +593,28 @@ def _errs_to_log(errors: list[BuildError]) -> list[dict[str, Any]]:
         {"file": e.file, "line": e.line, "message": e.message}
         for e in errors
     ]
+
+
+def _artifact_findings_to_errors(
+    findings: list[ArtifactFinding],
+) -> list[BuildError]:
+    """Adapt artifact findings to the existing repatch error plumbing."""
+    errors: list[BuildError] = []
+    for finding in findings:
+        msg = finding.message
+        if finding.symbol:
+            msg = f"{msg} [symbol={finding.symbol}]"
+        if finding.target:
+            msg = f"{msg} [target={finding.target}]"
+        errors.append(
+            BuildError(
+                file=finding.file,
+                line=None,
+                message=f"{finding.code}: {msg}",
+                raw=finding.raw or finding.message,
+            )
+        )
+    return errors
 
 
 def _prune_plan_to_error_files(
@@ -970,6 +1015,152 @@ async def _route_and_match_custom_rules(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Checkpoint helpers
+# ══════════════════════════════════════════════════════════════════════════
+
+_CHECKPOINT_FILENAME = "checkpoint.json"
+
+
+def _model_runtime_metadata() -> dict[str, str]:
+    backend = (
+        os.environ.get("MODEL_BACKEND")
+        or os.environ.get("LLM_BACKEND")
+        or "anthropic"
+    ).strip().lower()
+    if backend in {"claude", "anthropic"}:
+        backend = "anthropic"
+        model = os.environ.get("ANTHROPIC_MODEL", "")
+        api_surface = "claude_agent_sdk"
+    elif backend in {"openai", "codex", "codex-pro"}:
+        backend = "openai"
+        model = (
+            os.environ.get("OPENAI_MODEL")
+            or os.environ.get("CODEX_PRO_MODEL")
+            or os.environ.get("ANTHROPIC_MODEL", "")
+        )
+        api_surface = os.environ.get("OPENAI_API_SURFACE", "chat_completions")
+    else:
+        model = ""
+        api_surface = ""
+    return {
+        "model_backend": backend,
+        "model": model,
+        "api_surface": api_surface,
+    }
+
+
+def _save_checkpoint(
+    output_dir: Path,
+    state: "PipelineState",
+    memory: "SharedWorkingMemory",
+    counters: dict,
+    ltm_query: str = "",
+    custom_route_query: str = "",
+) -> None:
+    payload = {
+        "version": "1",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "runtime": _model_runtime_metadata(),
+        "pipeline_state": state.value,
+        "ltm_query": ltm_query,
+        "custom_route_query": custom_route_query,
+        "budget_counters": counters,
+        "working_memory": json.loads(memory.model_dump_json()),
+    }
+    (output_dir / _CHECKPOINT_FILENAME).write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _load_checkpoint(output_dir: Path) -> dict | None:
+    p = output_dir / _CHECKPOINT_FILENAME
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _delete_checkpoint(output_dir: Path) -> None:
+    p = output_dir / _CHECKPOINT_FILENAME
+    if p.exists():
+        p.unlink()
+
+
+def _pack_counters(
+    budget: "DeepSearchBudget",
+    rework_rounds_used: int,
+    patch_verify_rounds_used: int,
+    plan_coverage_rounds_used: int,
+    per_req_unchecked_count: dict,
+    closure_failure_streak: int,
+    dynamic_grounding_done: bool,
+) -> dict:
+    return {
+        "deep_search_iterations_done": budget.iterations,
+        "rework_rounds_used": rework_rounds_used,
+        "patch_verify_rounds_used": patch_verify_rounds_used,
+        "plan_coverage_rounds_used": plan_coverage_rounds_used,
+        "per_req_unchecked_count": per_req_unchecked_count,
+        "closure_failure_streak": closure_failure_streak,
+        "dynamic_grounding_done": dynamic_grounding_done,
+    }
+
+
+async def run_pipeline_from_checkpoint(
+    issue_id: str,
+    repo_dir: "str | Path",
+    output_dir: "str | Path",
+    checkpoint: dict,
+) -> Path:
+    """Resume a pipeline run from a previously saved checkpoint.
+
+    Restores the full SharedWorkingMemory (evidence cards, LTM blocks, etc.)
+    and the budget counters, then re-enters the state machine at the
+    checkpointed PipelineState.  The caller (main.py) is responsible for
+    resetting the repo to base_commit before invoking this function, exactly
+    as it does before a fresh run.
+    """
+    from src.models.memory import SharedWorkingMemory
+    from src.tools.ingestion_tools import restore_working_memory
+
+    repo_dir = Path(repo_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    memory = SharedWorkingMemory.model_validate(checkpoint["working_memory"])
+    restore_working_memory(memory)
+    set_repo_root(repo_dir)
+
+    evidence_path = (output_dir / "evidence.json").resolve()
+    set_evidence_json_path(evidence_path)
+    # Re-sync evidence.json on disk so grounding helpers read the restored state.
+    evidence_path.write_text(
+        memory.evidence_cards.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+    initial_state = PipelineState(checkpoint["pipeline_state"])
+    print(
+        f"[resume] Restoring pipeline at state={initial_state.value} "
+        f"(checkpoint saved {checkpoint.get('saved_at', '?')})",
+        flush=True,
+    )
+
+    return await _run_state_machine(
+        issue_id=issue_id,
+        repo_dir=repo_dir,
+        output_dir=output_dir,
+        evidence_path=evidence_path,
+        memory=memory,
+        initial_state=initial_state,
+        ltm_query=checkpoint.get("ltm_query", ""),
+        custom_route_query=checkpoint.get("custom_route_query", ""),
+        initial_counters=checkpoint.get("budget_counters"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Code-driven pipeline
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1114,10 +1305,13 @@ async def _run_state_machine(
     initial_state: PipelineState,
     ltm_query: str = "",
     custom_route_query: str = "",
+    initial_counters: dict | None = None,
 ) -> Path:
     """Core state-machine loop shared by run_pipeline and run_pipeline_from_evidence."""
     state = initial_state
+    _c = initial_counters or {}
     budget = DeepSearchBudget(max_iterations=30)
+    budget.iterations = _c.get("deep_search_iterations_done", 0)
     # Hard wall-clock cap per deep-search round. The SDK already has per-query
     # max_turns / max_budget_usd, but a wedged subprocess (e.g. an OOM-killed
     # child the parent never reaps) can hang the await forever. wait_for turns
@@ -1137,24 +1331,24 @@ async def _run_state_machine(
     degraded_patch_mode: bool = False
     _DEGRADED_MIN_GROUNDED = 1
     closure_retry_limit = 2
-    closure_failure_streak = 0
+    closure_failure_streak = _c.get("closure_failure_streak", 0)
     max_closure_failure_streak = 3
     # Rework budget: each EVIDENCE_MISSING with parseable req IDs re-opens
     # those requirements (verdict=UNCHECKED, scope cleared) and feeds the
     # closure-checker's rationale into deep-search as rework context.  The
     # round counter tracks how many rework rounds have been consumed so far.
-    rework_rounds_used = 0
+    rework_rounds_used = _c.get("rework_rounds_used", 0)
     rework_rounds_max = 3
 
     # Per-requirement retry counter: prevents infinite loops where the same
     # requirement keeps returning UNCHECKED and starving other requirements.
-    per_req_unchecked_count: dict[str, int] = {}
+    per_req_unchecked_count: dict[str, int] = _c.get("per_req_unchecked_count", {})
     per_req_unchecked_max = 3
 
     # Post-patch build verification: on NEW compile/collection errors the
     # pipeline re-opens patch planning (CLOSED) with the errors fed back via
     # memory.build_error_feedback. Capped at patch_verify_rounds_max.
-    patch_verify_rounds_used = 0
+    patch_verify_rounds_used = _c.get("patch_verify_rounds_used", 0)
     patch_verify_rounds_max = 3
     # True once a build command demonstrably ran this session — a later
     # "unverifiable" verdict is then likely transient and retried once.
@@ -1167,7 +1361,7 @@ async def _run_state_machine(
     # Spec-priority firewall: how many times we re-planned because the plan
     # failed to cover an AS_IS_VIOLATED requirement's cited file. Capped to
     # avoid a loop when the planner genuinely cannot/won't cover it.
-    plan_coverage_rounds_used = 0
+    plan_coverage_rounds_used = _c.get("plan_coverage_rounds_used", 0)
     plan_coverage_rounds_max = 1
     # LTM/custom-rule retrieval for planning is expensive; run it once on the
     # first CLOSED entry and reuse the cached blocks on repatch rounds.
@@ -1178,6 +1372,9 @@ async def _run_state_machine(
     all_planned_files: set[str] = set()
     # Per-round build verification records, written to build_verification.json.
     build_verify_log: list[dict[str, Any]] = []
+    # Per-round patch artifact verification records, written to
+    # artifact_verification.json.
+    artifact_verify_log: list[dict[str, Any]] = []
     # Consecutive deep-search failure counter per requirement id.
     # Prevents infinite retry when a requirement keeps failing before verdict is set.
     _ds_fail_counts: dict[str, int] = {}
@@ -1197,6 +1394,10 @@ async def _run_state_machine(
     _ds_stall_counts: dict[str, int] = {}
     _ds_frozen_reqs: set[str] = set()
     _DS_STALL_MAX = 3
+    # Restore frozen requirements from action_history (survives container restarts).
+    for _evt in memory.action_history:
+        if _evt.outcome.startswith("frozen_stalled:") and _evt.requirement_id:
+            _ds_frozen_reqs.add(_evt.requirement_id)
     # Consecutive "hollow" rounds per requirement: a round is hollow when it
     # lands ZERO verified evidence_locations (the 004/011 signature — claimed
     # verdict, attribution/traceability strips the cites to empty).  After one
@@ -1211,7 +1412,7 @@ async def _run_state_machine(
     # evidence stage (before the closure-checker LLM). Tracks whether the single
     # pass has been consumed, plus the per-requirement reachability notes it
     # produced (injected into the closure-checker as a soft consistency input).
-    _dynamic_grounding_done = False
+    _dynamic_grounding_done = _c.get("dynamic_grounding_done", False)
     dynamic_notes: list[str] = []
 
     _terminal_states = (
@@ -1274,7 +1475,7 @@ async def _run_state_machine(
 
             # Pick the next UNCHECKED requirement to investigate
             current_evidence = get_submitted_evidence()
-            target = _pick_next_requirement(current_evidence) if current_evidence else None
+            target = _pick_next_requirement(current_evidence, _ds_frozen_reqs) if current_evidence else None
 
             if current_evidence is None:
                 print(
@@ -1489,6 +1690,17 @@ async def _run_state_machine(
                         requirement_id=target.id,
                     )
 
+            # ── Checkpoint ①: after each completed deep-search round ────
+            _save_checkpoint(
+                output_dir, PipelineState.UNDER_SPECIFIED, memory,
+                _pack_counters(
+                    budget, rework_rounds_used, patch_verify_rounds_used,
+                    plan_coverage_rounds_used, per_req_unchecked_count,
+                    closure_failure_streak, _dynamic_grounding_done,
+                ),
+                ltm_query, custom_route_query,
+            )
+
             # Transition to EvidenceRefining
             assert is_valid_transition(state, PipelineState.EVIDENCE_REFINING)
             state = PipelineState.EVIDENCE_REFINING
@@ -1631,6 +1843,16 @@ async def _run_state_machine(
                         per_req_g.setdefault(gf.requirement_id, []).append(gf.render())
                 reset_ids_g: list[str] = []
                 for rid, lines in per_req_g.items():
+                    # Never reset a frozen requirement — it stalled because deep-search
+                    # could not produce verified evidence for it. Resetting it back to
+                    # UNCHECKED would restart the same infinite loop.
+                    if rid in _ds_frozen_reqs:
+                        print(
+                            f"[orchestrator] static-grounding gate: {rid} failed "
+                            f"but is frozen — skipping reset (would loop).",
+                            flush=True,
+                        )
+                        continue
                     feedback = (
                         "Static grounding gate found evidence that does NOT "
                         "resolve in the repository:\n"
@@ -1900,6 +2122,16 @@ async def _run_state_machine(
                 )
                 assert is_valid_transition(state, PipelineState.CLOSED)
                 state = PipelineState.CLOSED
+                # ── Checkpoint ②: evidence closure approved ─────────────
+                _save_checkpoint(
+                    output_dir, PipelineState.CLOSED, memory,
+                    _pack_counters(
+                        budget, rework_rounds_used, patch_verify_rounds_used,
+                        plan_coverage_rounds_used, per_req_unchecked_count,
+                        closure_failure_streak, _dynamic_grounding_done,
+                    ),
+                    ltm_query, custom_route_query,
+                )
             else:
                 print(
                     f"[orchestrator] EVIDENCE_MISSING: "
@@ -2184,6 +2416,97 @@ async def _run_state_machine(
                     outcome=f"test_edits_reverted:{len(reverted_tests)}",
                 )
 
+            current_plan_files = [
+                edit.filepath
+                for edit in memory.patch_plan.edits
+            ] if memory.patch_plan is not None else []
+            artifact_diff_text = _collect_git_diff(
+                repo_dir,
+                planned_files=sorted(all_planned_files | set(current_plan_files)),
+            )
+            artifact_result = verify_patch_artifacts(
+                repo_dir,
+                memory.patch_plan,
+                artifact_diff_text,
+            )
+            artifact_verify_log.append(
+                {
+                    "round": patch_verify_rounds_used,
+                    **artifact_result.to_log(),
+                }
+            )
+            print(
+                "[artifact-verify] "
+                + (
+                    "clean."
+                    if artifact_result.ok
+                    else f"{len(artifact_result.findings)} finding(s)."
+                ),
+                flush=True,
+            )
+            if not artifact_result.ok:
+                artifact_errors = _artifact_findings_to_errors(
+                    artifact_result.findings
+                )
+                if patch_verify_rounds_used < patch_verify_rounds_max:
+                    patch_verify_rounds_used += 1
+                    memory.build_error_feedback = render_artifact_feedback(
+                        artifact_result.findings
+                    )
+                    pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                        memory.patch_plan, artifact_errors
+                    )
+                    memory.patch_plan = pruned_plan
+                    if dropped_edits:
+                        print(
+                            f"[artifact-verify] pruned prior patch plan to "
+                            f"artifact finding files: dropped {dropped_edits} "
+                            f"edit(s), kept "
+                            f"{len(pruned_plan.edits) if pruned_plan else 0}.",
+                            flush=True,
+                        )
+                    focus_files = sorted({
+                        e.file.replace("\\", "/").strip().lstrip("./")
+                        for e in artifact_errors
+                        if e.file and e.file not in {"(patch.diff)", "(build)"}
+                    })
+                    memory.evidence_focus_files = focus_files
+                    print(
+                        "[artifact-verify] artifact mismatch -> repatch "
+                        f"(round {patch_verify_rounds_used}/"
+                        f"{patch_verify_rounds_max}).",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="artifact-verify",
+                        outcome=(
+                            f"repatch:round={patch_verify_rounds_used}/"
+                            f"{patch_verify_rounds_max}:"
+                            f"{len(artifact_result.findings)}_findings"
+                        ),
+                    )
+                    assert is_valid_transition(state, PipelineState.CLOSED)
+                    state = PipelineState.CLOSED
+                    continue
+
+                terminal = (
+                    "NO_EFFECT_PATCH"
+                    if artifact_result.empty_patch else "PATCH_INCOMPLETE"
+                )
+                print(
+                    "[artifact-verify] artifact findings persist and repatch "
+                    f"budget exhausted; terminating as {terminal}.",
+                    flush=True,
+                )
+                memory.record_action(
+                    phase="artifact-verify",
+                    outcome=f"{terminal}_terminal",
+                )
+                patch_outcome = terminal
+                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                state = PipelineState.PATCH_FAILED
+                continue
+
             system = detect_build_system(repo_dir)
             print(
                 f"[build-verify] build system detected: {system}",
@@ -2292,7 +2615,15 @@ async def _run_state_machine(
                     state = PipelineState.PATCH_SUCCESS
                 continue
 
-            post = run_build_check(repo_dir, system)
+            python_targets = (
+                changed_python_production_files(repo_dir)
+                if system == "python" else None
+            )
+            post = run_build_check(
+                repo_dir,
+                system,
+                python_targets=python_targets,
+            )
             if not post.unverifiable and not post.skipped:
                 toolchain_seen_working = True
             print(
@@ -2342,7 +2673,11 @@ async def _run_state_machine(
                     "retrying build once.",
                     flush=True,
                 )
-                post = run_build_check(repo_dir, system)
+                post = run_build_check(
+                    repo_dir,
+                    system,
+                    python_targets=python_targets,
+                )
                 if not post.unverifiable:
                     toolchain_seen_working = True
                 print(
@@ -2371,6 +2706,7 @@ async def _run_state_machine(
                     {"round": patch_verify_rounds_used, "system": system,
                      "ok": False, "unverifiable": True, "toolchain_missing": True,
                      "command": post.command, "timed_out": post.timed_out,
+                     "python_targets": python_targets or [],
                      "reverted_tests": reverted_tests,
                      "raw_output_tail": raw_tail,
                      "downgraded_signatures": sorted(downgraded)}
@@ -2385,6 +2721,7 @@ async def _run_state_machine(
                 build_verify_log.append(
                     {"round": patch_verify_rounds_used, "system": system,
                      "ok": True, "command": post.command,
+                     "python_targets": python_targets or [],
                      "reverted_tests": reverted_tests,
                      "downgraded_signatures": sorted(downgraded)}
                 )
@@ -2424,7 +2761,11 @@ async def _run_state_machine(
                     flush=True,
                 )
             else:
-                baseline = _compute_baseline_build(repo_dir, system)
+                baseline = _compute_baseline_build(
+                    repo_dir,
+                    system,
+                    python_targets=python_targets,
+                )
                 new_errors = diff_new_errors(baseline, post)
                 print(
                     f"[build-verify] new (patch-induced) errors: {len(new_errors)} "
@@ -2441,6 +2782,7 @@ async def _run_state_machine(
                     "ok": post.ok,
                     "unverifiable": post.unverifiable,
                     "command": post.command,
+                    "python_targets": python_targets or [],
                     "timed_out": post.timed_out,
                     "baseline_computed": baseline is not None,
                     "reverted_tests": reverted_tests,
@@ -2635,6 +2977,23 @@ async def _run_state_machine(
     if diff_text.startswith("\ufeff"):
         diff_text = diff_text.lstrip("\ufeff")
 
+    final_artifact_result = verify_patch_artifacts(repo_dir, wm.patch_plan, diff_text)
+    artifact_verify_log.append({"round": "final", **final_artifact_result.to_log()})
+    if not final_artifact_result.ok:
+        if final_artifact_result.empty_patch:
+            patch_outcome = "NO_EFFECT_PATCH"
+            closure_approved = False
+        elif patch_outcome in (None, "PATCH_SUCCESS", "PATCH_FAILED"):
+            patch_outcome = "PATCH_INCOMPLETE"
+            closure_approved = False
+    if artifact_verify_log:
+        av_path = output_dir / "artifact_verification.json"
+        av_path.write_text(
+            json.dumps(artifact_verify_log, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"[orchestrator] Artifact verification log saved -> {av_path}", flush=True)
+
     # Plan-coverage check: every file in the FINAL plan must appear in the diff.
     # If the generator silently dropped an edit (e.g. SEARCH mismatch it
     # failed to recover from), the outcome is a partial patch; downgrade
@@ -2667,6 +3026,11 @@ async def _run_state_machine(
         encoding="utf-8",
     )
     print(f"[orchestrator] prediction.json saved -> {prediction_path}", flush=True)
+
+    # Remove checkpoint now that the pipeline has reached a terminal state and
+    # all output files are written.  A fresh restart is always preferred over
+    # resuming from a completed (or failed) run.
+    _delete_checkpoint(output_dir)
 
     return evidence_path
 

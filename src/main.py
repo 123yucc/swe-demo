@@ -20,14 +20,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.artifacts import instance_to_artifact_text
+from src.agents._cost_tracker import get_totals as get_cost_totals, reset as reset_cost_tracker
 from src.memory import ensure_running as ensure_ltm_running
-from src.orchestrator.engine import run_orchestrator
+from src.output_paths import default_output_dir, model_output_dir_name
+from src.orchestrator.engine import (
+    _delete_checkpoint,
+    _load_checkpoint,
+    _model_runtime_metadata,
+    run_orchestrator,
+    run_pipeline_from_checkpoint,
+)
 
 
 def load_instance_from_dataset(
@@ -140,6 +151,35 @@ def write_prediction(
     return pred_path
 
 
+_TERMINAL_ARTIFACTS = (
+    "patch.diff",
+    "patch_outcome.json",
+    "prediction.json",
+    "build_verification.json",
+    "run_metrics.json",
+    "working_memory.json",
+    "patch_plan.json",
+    "patch_failures.log",
+)
+
+
+def clear_terminal_artifacts(output_dir: Path) -> None:
+    """Remove stale terminal artifacts before starting or resuming a run."""
+    removed: list[str] = []
+    for name in _TERMINAL_ARTIFACTS:
+        path = output_dir / name
+        if not path.exists():
+            continue
+        path.unlink()
+        removed.append(name)
+    if removed:
+        print(
+            "[outputs] cleared stale terminal artifacts: "
+            + ", ".join(sorted(removed)),
+            flush=True,
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the repair harness on a SWE-bench Pro instance.",
@@ -166,9 +206,13 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help=(
-            "Output directory. Defaults to workdir/<issue_name>/outputs for "
-            "--instance-json mode, otherwise workdir/<instance_id>/outputs."
+            "Output directory. Defaults to workdir/<issue_name>/outputs_<model> "
+            "for --instance-json mode, otherwise workdir/<instance_id>/outputs_<model>."
         ),
+    )
+    parser.add_argument(
+        "--force-restart", action="store_true",
+        help="Ignore any existing checkpoint and start the pipeline from scratch.",
     )
 
     args = parser.parse_args()
@@ -220,9 +264,9 @@ def main() -> None:
                 issue_dir = instance_json_path.parent.parent
             else:
                 issue_dir = instance_json_path.parent
-            output_dir = issue_dir / "outputs"
+            output_dir = default_output_dir(issue_dir)
         else:
-            output_dir = Path("workdir") / instance_id / "outputs"
+            output_dir = default_output_dir(Path("workdir") / instance_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Schema-version guard: refuse stale evidence.json ---
@@ -249,17 +293,72 @@ def main() -> None:
     print(f"Output dir  : {output_dir}")
     print()
 
-    # --- Run orchestrator ---
-    evidence_path = run_orchestrator(
-        issue_id=instance_id,
-        repo_dir=repo_dir,
-        artifact_text=artifact_text,
-        output_dir=output_dir,
-        problem_statement=instance.get("problem_statement", "") or artifact_text,
-    )
+    # --- Run orchestrator (with checkpoint resume support) ---
+    reset_cost_tracker()
+    run_start_ts = time.monotonic()
+    run_start_iso = datetime.now(timezone.utc).isoformat()
+
+    checkpoint = _load_checkpoint(output_dir)
+    if checkpoint and not args.force_restart:
+        saved_runtime = checkpoint.get("runtime")
+        current_runtime = _model_runtime_metadata()
+        if saved_runtime and saved_runtime != current_runtime:
+            print(
+                "[resume] Checkpoint runtime does not match current model "
+                f"runtime. checkpoint={saved_runtime}, current={current_runtime}. "
+                "Use --force-restart to start a fresh run.",
+                flush=True,
+            )
+            sys.exit(1)
+    clear_terminal_artifacts(output_dir)
+    if checkpoint and not args.force_restart:
+        state_name = checkpoint.get("pipeline_state", "?")
+        saved_at = checkpoint.get("saved_at", "?")
+        print(
+            f"[resume] Checkpoint found (state={state_name}, saved={saved_at}). "
+            "Resuming from last save point.",
+            flush=True,
+        )
+        evidence_path = asyncio.run(run_pipeline_from_checkpoint(
+            issue_id=instance_id,
+            repo_dir=repo_dir,
+            output_dir=output_dir,
+            checkpoint=checkpoint,
+        ))
+    else:
+        if checkpoint and args.force_restart:
+            print("[resume] --force-restart: ignoring existing checkpoint, starting fresh.")
+            _delete_checkpoint(output_dir)
+        evidence_path = run_orchestrator(
+            issue_id=instance_id,
+            repo_dir=repo_dir,
+            artifact_text=artifact_text,
+            output_dir=output_dir,
+            problem_statement=instance.get("problem_statement", "") or artifact_text,
+        )
+
+    run_end_iso = datetime.now(timezone.utc).isoformat()
+    wall_clock_seconds = time.monotonic() - run_start_ts
 
     print(f"\n=== COMPLETE ===")
     print(f"Evidence JSON: {evidence_path}")
+
+    # --- Write run metrics (timing + token cost) ---
+    cost = get_cost_totals()
+    runtime = _model_runtime_metadata()
+    metrics = {
+        "instance_id": instance_id,
+        "model_backend": runtime.get("model_backend", "unknown"),
+        "model": runtime.get("model") or "unknown",
+        "output_dir_name": model_output_dir_name(runtime.get("model") or None),
+        "run_start_utc": run_start_iso,
+        "run_end_utc": run_end_iso,
+        "wall_clock_seconds": round(wall_clock_seconds, 1),
+        **cost,
+    }
+    metrics_path = output_dir / "run_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(f"Run metrics  -> {metrics_path}")
 
     # --- Write prediction for SWE-bench eval ---
     patch_path = output_dir / "patch.diff"

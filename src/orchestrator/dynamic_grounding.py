@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -65,6 +64,11 @@ from src.orchestrator.ast_grounding import (
     def_spans_containing,
 )
 from src.orchestrator.build_verify import BuildSystem, detect_build_system
+from src.orchestrator.repo_executor import (
+    command_available,
+    copy_from_executor,
+    run_repo_command,
+)
 
 
 # Return code marking a toolchain executable that could not be spawned
@@ -268,7 +272,7 @@ def _probe_none(_repo_dir: Path) -> bool:
 
 def _probe_go_coverage(_repo_dir: Path) -> bool:
     # ``-coverprofile`` is built into ``go test`` — stable whenever go is present.
-    return shutil.which("go") is not None
+    return command_available(["go", "version"], repo_dir=_repo_dir)
 
 
 def _probe_python_coverage(repo_dir: Path) -> bool:
@@ -601,25 +605,7 @@ def adapter_for(repo_dir: Path) -> LangAdapter | None:
 
 def _run(cmd: list[str], repo_dir: Path, timeout: int) -> tuple[int, str, bool]:
     """Run *cmd* in *repo_dir*; return (returncode, combined_output, timed_out)."""
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or "") + (exc.stderr or "")
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        return 124, out, True
-    except (FileNotFoundError, OSError) as exc:
-        return _RC_TOOLCHAIN_MISSING, f"{type(exc).__name__}: {exc}", False
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or ""), False
+    return run_repo_command(cmd, repo_dir=repo_dir, timeout=timeout)
 
 
 def run_reproduction(
@@ -644,6 +630,7 @@ def run_reproduction(
 
     cmd = adapter.drive_cmd(source)
     rc, output, timed_out = _run(cmd, repo_dir, timeout)
+    copy_from_executor(repo_dir, [".coverage", "coverage.out"], timeout=30)
 
     trace = adapter.parse_trace(output)
     exception_text = _extract_exception(output, adapter.name)

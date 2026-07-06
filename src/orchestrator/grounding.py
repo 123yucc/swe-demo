@@ -139,7 +139,17 @@ def ground_exact_code_regions(
     regions: list[str],
     repo_dir: Path,
 ) -> list[GroundingFailure]:
-    """Each ``path:LINE[-LINE]`` must resolve to a file with an in-bounds range."""
+    """Each ``path:LINE[-LINE]`` must resolve to a file whose START line exists.
+
+    A region is a *definite* refutation only when the file is missing or its
+    START line lies past EOF (``start > lc``) / below 1 — i.e. the region
+    anchors nothing real. An END that overshoots EOF while the start is in
+    bounds is benign over-citation: the deep-search agent routinely cites "the
+    natural home, to end of file" for a TO_BE_MISSING interface and picks a last
+    line one or two past the true EOF. The start still anchors real code, so per
+    the module's definite-refutation discipline this is a soft pass, not a reset
+    (failing it caused an infinite rework loop on whole-file citations).
+    """
     failures: list[GroundingFailure] = []
     for region in regions:
         path, start, end = _parse_evidence_location(region)
@@ -155,12 +165,12 @@ def ground_exact_code_regions(
             ))
             continue
         lc = _line_count(content)
-        if start < 1 or end > lc:
+        if start < 1 or start > lc:
             failures.append(GroundingFailure(
                 requirement_id=requirement_id,
                 kind="region_oob",
                 detail=(
-                    f"cited region {region!r}: lines {start}-{end} out of "
+                    f"cited region {region!r}: start line {start} out of "
                     f"bounds (file has {lc} lines)"
                 ),
             ))
@@ -242,40 +252,75 @@ def ground_findings_snippets(
     return failures
 
 
+def _introduced_symbol(line: str) -> str | None:
+    """Extract the symbol a ``missing_elements_to_implement`` line *introduces*.
+
+    Each line declares ONE new interface plus, often, the existing types it
+    references (``Function: `New(cc ClusterConfig) (*Derived, error)` ...``).
+    Only the introduced symbol is a defensible "this exact thing is missing"
+    claim — the referenced types (``ClusterConfig`` here) already exist by
+    design and must NOT be grounded, or every signature that names a real type
+    self-refutes (the issue013 reset loop).
+
+    Resolution order:
+      1. A ``Type:|Struct:|Interface:|Class:|Function:|Method:|Func:|Const:|Var:|Field:``
+         label → the first identifier after it (also the leading identifier of a
+         backtick-wrapped signature, e.g. ``Function: `New(...)``` → ``New``).
+      2. Else the first backtick clean-identifier on the line; if that backtick
+         wraps a signature, its leading identifier.
+
+    Returns the introduced identifier, or None when none can be resolved (soft
+    pass — no opinion).
+    """
+    label = re.search(
+        r"\b(?:Type|Struct|Interface|Class|Function|Method|Func|Const|Var|Field)\s*:\s*"
+        r"`?\s*([A-Za-z_][A-Za-z0-9_]*)",
+        line,
+    )
+    if label:
+        return label.group(1)
+    for snippet in _backtick_snippets(line):
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", snippet)
+        if m:
+            return m.group(1)
+    return None
+
+
 def ground_missing_elements(
     elements: list[str],
     repo_dir: Path,
 ) -> list[GroundingFailure]:
-    """Backtick snippets in ``missing_elements_to_implement`` must NOT exist.
+    """The symbol each ``missing_elements_to_implement`` line introduces must NOT exist.
 
     A snippet declared "missing" that grep finds in the codebase is a
     contradiction (the new_interface judgement is wrong). Returns failures
     tagged ``"<global>"`` — the caller attributes them to a requirement via
     ``attribute_field_failure_to_req``.
 
-    Restricted to backtick snippets: only an explicitly-quoted, specific symbol
-    is a defensible "this exact thing" signal. Free-text words are skipped to
-    avoid false positives.
+    Only the line's *introduced* symbol is grounded (see ``_introduced_symbol``);
+    referenced types named inside a new-interface signature are skipped, so a
+    signature like ``func New(cc ExistingType)`` never self-refutes on
+    ``ExistingType``.
     """
     failures: list[GroundingFailure] = []
     # Search source files only; data/doc files are not definition sites.
     code_files = _collect_code_files(repo_dir)
     for line in elements:
-        for snippet in _backtick_snippets(line):
-            # Only ground clean identifiers — expressions/signatures are noisy.
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet):
-                continue
-            for content in code_files:
-                if _symbol_present(content, snippet):
-                    failures.append(GroundingFailure(
-                        requirement_id="<global>",
-                        kind="missing_element_present",
-                        detail=(
-                            f"missing_element `{snippet}` is declared absent but "
-                            f"a definition/reference exists in the repository"
-                        ),
-                    ))
-                    break
+        snippet = _introduced_symbol(line)
+        # Only ground clean identifiers — expressions/signatures are noisy.
+        if snippet is None or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet):
+            continue
+        for content in code_files:
+            if _symbol_present(content, snippet):
+                failures.append(GroundingFailure(
+                    requirement_id="<global>",
+                    kind="missing_element_present",
+                    detail=(
+                        f"missing_element `{snippet}` is declared absent but "
+                        f"a definition/reference exists in the repository"
+                    ),
+                ))
+                break
     return failures
 
 
@@ -385,10 +430,18 @@ def ground_symptom_symbols(
     AST can parse at least one repo file and NONE define the symbol, it is a
     hallucinated reference → fail (tagged ``<global>`` for attribution). If no
     file is parseable (AST unavailable repo-wide), soft pass.
+
+    A refutation is only "definite" when AST coverage has no language blind
+    spot: if ANY source language present in the repo produced zero indexes
+    (e.g. a Go repo where tree-sitter-go is unavailable, leaving only a stray
+    Python script indexed), a cited symbol could legitimately be defined in
+    that un-parsed language. Per the module's soft-pass discipline that is
+    "insufficient information", so the whole symptom check soft-passes rather
+    than refuting Go symbols against a Python-only index.
     """
-    indexes = _repo_indexes(repo_dir)
-    if not indexes:
-        return []  # AST unavailable → soft pass
+    indexes, blind_langs = _repo_indexes(repo_dir)
+    if not indexes or blind_langs:
+        return []  # AST unavailable / language blind spot → soft pass
 
     failures: list[GroundingFailure] = []
     seen: set[str] = set()
@@ -445,8 +498,17 @@ def _indexes_for(paths: list[str | None], repo_dir: Path):
 
 
 def _repo_indexes(repo_dir: Path, limit: int = 1200):
-    """Build symbol indexes across repo source files (Python-first, bounded)."""
+    """Build symbol indexes across repo source files; report language blind spots.
+
+    Returns ``(indexes, blind_langs)`` where ``blind_langs`` is the set of file
+    extensions that were present in the repo but produced ZERO indexes (the
+    backend was unavailable or failed for every file of that language). A
+    non-empty ``blind_langs`` means AST coverage is incomplete, so a downstream
+    "symbol absent everywhere" claim cannot be a definite refutation.
+    """
     indexes = []
+    seen_suffixes: set[str] = set()
+    indexed_suffixes: set[str] = set()
     for fp in repo_dir.rglob("*"):
         if len(indexes) >= limit:
             break
@@ -454,6 +516,8 @@ def _repo_indexes(repo_dir: Path, limit: int = 1200):
             continue
         if any(part in _SKIP_DIRS for part in fp.parts):
             continue
+        suffix = fp.suffix.lower()
+        seen_suffixes.add(suffix)
         try:
             content = fp.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -462,7 +526,9 @@ def _repo_indexes(repo_dir: Path, limit: int = 1200):
         idx = build_symbol_index(rel, content)
         if idx is not None:
             indexes.append(idx)
-    return indexes
+            indexed_suffixes.add(suffix)
+    blind_langs = seen_suffixes - indexed_suffixes
+    return indexes, blind_langs
 
 
 # ── Top-level static grounding gate ────────────────────────────────────────
@@ -491,19 +557,27 @@ def run_static_grounding(
         failures.extend(
             ground_exact_code_regions(req.id, loc.exact_code_regions, repo_dir)
         )
-        failures.extend(
-            ground_suspect_entities(req.id, loc.suspect_entities, repo_dir)
-        )
-        failures.extend(
-            ground_findings_snippets(
-                req.id, req.findings, req.evidence_locations, repo_dir
+        # Only run symbol-presence, snippet, and call-chain checks for
+        # AS_IS_COMPLIANT requirements where the cited symbols, code snippets,
+        # and call edges must already exist in base_commit.  For any
+        # non-compliant verdict the deep-search agent routinely cites
+        # future/target code (new names, yet-to-be-added symbols, new call
+        # edges) that is absent from base_commit by definition — grounding
+        # those would produce false resets and infinite rework loops.
+        if req.verdict == "AS_IS_COMPLIANT":
+            failures.extend(
+                ground_suspect_entities(req.id, loc.suspect_entities, repo_dir)
             )
-        )
-        failures.extend(
-            ground_call_chain(
-                req.id, loc.call_chain_context, req.evidence_locations, repo_dir
+            failures.extend(
+                ground_findings_snippets(
+                    req.id, req.findings, req.evidence_locations, repo_dir
+                )
             )
-        )
+            failures.extend(
+                ground_call_chain(
+                    req.id, loc.call_chain_context, req.evidence_locations, repo_dir
+                )
+            )
 
     # Global: symptom symbols (parser-owned observable_failures).
     for gf in ground_symptom_symbols(

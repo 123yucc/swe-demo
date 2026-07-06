@@ -15,16 +15,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-DOCKER = "C:/Program Files/Docker/Docker/resources/bin/docker.exe"
+DOCKER = os.environ.get("DOCKER", "docker")
 EVAL_DIR = Path("eval/SWE-bench_Pro-os")
 DOCKERHUB_USER = "jefzda"
+FALLBACK_DOCKERHUB_USERS = ["123yucc"]
 
 
 def run(cmd: list, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, **kwargs)
 
 
-def docker(*args, capture=True, timeout=600) -> subprocess.CompletedProcess:
+def docker(*args, capture=True, timeout=1800) -> subprocess.CompletedProcess:
     return run(
         [DOCKER] + list(args),
         capture_output=capture,
@@ -49,17 +50,37 @@ def load_instances(start: int, count: int) -> list[dict]:
     return instances
 
 
-def get_image_tag(instance: dict) -> str:
-    """Return the full Docker image tag for an instance."""
+def dockerhub_tag_from_image_name(image_name: str) -> str:
+    if not image_name or ":" not in image_name:
+        return ""
+    return image_name.rsplit("/", 1)[-1].replace(":", "-")[:128]
+
+
+def get_image_candidates(instance: dict) -> list[str]:
+    """Return Docker image candidates for an instance."""
     dockerhub_tag = instance.get("dockerhub_tag", "")
-    return f"{DOCKERHUB_USER}/sweap-images:{dockerhub_tag}"
+    if not dockerhub_tag:
+        dockerhub_tag = dockerhub_tag_from_image_name(str(instance.get("image_name", "")))
+    candidates = []
+    if dockerhub_tag:
+        candidates.extend(
+            f"{user}/sweap-images:{dockerhub_tag}"
+            for user in [DOCKERHUB_USER, *FALLBACK_DOCKERHUB_USERS]
+        )
+    if instance.get("image_name"):
+        candidates.append(str(instance["image_name"]))
+    return list(dict.fromkeys(candidates))
 
 
-def pull_image(image_tag: str) -> bool:
-    """Pull a Docker image, returns True on success."""
-    print(f"    pulling {image_tag} ...")
-    r = run([DOCKER, "pull", image_tag], capture_output=False, timeout=600)
-    return r.returncode == 0
+def pull_first_image(candidates: list[str], retries: int = 3) -> str | None:
+    """Pull the first available Docker image, returning the selected image."""
+    for image_tag in candidates:
+        for attempt in range(1, retries + 1):
+            print(f"    pulling {image_tag} (attempt {attempt}/{retries}) ...")
+            r = run([DOCKER, "pull", image_tag], capture_output=False, timeout=1800)
+            if r.returncode == 0:
+                return image_tag
+    return None
 
 
 def extract_repo_from_image(image_tag: str, dest_dir: Path) -> bool:
@@ -121,8 +142,8 @@ def setup_issue(label: int, instance: dict, workdir: Path) -> None:
     print(f"  saved metadata -> {metadata_path}")
 
     # Find or pull image
-    image_tag = get_image_tag(instance)
-    print(f"  image: {image_tag}")
+    image_candidates = get_image_candidates(instance)
+    print(f"  image candidates: {image_candidates}")
 
     # Check if repo already exists
     if repo_dir.exists() and (repo_dir / ".git").exists():
@@ -130,8 +151,9 @@ def setup_issue(label: int, instance: dict, workdir: Path) -> None:
         return
 
     # Pull image
-    if not pull_image(image_tag):
-        print(f"  ERROR: failed to pull image {image_tag}")
+    image_tag = pull_first_image(image_candidates)
+    if not image_tag:
+        print(f"  ERROR: failed to pull any image candidate")
         return
 
     # Extract repo
@@ -161,7 +183,21 @@ def setup_issue(label: int, instance: dict, workdir: Path) -> None:
     else:
         print(f"  WARNING: could not reset to base_commit: {git_r.stderr}")
 
+    run([DOCKER, "rmi", "-f", image_tag], capture_output=True, text=True, timeout=180)
     print(f"  done: {issue_dir}")
+
+
+def load_existing_metadata(workdir: Path, start_label: int, count: int, only: int | None) -> list[tuple[int, dict]]:
+    instances: list[tuple[int, dict]] = []
+    labels = [only] if only is not None else list(range(start_label, start_label + count))
+    for label in labels:
+        metadata_path = workdir / f"swe_issue_{label:03d}" / "artifacts" / "instance_metadata.json"
+        if not metadata_path.exists():
+            print(f"  missing metadata -> {metadata_path}")
+            continue
+        with open(metadata_path, encoding="utf-8") as f:
+            instances.append((label, json.load(f)))
+    return instances
 
 
 def main() -> None:
@@ -172,15 +208,25 @@ def main() -> None:
     parser.add_argument("--workdir", type=str, default="workdir")
     parser.add_argument("--only", type=int, default=None,
                         help="Only process this label number (e.g. 11)")
+    parser.add_argument(
+        "--from-existing-metadata",
+        action="store_true",
+        help="Use existing workdir/swe_issue_*/artifacts/instance_metadata.json instead of loading HuggingFace",
+    )
     args = parser.parse_args()
 
     workdir = Path(args.workdir)
-    instances = load_instances(args.start, args.count)
+    if args.from_existing_metadata:
+        labeled_instances = load_existing_metadata(workdir, args.start_label, args.count, args.only)
+    else:
+        instances = load_instances(args.start, args.count)
+        labeled_instances = [
+            (args.start_label + i, instance)
+            for i, instance in enumerate(instances)
+            if args.only is None or args.start_label + i == args.only
+        ]
 
-    for i, instance in enumerate(instances):
-        label = args.start_label + i
-        if args.only is not None and label != args.only:
-            continue
+    for label, instance in labeled_instances:
         print(f"\n[{label:03d}] {instance['instance_id']}")
         setup_issue(label, instance, workdir)
 

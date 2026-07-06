@@ -24,6 +24,8 @@ from claude_agent_sdk import (
 )
 
 import src.config  # noqa: F401  — side-effect: load .env into os.environ
+from src.agents import _cost_tracker
+from src.agents._backend import use_openai_backend
 from src.models.memory import SharedWorkingMemory
 from src.models.patch import FileEditPlan, PatchPlan
 from src.tools.patch_tools import apply_search_replace
@@ -348,6 +350,12 @@ Rules:
 - Preserve existing indentation style
 - Apply edits in dependency order
 - preserved_findings are hard constraints: verify before submitting
+- NEVER edit test files. The evaluator owns the test suite and applies its own
+  test patch on top of yours; any edit to a test file (paths under tests/ or
+  test/, files named *_test.go, test_*.py, *_test.py, *.test.js, *.spec.ts,
+  *.spec.js, or under __tests__/) is reverted before verification and can only
+  collide with the evaluator's gold tests. If a plan entry points at a test
+  file, skip it and edit only the production code.
 
 After all files are patched, output: PATCH_APPLIED
 If any file could not be patched: PATCH_INCOMPLETE
@@ -522,6 +530,164 @@ def _count_apply_actions(memory: SharedWorkingMemory, filepath: str) -> int:
     )
 
 
+def _compact_preserved_findings(findings: list[str], limit: int = 12) -> str:
+    compact: list[str] = []
+    seen: set[str] = set()
+    for item in findings:
+        text = " ".join(str(item).split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if len(text) > 900:
+            text = text[:897].rstrip() + "..."
+        compact.append(f"- {text}")
+        if len(compact) >= limit:
+            break
+    return "\n".join(compact) or "- (none)"
+
+
+def _build_openai_direct_patch_prompt(
+    memory: SharedWorkingMemory,
+    repo_dir: Path,
+    edit: FileEditPlan,
+    *,
+    sub_edit_label: str,
+    retry_preamble: str = "",
+    prior_error: str = "",
+) -> str:
+    target = repo_dir / edit.filepath
+    try:
+        current_content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        current_content = f"<<ERROR reading file: {exc}>>"
+
+    targets = ", ".join(edit.target_functions) or "(file-wide pass)"
+    co_edits = ", ".join(edit.co_edit_dependencies) or "(none)"
+    findings = _compact_preserved_findings(edit.preserved_findings)
+    req_section = _build_requirement_section(memory, edit)
+    retry_section = (
+        f"\n\nPrevious apply_search_replace error:\n{prior_error}\n"
+        if prior_error
+        else ""
+    )
+
+    return (
+        f"{retry_preamble}"
+        "Generate exact SEARCH/REPLACE blocks for the target file. "
+        "Do not answer PATCH_INCOMPLETE unless the requested change is "
+        "impossible from the supplied file content.\n\n"
+        f"Edit label: {sub_edit_label}\n"
+        f"filepath: {edit.filepath}\n"
+        f"target_functions: {targets}\n"
+        f"change_rationale: {edit.change_rationale}\n"
+        f"co_edit_dependencies: {co_edits}\n\n"
+        "Preserved findings / hard constraints:\n"
+        f"{findings}\n"
+        f"{req_section}"
+        f"{retry_section}\n\n"
+        "Output rules:\n"
+        "- Return only SEARCH/REPLACE blocks. Do not wrap them in JSON, "
+        "Markdown, prose, or explanations.\n"
+        "- `blocks` must use exactly this format, repeated as needed:\n"
+        "<<<<<<SEARCH\n"
+        "exact old text from the file\n"
+        "======SPLIT\n"
+        "replacement text\n"
+        ">>>>>>REPLACE\n"
+        "- SEARCH text must be copied verbatim from Current file content and "
+        "must be unique in the file.\n"
+        "- Do not edit tests.\n\n"
+        "Current file content:\n"
+        "```text\n"
+        f"{current_content}\n"
+        "```"
+    )
+
+
+def _extract_search_replace_blocks(text: str) -> str:
+    """Extract raw SEARCH/REPLACE blocks from an OpenAI free-text response."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if "<<<<<<SEARCH" not in stripped:
+        return ""
+
+    # If the model wrapped the answer in a code fence, the delimiter slicing
+    # below still works.  It also tolerates brief accidental prose before/after.
+    start = stripped.find("<<<<<<SEARCH")
+    end = stripped.rfind(">>>>>>REPLACE")
+    if end == -1:
+        return ""
+    end += len(">>>>>>REPLACE")
+    return stripped[start:end].strip()
+
+
+async def _attempt_openai_direct_edit(
+    memory: SharedWorkingMemory,
+    repo_dir: Path,
+    edit: FileEditPlan,
+    *,
+    sub_edit_label: str,
+    retry_preamble: str,
+    max_turns: int,
+) -> tuple[str, str]:
+    from src.agents._openai_native import run_openai_tool_agent
+
+    prior_error = ""
+    last_result = ""
+    for _ in range(2):
+        prompt = _build_openai_direct_patch_prompt(
+            memory,
+            repo_dir,
+            edit,
+            sub_edit_label=sub_edit_label,
+            retry_preamble=retry_preamble,
+            prior_error=prior_error,
+        )
+        try:
+            result = await run_openai_tool_agent(
+                system_prompt=(
+                    "You are a code patch generator. Return only exact "
+                    "SEARCH/REPLACE blocks that can be applied mechanically."
+                ),
+                user_prompt=prompt,
+                allowed_tools=[],
+                max_turns=max_turns,
+                cwd=str(repo_dir),
+            )
+        except Exception as exc:
+            last_result = f"PATCH_INCOMPLETE: block generation failed: {exc}"
+            prior_error = last_result
+            continue
+
+        blocks = _extract_search_replace_blocks(result.result_text)
+        if not blocks:
+            last_result = (
+                "PATCH_INCOMPLETE: OpenAI response did not contain "
+                "SEARCH/REPLACE blocks. Response preview: "
+                + _safe_preview(result.result_text, limit=600)
+            )
+            prior_error = last_result
+            continue
+
+        result = await apply_search_replace.handler(
+            {"filepath": edit.filepath, "blocks": blocks}
+        )
+        result_text = ""
+        if isinstance(result, dict):
+            result_text = " ".join(
+                str(item.get("text", ""))
+                for item in result.get("content", [])
+                if isinstance(item, dict)
+            )
+        last_result = result_text or str(result)
+        if "Successfully applied" in last_result:
+            return "success", "PATCH_APPLIED: " + last_result
+        prior_error = last_result
+
+    return "success", last_result or "PATCH_INCOMPLETE"
+
+
 async def _attempt_sub_edit(
     memory: SharedWorkingMemory,
     repo_dir: Path,
@@ -589,14 +755,27 @@ async def _attempt_sub_edit(
     result_text = ""
     limit_hit: str | None = None
     subtype = ""
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(prompt)
-        async for message in client.receive_response():
-            if isinstance(message, ResultMessage):
-                result_text = message.result or ""
-                subtype = message.subtype or ""
-                if subtype in ("error_max_turns", "error_max_budget_usd"):
-                    limit_hit = subtype
+    if use_openai_backend():
+        subtype, result_text = await _attempt_openai_direct_edit(
+            memory,
+            repo_dir,
+            edit,
+            sub_edit_label=sub_edit_label,
+            retry_preamble=retry_preamble,
+            max_turns=max_turns,
+        )
+        if subtype == "error_max_turns":
+            limit_hit = subtype
+    else:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                if isinstance(message, ResultMessage):
+                    _cost_tracker.accumulate(message)
+                    result_text = message.result or ""
+                    subtype = message.subtype or ""
+                    if subtype in ("error_max_turns", "error_max_budget_usd"):
+                        limit_hit = subtype
 
     actions_after = _count_apply_actions(memory, edit.filepath)
     delta = actions_after - actions_before
@@ -775,7 +954,31 @@ async def _run_single_edit(
         flush=True,
     )
 
-    edit_ok = outcome in ("CHANGED", "IDEMPOTENT") and not missing_from_diff
+    # reference_only edits were auto-added by planner backfill from a co-edit
+    # relation, not chosen as definite change targets.  Evidence often names
+    # such files only as read-for-pattern context (e.g. "read user.js to learn
+    # the privilege-check pattern").  When the generator correctly concludes no
+    # change is needed (no diff), that is a legitimate NO_OP_OK — not a failure.
+    # Forcing it to FAILED here is exactly what sank issue 003: a complete,
+    # correct 6-file patch was reported PATCH_FAILED because one backfilled
+    # reference file produced no diff.  An actual error (CHANGED but somehow
+    # missing from diff, which cannot happen for a no-op) is still caught.
+    if edit.reference_only and outcome == "FAILED" and missing_from_diff:
+        print(
+            f"[patch-generator] {edit_label}: reference_only edit produced no "
+            f"diff — treating as NO_OP_OK (file was a read-for-pattern co-edit "
+            f"target, not a required change).",
+            flush=True,
+        )
+        outcome = "NO_OP_OK"
+        memory.record_action(
+            phase="patch-generation",
+            subagent="patch-generator",
+            outcome=f"EDIT_NO_OP_OK:{edit_label}",
+        )
+        missing_from_diff = False
+
+    edit_ok = outcome in ("CHANGED", "IDEMPOTENT", "NO_OP_OK") and not missing_from_diff
     final_status = "PATCH_SUCCESS" if edit_ok else "PATCH_FAILED"
     failure_logger.file_summary(
         filepath=edit.filepath,

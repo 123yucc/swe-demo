@@ -97,6 +97,24 @@ class DeepSearchReport(BaseModel):
             "Cross-cutting dependency paths (interface/package/config)."
         ),
     )
+    consistency_anchors: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Pairs of code points that MUST stay jointly consistent, in the "
+            "form '<path_a>:<locator_a> <-> <path_b>:<locator_b>'. Each locator "
+            "is a line ('LINE'), a line range ('LINE-LINE'), a prefixed symbol "
+            "('class:NAME', 'func:NAME', 'method:NAME', 'type:NAME', "
+            "'enum:NAME', 'field:NAME', 'name:NAME', ...), or a bare identifier. "
+            "Populate ONLY when the requirement matches one of: (A) a config/"
+            "data file references an identifier the code side must define, "
+            "(B) a symbol is renamed / changes visibility and its old-vs-new "
+            "references across the repo (including same-package _test.* files "
+            "at base_commit) must stay aligned, (C) a new file must be "
+            "registered/imported/mounted elsewhere. Leave empty otherwise — do "
+            "NOT pad with anchors that are not load-bearing. A code gate "
+            "machine-verifies that both endpoints resolve."
+        ),
+    )
     similar_implementation_patterns: list[str] = Field(
         default_factory=list,
         description=(
@@ -148,3 +166,50 @@ class DeepSearchReport(BaseModel):
             )
 
         return v
+
+    @field_validator("similar_implementation_patterns", mode="before")
+    @classmethod
+    def normalize_similar_implementation_patterns(cls, value):
+        """Accept common structured variants emitted by the model.
+
+        GPT-5.2 sometimes returns object-shaped entries here even though the
+        schema asks for plain strings. Coerce those objects into concise,
+        readable strings instead of failing the whole structured decode.
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    normalized.append(text)
+                continue
+            if isinstance(item, dict):
+                parts: list[str] = []
+                for key in (
+                    "pattern",
+                    "description",
+                    "location",
+                    "locations",
+                    "evidence",
+                    "notes",
+                ):
+                    raw = item.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        parts.append(raw.strip())
+                    elif isinstance(raw, list):
+                        joined = ", ".join(str(x).strip() for x in raw if str(x).strip())
+                        if joined:
+                            parts.append(joined)
+                text = " | ".join(dict.fromkeys(parts))
+                if text:
+                    normalized.append(text)
+                continue
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized

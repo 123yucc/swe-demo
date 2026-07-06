@@ -59,7 +59,16 @@ consistency dimension when, e.g.:
     AS_IS_VIOLATED, another over the same region is AS_IS_COMPLIANT),
   - a compliant-group entry asserts behavior that an active requirement's
     findings directly contradict,
-  - co-edit relations imply a change that some verdict denies is needed.
+  - co-edit relations imply a change that some verdict denies is needed,
+  - SPEC-vs-FINDINGS CONTRADICTION: a requirement has a non-compliant verdict
+    (AS_IS_VIOLATED / TO_BE_MISSING / TO_BE_PARTIAL) yet its findings argue the
+    cited code "must remain unchanged" / "is load-bearing" / "must stay as-is",
+    OR defer the fix to another requirement ("this is a side-effect of fixing
+    req-X", "becomes dead code once req-Y lands"). A non-compliant verdict
+    means a change is owed at the cited location; findings that argue against
+    making any change there, or that offload the change point onto a different
+    requirement, are internally inconsistent. FAIL with conflicting_field
+    "findings".
 When you FAIL consistency, list ALL implicated requirement_ids and set
 conflicting_field to "<cross-req>" (or the specific field in conflict).
 
