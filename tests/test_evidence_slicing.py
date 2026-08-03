@@ -63,6 +63,29 @@ def test_full_dump_when_focus_empty():
     assert "active repair context" in out
 
 
+def test_large_full_dump_omits_duplicate_scoped_evidence(monkeypatch):
+    mem = _memory(
+        _req("req-001", region="core/a.go:10", suspect="SCOPED_ONLY_MARKER"),
+    )
+    monkeypatch.setenv("EVIDENCE_PROMPT_COMPACTION_MIN_CHARS", "1")
+    out = mem.format_for_prompt()
+    assert "AGGREGATE_MARKER" in out
+    assert "req-001" in out
+    assert "SCOPED_ONLY_MARKER" not in out
+    assert "Nested requirement scoped_evidence is omitted" in out
+
+
+def test_full_dump_compaction_can_be_disabled(monkeypatch):
+    mem = _memory(
+        _req("req-001", region="core/a.go:10", suspect="SCOPED_ONLY_MARKER"),
+    )
+    monkeypatch.setenv("EVIDENCE_PROMPT_COMPACTION", "off")
+    monkeypatch.setenv("EVIDENCE_PROMPT_COMPACTION_MIN_CHARS", "1")
+    out = mem.format_for_prompt()
+    assert "SCOPED_ONLY_MARKER" in out
+    assert "Nested requirement scoped_evidence is omitted" not in out
+
+
 def test_slice_keeps_only_touching_requirements():
     mem = _memory(
         _req("req-001", region="core/a.go:10", suspect="core/a.go"),

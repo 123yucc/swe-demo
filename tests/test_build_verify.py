@@ -11,6 +11,7 @@ Run:  python -m pytest tests/test_build_verify.py -v
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,8 @@ import pytest
 from src.orchestrator.build_verify import (
     BuildCheckResult,
     BuildError,
+    changed_go_packages,
+    changed_python_production_files,
     detect_build_system,
     diff_new_errors,
     parse_go_errors,
@@ -25,6 +28,56 @@ from src.orchestrator.build_verify import (
     render_errors_for_feedback,
     run_build_check,
 )
+
+
+def test_changed_go_packages_uses_canonical_host_diff(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True,
+    )
+    pkg = tmp_path / "scanner"
+    pkg.mkdir()
+    source = pkg / "parser.go"
+    source.write_text("package scanner\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    source.write_text("package scanner\n\nfunc parse() {}\n", encoding="utf-8")
+
+    assert changed_go_packages(tmp_path) == ["./scanner"]
+
+
+def test_changed_python_production_files_uses_canonical_host_diff(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    source = pkg / "module.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    test_file = test_dir / "test_module.py"
+    test_file.write_text("def test_ok():\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    test_file.write_text("def test_changed():\n    pass\n", encoding="utf-8")
+    new_source = pkg / "new_module.py"
+    new_source.write_text("VALUE = 3\n", encoding="utf-8")
+
+    assert changed_python_production_files(tmp_path) == [
+        "pkg/module.py",
+        "pkg/new_module.py",
+    ]
 
 # ── Real captured output (verbatim from eval logs) ──────────────────────────
 
@@ -212,6 +265,41 @@ def test_run_go_without_toolchain_is_unverifiable_not_ok(tmp_path: Path):
     assert result.toolchain_missing is True
 
 
+def test_go_build_flags_broken_repo_test_files_via_test_compile(tmp_path: Path):
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain required for this check")
+    (tmp_path / "go.mod").write_text(
+        "module example.com/test\n\ngo 1.20\n",
+        encoding="utf-8",
+    )
+    pkg = tmp_path / "events"
+    pkg.mkdir()
+    (pkg / "message.go").write_text(
+        "package events\n\n"
+        "type message struct { data string }\n",
+        encoding="utf-8",
+    )
+    (pkg / "message_test.go").write_text(
+        "package events\n\n"
+        "import \"testing\"\n\n"
+        "func TestLegacy(t *testing.T) {\n"
+        "\t_ = message{Data: \"x\"}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    result = run_build_check(
+        tmp_path,
+        system="go",
+        go_targets=["./events"],
+    )
+
+    assert result.ok is False
+    assert any(err.file == "events/message_test.go" for err in result.errors)
+    assert "unknown field Data" in " ".join(err.message for err in result.errors)
+    assert "go test -c -o /tmp/build-verify-1.test ./events" in result.command
+
+
 def test_unverifiable_result_is_not_treated_as_ok():
     """An unverifiable result is distinct from every ok shape."""
     unver = BuildCheckResult(system="go", ok=False, unverifiable=True)
@@ -255,6 +343,8 @@ def test_python_present_is_not_unverifiable(tmp_path: Path):
 
 
 def test_python_changed_production_import_error_is_build_error(tmp_path: Path):
+    if shutil.which("python") is None:
+        pytest.skip("python interpreter not on PATH under this name")
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "mod.py").write_text("import does_not_exist_for_build_gate\n", encoding="utf-8")
@@ -309,3 +399,24 @@ def test_render_errors_for_feedback():
     rendered = render_errors_for_feedback(errors)
     assert "lib/service/service.go:2557: unknown field 'Auth'" in rendered
     assert "tests/x.py: AttributeError: nope" in rendered
+
+
+def test_python_script_import_uses_script_directory_for_init_path(tmp_path: Path):
+    if shutil.which("python") is None:
+        pytest.skip("python interpreter not on PATH under this name")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "_init_path.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (scripts / "runner.py").write_text(
+        "import _init_path\nVALUE = _init_path.VALUE\n",
+        encoding="utf-8",
+    )
+
+    result = run_build_check(
+        tmp_path,
+        system="python",
+        python_targets=["scripts/runner.py"],
+    )
+
+    assert result.ok is True
+    assert result.errors == []

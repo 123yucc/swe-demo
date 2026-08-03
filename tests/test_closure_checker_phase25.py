@@ -65,6 +65,22 @@ def test_manifest_skips_unchecked():
     assert manifest.tasks == []
 
 
+def test_manifest_skips_descriptive_audit_concern_language():
+    req = RequirementItem(
+        id="req-004",
+        text="move interface",
+        origin="requirements",
+        verdict="AS_IS_VIOLATED",
+        findings=(
+            "This directly refutes the audit concern that req-004 must be "
+            "localized to qtlog's multi-logger routing logic."
+        ),
+        evidence_locations=["qtlog.py:10"],
+    )
+    manifest = build_audit_manifest(_cards(req))
+    assert manifest.tasks == []
+
+
 def test_compliant_group_rendered_for_consistency():
     ev = _cards(
         RequirementItem(

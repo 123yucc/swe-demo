@@ -1,0 +1,535 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "Despite manually setting the header, `.netrc` is used and overrides it with Basic auth, causing a 401 Unauthorized response."
+    ],
+    "repair_targets": [
+      "When set to `false`, `.netrc` credentials are ignored, ensuring that any explicitly set `Authorization` headers are respected.",
+      "A new `use_netrc` parameter (defaulting to `true`) has been added to the module and underlying request logic.",
+      "The `Authorization` header with `Bearer` should be used and the request should succeed if valid."
+    ],
+    "regression_expectations": [
+      "`use_netrc` should default to enabled (`true`)."
+    ]
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "Current code handles three auth sources for non-FTP URLs: explicit username/password arguments, credentials embedded in the URL, and fallback `.netrc` credentials; it does not handle a caller-specified opt-out for `.netrc` lookup.",
+      "The `.netrc` path is only reached when no explicit username was resolved and the URL lacked embedded credentials; explicit auth takes precedence over `.netrc`.",
+      "`.netrc` lookup exceptions are only partially handled: `IOError` during `netrc.netrc(...)` is suppressed to `login = None`, but there is no boundary/control around whether lookup should happen at all.",
+      "Current `.netrc` handling applies only on non-FTP requests.",
+      "Current `.netrc` fallback is skipped whenever explicit username/password or URL-embedded credentials are present, and also bypassed when `use_gssapi` is enabled.",
+      "Current `.netrc` branch silently ignores missing `.netrc` files via `IOError`, and only injects an Authorization header when both username and password are returned."
+    ],
+    "behavioral_constraints": [
+      "`Request.open()` resolves auth in order: explicit `url_username`/`url_password`, then credentials embedded in the URL, then GSSAPI/basic-auth handler paths, and only in the final `else` branch falls back to `.netrc`; callers currently depend on this auth resolution flow.",
+      "When `.netrc` lookup succeeds, `Request.open()` injects an `Authorization` header directly before opener construction; any stored constructor preference must be consulted before this point to affect outgoing requests.",
+      "`fetch_url()` derives request settings from `module.params` and passes them through `open_url()`; module-level support for any new `.netrc` control must be threaded through this chain rather than handled only inside `uri`.",
+      "Header dictionaries are merged as `dict(self.headers, **headers)` before auth handling, so request-specific headers override instance headers and auth injection happens after that merge.",
+      "Auth branch ordering matters: explicit `url_username` / URL-embedded credentials are handled before the `.netrc` fallback branch, and `use_gssapi` bypasses both basic-auth and `.netrc` logic.",
+      "`.netrc` lookup is only reached for non-FTP requests and only when neither explicit username nor URL netloc credentials were resolved."
+    ],
+    "backward_compatibility": [
+      "`Request.__init__` currently accepts the existing keyword parameters (`headers`, `use_proxy`, `force`, `timeout`, `validate_certs`, `url_username`, `url_password`, `http_agent`, `force_basic_auth`, `follow_redirects`, `client_cert`, `client_key`, `cookies`, `unix_socket`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`); existing callers such as `open_url()` rely on that signature remaining compatible.",
+      "`open_url()` and `fetch_url()` currently default to consulting `.netrc` when no explicit username is supplied; any fix should preserve current behavior unless the new control parameter is explicitly set to disable it.",
+      "`url_argument_spec()` is the shared parameter source for modules like `uri`; extending auth behavior should preserve existing parameter names and defaults so existing playbooks continue to work unchanged.",
+      "`Request.open` currently accepts the documented kwargs shown in its signature; adding `.netrc` control must preserve existing parameters and the current fallback pattern where per-call `None` inherits instance defaults (`_fallback`).",
+      "`open_url` is a public helper that forwards many auth-related kwargs directly to `Request().open`; any fix must keep this wrapper/call signature behavior compatible for existing callers such as lookup/url and galaxy code.",
+      "Current callers can omit any `.netrc` setting and still receive `.netrc`-derived Basic authorization when no explicit credentials are provided; changing default behavior would be externally observable."
+    ],
+    "similar_implementation_patterns": [
+      "`Request` already uses a constructor-store plus per-call fallback pattern for options such as `force_basic_auth`, `follow_redirects`, `client_cert`, `ca_path`, `decompress`, and `ciphers` (`lib/ansible/module_utils/urls.py:1332-1347`, `1416-1432`). A `.netrc` preference would fit this existing pattern.",
+      "`fetch_url()` already reads auth-related module params and forwards them to `open_url()` (`lib/ansible/module_utils/urls.py:1881-1905`), which is the existing propagation style for request options.",
+      "`Request.open` already uses a standard per-call-overrides-instance-default pattern through `_fallback` for auth-adjacent controls such as `force_basic_auth` (lib/ansible/module_utils/urls.py:1416-1432).",
+      "`open_url` mirrors `Request.open` parameters and forwards them directly, providing the existing pattern for exposing new request controls to callers (lib/ansible/module_utils/urls.py:1649-1668).",
+      "Galaxy API auth avoids overwriting an existing `Authorization` header (`lib/ansible/galaxy/api.py:418-421`), a relevant reference for preserving explicit caller auth precedence when adjusting auth sourcing."
+    ],
+    "missing_elements_to_implement": []
+  },
+  "localization": {
+    "suspect_entities": [
+      "lib/ansible/module_utils/urls.py:Request.__init__",
+      "lib/ansible/module_utils/urls.py:Request.open",
+      "lib/ansible/module_utils/urls.py:open_url",
+      "lib/ansible/module_utils/urls.py:fetch_url",
+      "lib/ansible/module_utils/urls.py:url_argument_spec",
+      "lib/ansible/modules/uri.py:main",
+      "lib/ansible/module_utils/urls.py:class Request",
+      "lib/ansible/module_utils/urls.py:method Request.open",
+      "lib/ansible/module_utils/urls.py:def open_url",
+      "test/units/module_utils/urls/test_Request.py:test_Request_open_netrc"
+    ],
+    "exact_code_regions": [
+      "lib/ansible/module_utils/urls.py:1306-1352",
+      "lib/ansible/module_utils/urls.py:1416-1497",
+      "lib/ansible/module_utils/urls.py:1649-1668",
+      "lib/ansible/module_utils/urls.py:1798-1815",
+      "lib/ansible/module_utils/urls.py:1881-1905",
+      "lib/ansible/modules/uri.py:569-573",
+      "lib/ansible/modules/uri.py:585-608",
+      "lib/ansible/module_utils/urls.py:1307-1310",
+      "lib/ansible/module_utils/urls.py:1358-1364",
+      "lib/ansible/module_utils/urls.py:1416-1432",
+      "lib/ansible/module_utils/urls.py:1487-1497",
+      "lib/ansible/module_utils/urls.py:1878-1905",
+      "test/units/module_utils/urls/test_Request.py:33-81",
+      "test/units/module_utils/urls/test_Request.py:274-292",
+      "lib/ansible/plugins/lookup/url.py:217-233"
+    ],
+    "call_chain_context": [
+      "lib/ansible/modules/uri.py:main -> lib/ansible/modules/uri.py:uri() request path -> lib/ansible/module_utils/urls.py:fetch_url -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+      "lib/ansible/module_utils/urls.py:fetch_url -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+      "lib/ansible/plugins/lookup/url.py:run -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+      "lib/ansible/galaxy/api.py:_call_galaxy -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open"
+    ],
+    "dataflow_relevant_uses": [
+      "`Request.__init__` stores constructor auth fields on `self` (`self.url_username`, `self.url_password`, `self.force_basic_auth`) in `lib/ansible/module_utils/urls.py:1336-1339`, and `Request.open()` later reads them via `_fallback(...)` at `lib/ansible/module_utils/urls.py:1420-1423`.",
+      "`fetch_url()` reads module params `url_username`, `url_password`, and `force_basic_auth` at `lib/ansible/module_utils/urls.py:1881-1884` and passes them into `open_url()` at `lib/ansible/module_utils/urls.py:1898-1905`.",
+      "In `Request.open()`, if neither explicit nor URL-embedded credentials are used, `login = rc.authenticators(parsed.hostname)` feeds `username, _, password = login`, which then feeds `headers[\"Authorization\"] = basic_auth_header(username, password)` at `lib/ansible/module_utils/urls.py:1488-1497`.",
+      "`Request.__init__.force_basic_auth` defined at lib/ansible/module_utils/urls.py:1339 is consumed via `_fallback` in `Request.open` at lib/ansible/module_utils/urls.py:1423.",
+      "`force_basic_auth` parameter from `open_url` at lib/ansible/module_utils/urls.py:1652-1665 flows directly into `Request.open`, showing the established pattern a future `.netrc` control would need to follow.",
+      "When no explicit `username` is resolved, `parsed.hostname` at lib/ansible/module_utils/urls.py:1490 is used as the key into `.netrc`; returned `(username, _, password)` then feeds `basic_auth_header` at lib/ansible/module_utils/urls.py:1495-1497."
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "If `Request.__init__` gains a stored `.netrc` preference -> `Request.open()` must also consult that stored value before the unconditional `.netrc` lookup branch.",
+      "If a `.netrc` control is added to `open_url()` -> `fetch_url()` must pass it through.",
+      "If module users must control `.netrc` behavior -> `url_argument_spec()` and modules such as `lib/ansible/modules/uri.py` that consume it must be updated together.",
+      "If `Request.__init__` gains instance-level `.netrc` control -> `Request.open` must also gain a per-call kwarg and `_fallback` application.",
+      "If `Request.open` gains `.netrc` gating -> `open_url` must forward the new kwarg so existing higher-level callers can use it.",
+      "If `.netrc` behavior changes -> tests in `test/units/module_utils/urls/test_Request.py` covering `.netrc` authorization must also change to reflect allowed/disabled behavior."
+    ],
+    "dependency_propagation": [
+      "Shared URL consumers inherit behavior through `url_argument_spec()` -> `fetch_url()` -> `open_url()` -> `Request.open()`, so adding `.netrc` control at the constructor level also has implications for helper functions and module argument plumbing.",
+      "The `uri` module builds its argument spec from `url_argument_spec()`, so any module-facing toggle for `.netrc` use would naturally propagate from `lib/ansible/module_utils/urls.py` into `lib/ansible/modules/uri.py`.",
+      "A `.netrc` control would need propagation across `Request.__init__`, `Request.open`, and the `open_url` wrapper to preserve the module_utils URL API shape.",
+      "Higher-level callers such as `lookup/url.py` and `fetch_url` currently expose/pass auth-related controls only through `open_url`; without wrapper propagation they cannot influence `.netrc` behavior."
+    ],
+    "consistency_anchors": []
+  },
+  "requirements": [
+    {
+      "id": "req-001",
+      "text": "- `Request.__init__` must expose a parameter that determines if `.netrc` credentials are considered and store that preference for later use in request handling.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "lib/ansible/module_utils/urls.py:1306-1352",
+        "lib/ansible/module_utils/urls.py:1440-1497",
+        "lib/ansible/module_utils/urls.py:1649-1668",
+        "lib/ansible/module_utils/urls.py:1798-1815",
+        "lib/ansible/module_utils/urls.py:1881-1905",
+        "lib/ansible/modules/uri.py:569-573",
+        "lib/ansible/modules/uri.py:585-608"
+      ],
+      "findings": "`Request.__init__` in `lib/ansible/module_utils/urls.py` does not expose any parameter controlling whether `.netrc` credentials should be consulted. Its constructor accepts auth-related parameters such as `url_username`, `url_password`, and `force_basic_auth`, but no `use_netrc`-style flag, and it stores only those existing constructor inputs on `self`. In `Request.open`, when no explicit username is available and the URL does not embed credentials, the code unconditionally attempts `netrc.netrc(...).authenticators(parsed.hostname)` and, if found, sets an `Authorization` header from those credentials. There is no constructor-stored preference used to suppress this behavior later in request handling. The higher-level helpers `open_url`, `fetch_url`, `url_argument_spec`, and the `uri` module likewise expose no `.netrc` control parameter to pass through.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "lib/ansible/module_utils/urls.py:Request.__init__",
+            "lib/ansible/module_utils/urls.py:Request.open",
+            "lib/ansible/module_utils/urls.py:open_url",
+            "lib/ansible/module_utils/urls.py:fetch_url",
+            "lib/ansible/module_utils/urls.py:url_argument_spec",
+            "lib/ansible/modules/uri.py:main"
+          ],
+          "exact_code_regions": [
+            "lib/ansible/module_utils/urls.py:1306-1352",
+            "lib/ansible/module_utils/urls.py:1416-1497",
+            "lib/ansible/module_utils/urls.py:1649-1668",
+            "lib/ansible/module_utils/urls.py:1798-1815",
+            "lib/ansible/module_utils/urls.py:1881-1905",
+            "lib/ansible/modules/uri.py:569-573",
+            "lib/ansible/modules/uri.py:585-608"
+          ],
+          "call_chain_context": [
+            "lib/ansible/modules/uri.py:main -> lib/ansible/modules/uri.py:uri() request path -> lib/ansible/module_utils/urls.py:fetch_url -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+            "lib/ansible/module_utils/urls.py:fetch_url -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open"
+          ],
+          "dataflow_relevant_uses": [
+            "`Request.__init__` stores constructor auth fields on `self` (`self.url_username`, `self.url_password`, `self.force_basic_auth`) in `lib/ansible/module_utils/urls.py:1336-1339`, and `Request.open()` later reads them via `_fallback(...)` at `lib/ansible/module_utils/urls.py:1420-1423`.",
+            "`fetch_url()` reads module params `url_username`, `url_password`, and `force_basic_auth` at `lib/ansible/module_utils/urls.py:1881-1884` and passes them into `open_url()` at `lib/ansible/module_utils/urls.py:1898-1905`.",
+            "In `Request.open()`, if neither explicit nor URL-embedded credentials are used, `login = rc.authenticators(parsed.hostname)` feeds `username, _, password = login`, which then feeds `headers[\"Authorization\"] = basic_auth_header(username, password)` at `lib/ansible/module_utils/urls.py:1488-1497`."
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If `Request.__init__` gains a stored `.netrc` preference -> `Request.open()` must also consult that stored value before the unconditional `.netrc` lookup branch.",
+            "If a `.netrc` control is added to `open_url()` -> `fetch_url()` must pass it through.",
+            "If module users must control `.netrc` behavior -> `url_argument_spec()` and modules such as `lib/ansible/modules/uri.py` that consume it must be updated together."
+          ],
+          "dependency_propagation": [
+            "Shared URL consumers inherit behavior through `url_argument_spec()` -> `fetch_url()` -> `open_url()` -> `Request.open()`, so adding `.netrc` control at the constructor level also has implications for helper functions and module argument plumbing.",
+            "The `uri` module builds its argument spec from `url_argument_spec()`, so any module-facing toggle for `.netrc` use would naturally propagate from `lib/ansible/module_utils/urls.py` into `lib/ansible/modules/uri.py`."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Current code handles three auth sources for non-FTP URLs: explicit username/password arguments, credentials embedded in the URL, and fallback `.netrc` credentials; it does not handle a caller-specified opt-out for `.netrc` lookup.",
+            "The `.netrc` path is only reached when no explicit username was resolved and the URL lacked embedded credentials; explicit auth takes precedence over `.netrc`.",
+            "`.netrc` lookup exceptions are only partially handled: `IOError` during `netrc.netrc(...)` is suppressed to `login = None`, but there is no boundary/control around whether lookup should happen at all."
+          ],
+          "behavioral_constraints": [
+            "`Request.open()` resolves auth in order: explicit `url_username`/`url_password`, then credentials embedded in the URL, then GSSAPI/basic-auth handler paths, and only in the final `else` branch falls back to `.netrc`; callers currently depend on this auth resolution flow.",
+            "When `.netrc` lookup succeeds, `Request.open()` injects an `Authorization` header directly before opener construction; any stored constructor preference must be consulted before this point to affect outgoing requests.",
+            "`fetch_url()` derives request settings from `module.params` and passes them through `open_url()`; module-level support for any new `.netrc` control must be threaded through this chain rather than handled only inside `uri`."
+          ],
+          "backward_compatibility": [
+            "`Request.__init__` currently accepts the existing keyword parameters (`headers`, `use_proxy`, `force`, `timeout`, `validate_certs`, `url_username`, `url_password`, `http_agent`, `force_basic_auth`, `follow_redirects`, `client_cert`, `client_key`, `cookies`, `unix_socket`, `ca_path`, `unredirected_headers`, `decompress`, `ciphers`); existing callers such as `open_url()` rely on that signature remaining compatible.",
+            "`open_url()` and `fetch_url()` currently default to consulting `.netrc` when no explicit username is supplied; any fix should preserve current behavior unless the new control parameter is explicitly set to disable it.",
+            "`url_argument_spec()` is the shared parameter source for modules like `uri`; extending auth behavior should preserve existing parameter names and defaults so existing playbooks continue to work unchanged."
+          ],
+          "similar_implementation_patterns": [
+            "`Request` already uses a constructor-store plus per-call fallback pattern for options such as `force_basic_auth`, `follow_redirects`, `client_cert`, `ca_path`, `decompress`, and `ciphers` (`lib/ansible/module_utils/urls.py:1332-1347`, `1416-1432`). A `.netrc` preference would fit this existing pattern.",
+            "`fetch_url()` already reads auth-related module params and forwards them to `open_url()` (`lib/ansible/module_utils/urls.py:1881-1905`), which is the existing propagation style for request options."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-002",
+      "text": "- `Request.open` should accept a control for `.netrc` usage, apply fallback when not provided, and only attempt to read `.netrc` if allowed.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "lib/ansible/module_utils/urls.py:1307-1310",
+        "lib/ansible/module_utils/urls.py:1358-1364",
+        "lib/ansible/module_utils/urls.py:1416-1432",
+        "lib/ansible/module_utils/urls.py:1487-1497",
+        "lib/ansible/module_utils/urls.py:1649-1668",
+        "test/units/module_utils/urls/test_Request.py:274-292"
+      ],
+      "findings": "`Request.open` currently has no parameter controlling `.netrc` usage. It applies fallback only for existing kwargs such as `force_basic_auth`, but there is no corresponding `.netrc` control in either `Request.__init__`, `Request.open`, or `open_url`. In the no-username/no-netloc-credentials branch, `Request.open` unconditionally attempts `netrc.netrc(os.environ.get('NETRC'))` and only suppresses `IOError`; therefore `.netrc` is always consulted for non-FTP requests when explicit credentials are absent, rather than only when allowed by a caller-provided control. Existing tests verify this unconditional `.netrc` authorization behavior.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "lib/ansible/module_utils/urls.py:class Request",
+            "lib/ansible/module_utils/urls.py:method Request.open",
+            "lib/ansible/module_utils/urls.py:def open_url",
+            "test/units/module_utils/urls/test_Request.py:test_Request_open_netrc"
+          ],
+          "exact_code_regions": [
+            "lib/ansible/module_utils/urls.py:1307-1310",
+            "lib/ansible/module_utils/urls.py:1358-1364",
+            "lib/ansible/module_utils/urls.py:1416-1432",
+            "lib/ansible/module_utils/urls.py:1487-1497",
+            "lib/ansible/module_utils/urls.py:1649-1668",
+            "lib/ansible/module_utils/urls.py:1878-1905",
+            "test/units/module_utils/urls/test_Request.py:33-81",
+            "test/units/module_utils/urls/test_Request.py:274-292",
+            "lib/ansible/plugins/lookup/url.py:217-233"
+          ],
+          "call_chain_context": [
+            "lib/ansible/plugins/lookup/url.py:run -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+            "lib/ansible/module_utils/urls.py:fetch_url -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open",
+            "lib/ansible/galaxy/api.py:_call_galaxy -> lib/ansible/module_utils/urls.py:open_url -> lib/ansible/module_utils/urls.py:Request.open"
+          ],
+          "dataflow_relevant_uses": [
+            "`Request.__init__.force_basic_auth` defined at lib/ansible/module_utils/urls.py:1339 is consumed via `_fallback` in `Request.open` at lib/ansible/module_utils/urls.py:1423.",
+            "`force_basic_auth` parameter from `open_url` at lib/ansible/module_utils/urls.py:1652-1665 flows directly into `Request.open`, showing the established pattern a future `.netrc` control would need to follow.",
+            "When no explicit `username` is resolved, `parsed.hostname` at lib/ansible/module_utils/urls.py:1490 is used as the key into `.netrc`; returned `(username, _, password)` then feeds `basic_auth_header` at lib/ansible/module_utils/urls.py:1495-1497."
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If `Request.__init__` gains instance-level `.netrc` control -> `Request.open` must also gain a per-call kwarg and `_fallback` application.",
+            "If `Request.open` gains `.netrc` gating -> `open_url` must forward the new kwarg so existing higher-level callers can use it.",
+            "If `.netrc` behavior changes -> tests in `test/units/module_utils/urls/test_Request.py` covering `.netrc` authorization must also change to reflect allowed/disabled behavior."
+          ],
+          "dependency_propagation": [
+            "A `.netrc` control would need propagation across `Request.__init__`, `Request.open`, and the `open_url` wrapper to preserve the module_utils URL API shape.",
+            "Higher-level callers such as `lookup/url.py` and `fetch_url` currently expose/pass auth-related controls only through `open_url`; without wrapper propagation they cannot influence `.netrc` behavior."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Current `.netrc` handling applies only on non-FTP requests.",
+            "Current `.netrc` fallback is skipped whenever explicit username/password or URL-embedded credentials are present, and also bypassed when `use_gssapi` is enabled.",
+            "Current `.netrc` branch silently ignores missing `.netrc` files via `IOError`, and only injects an Authorization header when both username and password are returned."
+          ],
+          "behavioral_constraints": [
+            "Header dictionaries are merged as `dict(self.headers, **headers)` before auth handling, so request-specific headers override instance headers and auth injection happens after that merge.",
+            "Auth branch ordering matters: explicit `url_username` / URL-embedded credentials are handled before the `.netrc` fallback branch, and `use_gssapi` bypasses both basic-auth and `.netrc` logic.",
+            "`.netrc` lookup is only reached for non-FTP requests and only when neither explicit username nor URL netloc credentials were resolved."
+          ],
+          "backward_compatibility": [
+            "`Request.open` currently accepts the documented kwargs shown in its signature; adding `.netrc` control must preserve existing parameters and the current fallback pattern where per-call `None` inherits instance defaults (`_fallback`).",
+            "`open_url` is a public helper that forwards many auth-related kwargs directly to `Request().open`; any fix must keep this wrapper/call signature behavior compatible for existing callers such as lookup/url and galaxy code.",
+            "Current callers can omit any `.netrc` setting and still receive `.netrc`-derived Basic authorization when no explicit credentials are provided; changing default behavior would be externally observable."
+          ],
+          "similar_implementation_patterns": [
+            "`Request.open` already uses a standard per-call-overrides-instance-default pattern through `_fallback` for auth-adjacent controls such as `force_basic_auth` (lib/ansible/module_utils/urls.py:1416-1432).",
+            "`open_url` mirrors `Request.open` parameters and forwards them directly, providing the existing pattern for exposing new request controls to callers (lib/ansible/module_utils/urls.py:1649-1668).",
+            "Galaxy API auth avoids overwriting an existing `Authorization` header (`lib/ansible/galaxy/api.py:418-421`), a relevant reference for preserving explicit caller auth precedence when adjusting auth sourcing."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-003",
+      "text": "- `open_url` has to define a parameter for `.netrc` handling, default it to enabled, and forward the value when creating a `Request`.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-004",
+      "text": "- `fetch_url` needs to accept a parameter that signals whether `.netrc` is used, default it to enabled, and pass it along to `open_url`.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-005",
+      "text": "- `url_get` should define a parameter for `.netrc` usage and explicitly forward this preference to `fetch_url` in all calls.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-006",
+      "text": "- The main flow of `get_url` must retrieve the `.netrc` setting from module arguments and consistently forward it to `url_get` for both primary download and checksum retrieval.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-007",
+      "text": "- The `uri` function requires a parameter controlling `.netrc` behavior and should propagate it to the lower-level request call.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-008",
+      "text": "- The entry point of `uri` has to include `.netrc` in its accepted arguments and forward the captured value into the `uri` function.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    },
+    {
+      "id": "req-009",
+      "text": "- The `run` method of the `url` lookup plugin must respect the configured `.netrc` option and forward it to the underlying request logic.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": null,
+      "parent_contract_id": "",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": ""
+    }
+  ],
+  "requirement_status": [],
+  "schema_version": "v3"
+}

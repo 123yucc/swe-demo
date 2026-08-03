@@ -10,6 +10,7 @@ rather than via the Agent tool dispatch.
 import asyncio
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ from src.agents import _cost_tracker
 from src.agents._backend import use_openai_backend
 from src.models.memory import SharedWorkingMemory
 from src.models.patch import FileEditPlan, PatchPlan
-from src.tools.patch_tools import apply_search_replace
+from src.tools.patch_tools import apply_search_replace, create_file
 
 
 AttemptOutcome = Literal["CHANGED", "IDEMPOTENT", "FAILED"]
@@ -46,6 +47,69 @@ _IDEMPOTENT_MARKERS = (
     "already in place",
     "already conformant",
 )
+
+
+class PatchGeneratorInfraError(RuntimeError):
+    """Model/relay infrastructure failure that must not be scored as patch quality."""
+
+
+def _is_infra_failure_signal(text: str) -> bool:
+    lowered = (text or "").lower()
+    infra_markers = (
+        "buzz_error",
+        "get_channel_failed",
+        "insufficient balance",
+        "error code: 403",
+        "error code: 500",
+        "certificate",
+        "ssl",
+        "tls",
+        "x509",
+        "connection refused",
+        "connection reset",
+        "remote protocol error",
+    )
+    return any(marker in lowered for marker in infra_markers)
+
+
+def _is_explicit_patch_format_failure(signal: str) -> bool:
+    lowered = (signal or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "malformed search/replace block",
+            "did not contain search/replace blocks",
+            "missing '======split' separator",
+            "missing '>>>>>>replace' terminator",
+            "search block is empty",
+            "no search/replace blocks found",
+        )
+    )
+
+
+def _creates_new_file(edit: FileEditPlan) -> bool:
+    """Compatibility wrapper for older deserialized FileEditPlan objects."""
+    return bool(getattr(edit, "creates_new_file", False))
+
+
+def _writes_full_file(edit: FileEditPlan, repo_dir: Path | None = None) -> bool:
+    """Return true when the edit should write complete file content."""
+    if repo_dir is None:
+        return _creates_new_file(edit)
+    target = repo_dir / edit.filepath
+    try:
+        if not target.exists():
+            return True
+        if target.is_file() and target.stat().st_size == 0:
+            return True
+        # A planned new-file edit may be revisited during artifact/static
+        # repair after the file has already been created. At that point a
+        # second create_file call is a whole-file rewrite and tends to destroy
+        # previously-correct symbols/imports. Repair existing non-empty files
+        # with minimal SEARCH/REPLACE instead.
+        return False
+    except OSError:
+        return _creates_new_file(edit)
 
 
 def _classify_attempt(
@@ -71,6 +135,8 @@ def _classify_attempt(
     if hash_changed:
         return "CHANGED"
     lowered = result_text.lower()
+    if lowered.lstrip().startswith("error:"):
+        return "FAILED"
     if "patch_incomplete" in lowered:
         return "FAILED"
     for marker in _IDEMPOTENT_MARKERS:
@@ -319,16 +385,18 @@ You receive a PatchPlan with preserved_findings and the original evidence
 requirements. Produce SEARCH/REPLACE edits.
 
 For each FileEditPlan in order:
-1. READ the target file before generating any SEARCH blocks
-2. IDENTIFY exact code regions that need to change
-3. CONSTRUCT SEARCH/REPLACE blocks:
+1. If the FileEditPlan creates a new file, do not Read the missing file; write
+   the complete new file with mcp__patch__create_file
+2. Otherwise, READ the target file before generating any SEARCH blocks
+3. IDENTIFY exact code regions that need to change
+4. CONSTRUCT SEARCH/REPLACE blocks:
    <<<<<<SEARCH
    [exact old code to find]
    ======SPLIT
    [new code to replace it with]
    >>>>>>REPLACE
-4. CALL mcp__patch__apply_search_replace for each file
-5. If ERROR: re-read the file, adjust, and retry
+5. CALL mcp__patch__apply_search_replace for each existing-file edit
+6. If ERROR: re-read the file, adjust, and retry
 
 CRITICAL — preserved_findings hard constraints (phase 18.D):
 The preserved_findings list contains verbatim prescriptive snippets from the
@@ -350,6 +418,12 @@ Rules:
 - Preserve existing indentation style
 - Apply edits in dependency order
 - preserved_findings are hard constraints: verify before submitting
+- expected_symbols are hard constraints: if the FileEditPlan names expected
+  symbols, define those exact spellings in that exact file before finishing.
+  Do not rename them, case-flip them, abbreviate them, or move them to a
+  sibling file. If the plan expects `requestLoggerContext`, defining
+  `addLoggerToContext` is a failure; if it expects `getClientUniqueId`,
+  creating `clientUuid` is a failure.
 - NEVER edit test files. The evaluator owns the test suite and applies its own
   test patch on top of yours; any edit to a test file (paths under tests/ or
   test/, files named *_test.go, test_*.py, *_test.py, *.test.js, *.spec.ts,
@@ -416,7 +490,57 @@ def _sanitize_patch_plan(memory: SharedWorkingMemory, repo_dir: Path) -> PatchPl
             subagent="patch-generator",
             outcome=f"FILTERED_PLANNED_FILES:{','.join(dropped)}",
         )
-    sanitized = PatchPlan(overview=patch_plan.overview, edits=kept)
+    consolidated: list[FileEditPlan] = []
+    by_scope: dict[tuple[str, tuple[str, ...]], int] = {}
+    merged_count = 0
+    for edit in kept:
+        scope = (
+            edit.filepath.replace("\\", "/").strip(),
+            tuple(edit.target_functions),
+        )
+        # Empty target scope can represent independent file-wide themes; only
+        # collapse explicit duplicate function/symbol scopes.
+        if not edit.target_functions or scope not in by_scope:
+            by_scope[scope] = len(consolidated)
+            consolidated.append(edit.model_copy(deep=True))
+            continue
+        current = consolidated[by_scope[scope]]
+
+        def merged(left: list[str], right: list[str]) -> list[str]:
+            return [*left, *(item for item in right if item not in left)]
+
+        rationales = [current.change_rationale]
+        if edit.change_rationale not in rationales:
+            rationales.append(edit.change_rationale)
+        consolidated[by_scope[scope]] = current.model_copy(update={
+            "change_rationale": "\nAdditional intent:\n".join(rationales),
+            "preserved_findings": merged(
+                current.preserved_findings, edit.preserved_findings
+            ),
+            "co_edit_dependencies": merged(
+                current.co_edit_dependencies, edit.co_edit_dependencies
+            ),
+            "reference_only": current.reference_only and edit.reference_only,
+            "expected_diff_required": (
+                current.expected_diff_required or edit.expected_diff_required
+            ),
+            "creates_new_file": current.creates_new_file or edit.creates_new_file,
+            "expected_symbols": merged(
+                current.expected_symbols, edit.expected_symbols
+            ),
+            "required_by_requirement_ids": merged(
+                current.required_by_requirement_ids,
+                edit.required_by_requirement_ids,
+            ),
+        })
+        merged_count += 1
+    if merged_count:
+        print(
+            f"[patch-generator] Consolidated {merged_count} duplicate "
+            "same-function planned edit(s).",
+            flush=True,
+        )
+    sanitized = PatchPlan(overview=patch_plan.overview, edits=consolidated)
     memory.patch_plan = sanitized
     return sanitized
 
@@ -443,6 +567,35 @@ def _build_requirement_section(memory: SharedWorkingMemory, edit: FileEditPlan) 
     if not req_lines:
         return ""
     return "\n\n## Relevant Requirements (verbatim)\n" + "\n\n".join(req_lines)
+
+
+def _build_repair_context_section(memory: SharedWorkingMemory) -> str:
+    """Return concise non-evidence repair context for focused edit prompts.
+
+    The patch generator executes each FileEditPlan in isolation.  On direct
+    compile/static repair rounds, the actionable signal lives in
+    ``build_error_feedback`` and matched custom rules rather than in the old
+    per-file preserved findings.  Keep this section compact but present in
+    every focused prompt so single-file generation cannot ignore the reason
+    the prior patch was rejected.
+    """
+    sections: list[str] = []
+    if memory.custom_repair_block:
+        sections.append(
+            "## Custom Repair Discipline\n"
+            f"{memory.custom_repair_block.strip()}"
+        )
+    if memory.build_error_feedback:
+        sections.append(
+            "## Blocking Verification Feedback\n"
+            "The previous patch was rejected by Stage2 verification. Fix these "
+            "items in the current target file without reverting the intended "
+            "requirement-level behavior:\n"
+            f"{memory.build_error_feedback.strip()}"
+        )
+    if not sections:
+        return ""
+    return "\n\n" + "\n\n".join(sections) + "\n\n"
 
 
 # Per-edit attempt count. Each subsequent attempt bumps max_turns and
@@ -480,6 +633,7 @@ def _warn_if_heavy(edit: FileEditPlan) -> None:
 
 def _build_single_edit_prompt(
     memory: SharedWorkingMemory,
+    repo_dir: Path,
     edit: FileEditPlan,
     *,
     sub_edit_label: str = "",
@@ -489,13 +643,36 @@ def _build_single_edit_prompt(
     findings = "\n".join(f"- {item}" for item in edit.preserved_findings) or "- (none)"
     targets = ", ".join(edit.target_functions) or "(unspecified)"
     co_edits = ", ".join(edit.co_edit_dependencies) or "(none)"
+    expected_symbols = ", ".join(edit.expected_symbols) or "(none)"
     req_section = _build_requirement_section(memory, edit)
-    scope_note = (
-        f"Scope: this run patches ONLY function(s) {targets} in {edit.filepath}. "
-        "Do NOT touch other parts of the file.\n\n"
-        if sub_edit_label
-        else ""
-    )
+    repair_context = _build_repair_context_section(memory)
+    if _writes_full_file(edit, repo_dir):
+        target_exists = (repo_dir / edit.filepath).exists()
+        scope_note = (
+            f"Scope: this run creates ONLY {edit.filepath}. "
+            "Do NOT edit other files in this turn.\n\n"
+        )
+        edit_instructions = (
+            f"- target_exists={target_exists}; this filepath is treated as a planned full-file write.\n"
+            "- Do NOT call Read on the missing target file.\n"
+            "- Build the complete file content from the plan, preserved_findings, "
+            "and nearby co-edit context if needed.\n"
+            "- You MUST call mcp__patch__create_file with the complete file content before finishing.\n"
+            "- If the file is successfully created, output PATCH_APPLIED.\n"
+        )
+    else:
+        scope_note = (
+            f"Scope: this run patches ONLY function(s) {targets} in {edit.filepath}. "
+            "Do NOT touch other parts of the file.\n\n"
+            if sub_edit_label
+            else ""
+        )
+        edit_instructions = (
+            "- Read the target file first.\n"
+            "- Apply minimal SEARCH/REPLACE edits only to the listed target_functions.\n"
+            "- You MUST call mcp__patch__apply_search_replace at least once before finishing.\n"
+            "- If the file is successfully patched, output PATCH_APPLIED.\n"
+        )
     return (
         f"{retry_preamble}"
         "Execute the following single-file patch plan. Only patch the target file in this run.\n\n"
@@ -506,16 +683,18 @@ def _build_single_edit_prompt(
         f"target_functions: {targets}\n"
         f"change_rationale: {edit.change_rationale}\n"
         f"co_edit_dependencies: {co_edits}\n"
+        f"expected_symbols: {expected_symbols}\n"
         "preserved_findings:\n"
         f"{findings}\n"
         f"{req_section}\n\n"
+        f"{repair_context}"
         "Instructions:\n"
-        "- Read the target file first.\n"
-        "- Apply minimal SEARCH/REPLACE edits only to the listed target_functions.\n"
         "- Respect preserved_findings as hard constraints.\n"
-        "- You MUST call mcp__patch__apply_search_replace at least once before finishing.\n"
+        "- Respect expected_symbols as hard constraints. If any are listed, "
+        "the final file must define those exact symbol spellings in this file; "
+        "do not substitute near-miss names or move them elsewhere.\n"
+        f"{edit_instructions}"
         "- If this file cannot be patched, output PATCH_INCOMPLETE explicitly.\n"
-        "- If the file is successfully patched, output PATCH_APPLIED.\n"
     )
 
 
@@ -546,6 +725,134 @@ def _compact_preserved_findings(findings: list[str], limit: int = 12) -> str:
     return "\n".join(compact) or "- (none)"
 
 
+def _target_search_tokens(targets: list[str]) -> list[str]:
+    tokens: list[str] = []
+    for target in targets:
+        for raw in (
+            (target or "").strip(),
+            (target or "").strip().rsplit(".", 1)[-1],
+            (target or "").strip().rsplit("::", 1)[-1],
+        ):
+            token = raw.split("(", 1)[0].strip()
+            if token and token not in tokens and token != "(file-wide pass)":
+                tokens.append(token)
+    return tokens
+
+
+def _build_current_file_prompt_context(
+    current_content: str,
+    targets: list[str],
+) -> tuple[str, str]:
+    """Return (label, body) for the file context section in direct prompts."""
+    if not current_content or not targets:
+        return "Current file content", f"```text\n{current_content}\n```"
+
+    lines = current_content.splitlines()
+    if len(lines) <= 260:
+        return "Current file content", f"```text\n{current_content}\n```"
+
+    token_hits: list[tuple[int, int]] = []
+    for token in _target_search_tokens(targets):
+        for idx, line in enumerate(lines):
+            if token in line:
+                start = max(0, idx - 40)
+                end = min(len(lines), idx + 120)
+                token_hits.append((start, end))
+                break
+
+    if not token_hits:
+        return "Current file content", f"```text\n{current_content}\n```"
+
+    ranges = [(0, min(len(lines), 120)), *token_hits]
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if not merged or start > merged[-1][1] + 10:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+    sections: list[str] = []
+    excerpt_chars = 0
+    for idx, (start, end) in enumerate(merged, 1):
+        excerpt = "\n".join(lines[start:end]).rstrip()
+        if not excerpt:
+            continue
+        excerpt_chars += len(excerpt)
+        sections.append(
+            f"Excerpt {idx} (lines {start + 1}-{end}):\n```text\n{excerpt}\n```"
+        )
+        if excerpt_chars >= 18000:
+            break
+
+    excerpt_body = "\n\n".join(sections).strip()
+    if not excerpt_body or excerpt_chars >= int(len(current_content) * 0.85):
+        return "Current file content", f"```text\n{current_content}\n```"
+    return (
+        "Current file excerpts",
+        (
+            "The following are verbatim excerpts from the target file. "
+            "SEARCH text must be copied exactly from one excerpt.\n\n"
+            + excerpt_body
+        ),
+    )
+
+
+def _should_retry_file_wide(edit: FileEditPlan, prior_attempt_signal: str) -> bool:
+    """Escalate a focused retry when the failure suggests top-level wiring drift.
+
+    A target_functions-scoped edit can still need sibling import / constant /
+    helper adjustments in the same file. When the prior attempt failed before
+    applying any block because the SEARCH text did not match or the response
+    never yielded a valid SEARCH/REPLACE payload, retry the SAME file as a
+    file-wide pass rather than forcing a function-only scope that already
+    failed.
+    """
+    if not edit.target_functions or edit.creates_new_file:
+        return False
+    signal = (prior_attempt_signal or "").lower()
+    return any(
+        marker in signal
+        for marker in (
+            "search text not found",
+            "search text found",
+            "malformed search/replace block",
+            "did not contain search/replace blocks",
+        )
+    )
+
+
+def _should_retry_missing_required_diff(
+    edit: FileEditPlan,
+    missing_from_diff: list[str],
+) -> bool:
+    """A required edit that vanished from git diff should get another try."""
+    return bool(
+        missing_from_diff
+        and not edit.reference_only
+        and getattr(edit, "expected_diff_required", True)
+    )
+
+
+def _can_accept_idempotent_noop(
+    edit: FileEditPlan,
+    missing_from_diff: list[str],
+) -> bool:
+    """Only optional/read-only edits may satisfy coverage without a diff."""
+    return bool(
+        missing_from_diff
+        and (
+            edit.reference_only
+            or not getattr(edit, "expected_diff_required", True)
+        )
+    )
+
+
+def _should_promote_silent_same_file_failure(signal: str) -> bool:
+    normalized = (signal or "").strip().lower()
+    return normalized in {"", "empty result", "no apply_search_replace tool call"}
+
+
 def _build_openai_direct_patch_prompt(
     memory: SharedWorkingMemory,
     repo_dir: Path,
@@ -555,20 +862,50 @@ def _build_openai_direct_patch_prompt(
     retry_preamble: str = "",
     prior_error: str = "",
 ) -> str:
+    targets = ", ".join(edit.target_functions) or "(file-wide pass)"
+    co_edits = ", ".join(edit.co_edit_dependencies) or "(none)"
+    findings = _compact_preserved_findings(edit.preserved_findings)
+    req_section = _build_requirement_section(memory, edit)
+    repair_context = _build_repair_context_section(memory)
+    retry_section = (
+        f"\n\nPrevious apply_search_replace error:\n{prior_error}\n"
+        if prior_error
+        else ""
+    )
+
+    if _writes_full_file(edit, repo_dir):
+        target_exists = (repo_dir / edit.filepath).exists()
+        return (
+            f"{retry_preamble}"
+            "Generate the complete content for a planned new or empty file. "
+            "Do not answer PATCH_INCOMPLETE unless the requested file content "
+            "is impossible from the supplied evidence.\n\n"
+            f"Edit label: {sub_edit_label}\n"
+            f"filepath: {edit.filepath}\n"
+            f"target_exists: {target_exists}\n"
+            f"target_symbols: {targets}\n"
+            f"change_rationale: {edit.change_rationale}\n"
+            f"co_edit_dependencies: {co_edits}\n\n"
+            "Preserved findings / hard constraints:\n"
+            f"{findings}\n"
+            f"{req_section}"
+            f"{repair_context}"
+            f"{retry_section}\n\n"
+            "Output rules:\n"
+            "- Return only the full file content.\n"
+            "- If you use a Markdown code fence, put only the file content "
+            "inside the fence and no prose outside it.\n"
+            "- Do not edit tests.\n"
+        )
+
     target = repo_dir / edit.filepath
     try:
         current_content = target.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         current_content = f"<<ERROR reading file: {exc}>>"
-
-    targets = ", ".join(edit.target_functions) or "(file-wide pass)"
-    co_edits = ", ".join(edit.co_edit_dependencies) or "(none)"
-    findings = _compact_preserved_findings(edit.preserved_findings)
-    req_section = _build_requirement_section(memory, edit)
-    retry_section = (
-        f"\n\nPrevious apply_search_replace error:\n{prior_error}\n"
-        if prior_error
-        else ""
+    context_label, context_body = _build_current_file_prompt_context(
+        current_content,
+        edit.target_functions,
     )
 
     return (
@@ -584,6 +921,7 @@ def _build_openai_direct_patch_prompt(
         "Preserved findings / hard constraints:\n"
         f"{findings}\n"
         f"{req_section}"
+        f"{repair_context}"
         f"{retry_section}\n\n"
         "Output rules:\n"
         "- Return only SEARCH/REPLACE blocks. Do not wrap them in JSON, "
@@ -597,10 +935,8 @@ def _build_openai_direct_patch_prompt(
         "- SEARCH text must be copied verbatim from Current file content and "
         "must be unique in the file.\n"
         "- Do not edit tests.\n\n"
-        "Current file content:\n"
-        "```text\n"
-        f"{current_content}\n"
-        "```"
+        f"{context_label}:\n"
+        f"{context_body}"
     )
 
 
@@ -622,6 +958,18 @@ def _extract_search_replace_blocks(text: str) -> str:
     return stripped[start:end].strip()
 
 
+def _extract_full_file_content(text: str) -> str:
+    """Extract full file content from a direct model response."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 2 and lines[-1].strip() == "```":
+            return "\n".join(lines[1:-1]).rstrip() + "\n"
+    return stripped.rstrip() + "\n"
+
+
 async def _attempt_openai_direct_edit(
     memory: SharedWorkingMemory,
     repo_dir: Path,
@@ -631,7 +979,10 @@ async def _attempt_openai_direct_edit(
     retry_preamble: str,
     max_turns: int,
 ) -> tuple[str, str]:
-    from src.agents._openai_native import run_openai_tool_agent
+    if os.environ.get("OPENAI_AGENT_LOOP", "native").strip().lower() == "agents_sdk":
+        from src.agents._openai_agents_sdk import run_agents_tool_agent as run_openai_tool_agent
+    else:
+        from src.agents._openai_native import run_openai_tool_agent
 
     prior_error = ""
     last_result = ""
@@ -645,11 +996,17 @@ async def _attempt_openai_direct_edit(
             prior_error=prior_error,
         )
         try:
-            result = await run_openai_tool_agent(
-                system_prompt=(
+            system_prompt = (
+                "You are a code patch generator. Return only the complete "
+                "new file content requested by the prompt."
+                if _writes_full_file(edit, repo_dir)
+                else (
                     "You are a code patch generator. Return only exact "
                     "SEARCH/REPLACE blocks that can be applied mechanically."
-                ),
+                )
+            )
+            result = await run_openai_tool_agent(
+                system_prompt=system_prompt,
                 user_prompt=prompt,
                 allowed_tools=[],
                 max_turns=max_turns,
@@ -657,6 +1014,36 @@ async def _attempt_openai_direct_edit(
             )
         except Exception as exc:
             last_result = f"PATCH_INCOMPLETE: block generation failed: {exc}"
+            prior_error = last_result
+            continue
+
+        if _writes_full_file(edit, repo_dir):
+            content = _extract_full_file_content(result.result_text)
+            if not content.strip():
+                last_result = (
+                    "PATCH_INCOMPLETE: OpenAI response did not contain new "
+                    "file content. Response preview: "
+                    + _safe_preview(result.result_text, limit=600)
+                )
+                prior_error = last_result
+                continue
+            result = await create_file.handler(
+                {
+                    "filepath": edit.filepath,
+                    "content": content,
+                    "overwrite": (repo_dir / edit.filepath).exists(),
+                }
+            )
+            result_text = ""
+            if isinstance(result, dict):
+                result_text = " ".join(
+                    str(item.get("text", ""))
+                    for item in result.get("content", [])
+                    if isinstance(item, dict)
+                )
+            last_result = result_text or str(result)
+            if "Successfully created" in last_result:
+                return "success", "PATCH_APPLIED: " + last_result
             prior_error = last_result
             continue
 
@@ -697,7 +1084,7 @@ async def _attempt_sub_edit(
     attempt_idx: int,
     retry_preamble: str,
     failure_logger: PatchFailureLogger,
-) -> AttemptOutcome:
+) -> tuple[AttemptOutcome, str]:
     """Run one attempt at a single FileEditPlan.
 
     Phase-C: the unit of work is a FileEditPlan (the planner's atomic edit
@@ -720,6 +1107,7 @@ async def _attempt_sub_edit(
     """
     prompt = _build_single_edit_prompt(
         memory,
+        repo_dir,
         edit,
         sub_edit_label=sub_edit_label,
         retry_preamble=retry_preamble,
@@ -739,12 +1127,17 @@ async def _attempt_sub_edit(
     patch_mcp = create_sdk_mcp_server(
         name="patch",
         version="1.0.0",
-        tools=[apply_search_replace],
+        tools=[apply_search_replace, create_file],
     )
 
     options = ClaudeAgentOptions(
         system_prompt=PATCH_GENERATOR_SYSTEM_PROMPT,
-        allowed_tools=["Read", "mcp__patch__apply_search_replace", "TodoWrite"],
+        allowed_tools=[
+            "Read",
+            "mcp__patch__apply_search_replace",
+            "mcp__patch__create_file",
+            "TodoWrite",
+        ],
         mcp_servers={"patch": patch_mcp},
         cwd=str(repo_dir),
         max_turns=max_turns,
@@ -780,11 +1173,7 @@ async def _attempt_sub_edit(
     actions_after = _count_apply_actions(memory, edit.filepath)
     delta = actions_after - actions_before
     hash_after = _file_hash(abs_target)
-    hash_changed = (
-        hash_before is not None
-        and hash_after is not None
-        and hash_before != hash_after
-    )
+    hash_changed = hash_after is not None and hash_before != hash_after
 
     classification = _classify_attempt(
         hash_changed=hash_changed,
@@ -817,15 +1206,17 @@ async def _attempt_sub_edit(
             result_preview=result_preview,
         )
 
-    return classification
+    return classification, (result_preview or subtype or "empty result")
 
 
 def _retry_preamble_for(
     sub_edit_label: str,
     prior_attempt_signal: str,
+    *,
+    file_wide_retry: bool = False,
 ) -> str:
     """Compose a directive preamble for retry attempts."""
-    return (
+    preamble = (
         f"PRIOR ATTEMPT FOR {sub_edit_label} FAILED ({prior_attempt_signal}).\n"
         "Common cause: too many turns spent thinking before producing the first "
         "SEARCH/REPLACE block. To avoid this:\n"
@@ -833,8 +1224,18 @@ def _retry_preamble_for(
         "2. Immediately produce SEARCH/REPLACE blocks and call "
         "mcp__patch__apply_search_replace.\n"
         "3. Skip TodoWrite and skip extended deliberation.\n"
-        "4. Output PATCH_APPLIED on success or PATCH_INCOMPLETE on failure.\n\n"
+        "4. For planned new files, call mcp__patch__create_file instead of "
+        "Read/apply_search_replace.\n"
+        "5. Output PATCH_APPLIED on success or PATCH_INCOMPLETE on failure.\n\n"
     )
+    if file_wide_retry:
+        preamble += (
+            "This retry is escalated to a SAME-FILE file-wide pass because the "
+            "prior attempt likely needed top-level imports/helpers/constant "
+            "wiring outside the named function. You may patch any necessary "
+            "top-level code in this one file, but do NOT touch other files.\n\n"
+        )
+    return preamble
 
 
 async def _run_single_edit(
@@ -858,10 +1259,11 @@ async def _run_single_edit(
        (planner ignored thematic-split guidance). Does not block.
     2. Up to _SUB_EDIT_MAX_ATTEMPTS attempts. CHANGED or IDEMPOTENT both
        count as success; FAILED triggers retry.
-    3. Final acceptance: success classification AND the file appears in
-       `git diff` for its planned path. A fully-IDEMPOTENT FileEditPlan
-       with no diff signals the planner asked for a no-op edit; the
-       coverage check catches that and downgrades to failure.
+    3. Final acceptance: CHANGED edits must appear in `git diff`.
+       IDEMPOTENT means the generator inspected the current file and affirmed
+       that the planned target state is already present; it is persisted as a
+       satisfied no-op (`reference_only`) so later artifact coverage does not
+       mistake it for a silently dropped edit.
     """
     _warn_if_heavy(edit)
 
@@ -877,23 +1279,51 @@ async def _run_single_edit(
 
     outcome: AttemptOutcome = "FAILED"
     prior_signal = "no apply_search_replace tool call"
+    infra_failure_signals: list[str] = []
     for attempt in range(1, _SUB_EDIT_MAX_ATTEMPTS + 1):
+        escalated_retry = attempt > 1 and _should_retry_file_wide(edit, prior_signal)
+        attempt_edit = (
+            edit.model_copy(update={"target_functions": []})
+            if escalated_retry
+            else edit
+        )
         preamble = (
             ""
             if attempt == 1
-            else _retry_preamble_for(edit_label, prior_signal)
+            else _retry_preamble_for(
+                edit_label,
+                prior_signal,
+                file_wide_retry=escalated_retry,
+            )
         )
-        outcome = await _attempt_sub_edit(
+        outcome, prior_signal = await _attempt_sub_edit(
             memory,
             repo_dir,
-            edit,
+            attempt_edit,
             sub_edit_label=edit_label,
             attempt_idx=attempt,
             retry_preamble=preamble,
             failure_logger=failure_logger,
         )
         if outcome in ("CHANGED", "IDEMPOTENT"):
+            attempt_diff = _run_git_diff(repo_dir, [edit.filepath])
+            attempt_missing = _planned_files_present_in_diff(
+                attempt_diff, [edit.filepath]
+            )
+            if (
+                attempt < _SUB_EDIT_MAX_ATTEMPTS
+                and _should_retry_missing_required_diff(edit, attempt_missing)
+            ):
+                prior_signal = (
+                    f"{outcome} but {edit.filepath} is still absent from git "
+                    "diff. Keep a real diff in this required file; do not "
+                    "revert it to base, drop the planned change, or claim "
+                    "the file is already correct unless the diff really exists."
+                )
+                continue
             break
+        if _is_infra_failure_signal(prior_signal):
+            infra_failure_signals.append(prior_signal)
 
     if outcome == "CHANGED":
         memory.record_action(
@@ -923,7 +1353,11 @@ async def _run_single_edit(
         # change at all we will catch it there.
         filepath_norm = edit.filepath.replace("\\", "/")
         prior = prior_changed_files or set()
-        if filepath_norm in prior:
+        if (
+            filepath_norm in prior
+            and _should_promote_silent_same_file_failure(prior_signal)
+            and not _is_explicit_patch_format_failure(prior_signal)
+        ):
             print(
                 f"[patch-generator] {edit_label}: silent after prior CHANGED edit "
                 f"for same file — promoting to IDEMPOTENT (prior edit likely covered it)",
@@ -936,6 +1370,11 @@ async def _run_single_edit(
                 outcome=f"EDIT_IDEMPOTENT_PROMOTED:{edit_label}",
             )
         else:
+            if infra_failure_signals and not edit.reference_only:
+                raise PatchGeneratorInfraError(
+                    f"{edit.filepath}: model/relay infrastructure failure: "
+                    f"{infra_failure_signals[-1]}"
+                )
             print(
                 f"[patch-generator] {edit_label}: gave up after {_SUB_EDIT_MAX_ATTEMPTS} attempts",
                 flush=True,
@@ -975,6 +1414,20 @@ async def _run_single_edit(
             phase="patch-generation",
             subagent="patch-generator",
             outcome=f"EDIT_NO_OP_OK:{edit_label}",
+        )
+        missing_from_diff = False
+
+    if outcome == "IDEMPOTENT" and _can_accept_idempotent_noop(edit, missing_from_diff):
+        print(
+            f"[patch-generator] {edit_label}: verified target state already "
+            "present; recording satisfied no-op for artifact coverage.",
+            flush=True,
+        )
+        edit.reference_only = True
+        memory.record_action(
+            phase="patch-generation",
+            subagent="patch-generator",
+            outcome=f"EDIT_SATISFIED_NO_OP:{edit_label}",
         )
         missing_from_diff = False
 

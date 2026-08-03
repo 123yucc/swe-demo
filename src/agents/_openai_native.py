@@ -9,15 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import os
 import re
+import ssl
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from pydantic import BaseModel
 
 from src.agents import _cost_tracker
+from src.agents.call_metrics import current as current_call_metrics
+from src.agents._cost_policy import tool_output_max_chars
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -29,15 +34,7 @@ class OpenAIToolResult(BaseModel):
     subtype: str = "success"
 
 
-def _client():
-    try:
-        from openai import AsyncOpenAI
-    except ImportError as exc:
-        raise RuntimeError(
-            "MODEL_BACKEND=openai requires the 'openai' package. "
-            "Run: pip install -r requirements.txt"
-        ) from exc
-
+def _api_key() -> str:
     api_key = (
         os.environ.get("OPENAI_API_KEY")
         or os.environ.get("CODEX_PRO_API_KEY")
@@ -48,6 +45,10 @@ def _client():
             "MODEL_BACKEND=openai requires OPENAI_API_KEY "
             "(or CODEX_PRO_API_KEY / ANTHROPIC_API_KEY fallback)."
         )
+    return api_key
+
+
+def _base_url() -> str | None:
     base_url = (
         os.environ.get("OPENAI_BASE_URL")
         or os.environ.get("BUZZ_BASE_URL")
@@ -56,10 +57,74 @@ def _client():
     )
     if base_url and not base_url.rstrip("/").endswith("/v1"):
         base_url = base_url.rstrip("/") + "/v1"
-    kwargs: dict[str, Any] = {"api_key": api_key}
+    return base_url
+
+
+def _ca_bundle_context(ca_path: str) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=ca_path)
+    partial_chain = getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", None)
+    if partial_chain is not None:
+        context.verify_flags |= partial_chain
+    return context
+
+
+def _ssl_verify_setting() -> bool | ssl.SSLContext:
+    cert_path = (os.environ.get("OPENAI_CA_CERT_PATH") or "").strip()
+    if cert_path:
+        if not Path(cert_path).exists():
+            raise RuntimeError(f"OPENAI_CA_CERT_PATH does not exist: {cert_path}")
+        return _ca_bundle_context(cert_path)
+
+    raw = os.environ.get("OPENAI_SSL_VERIFY", "").strip()
+    if not raw:
+        return True
+    lowered = raw.lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    if not Path(raw).exists():
+        raise RuntimeError(
+            "OPENAI_SSL_VERIFY must be a boolean-like value or an existing CA bundle path; "
+            f"got {raw!r}"
+        )
+    return _ca_bundle_context(raw)
+
+
+def _async_http_client():
+    verify = _ssl_verify_setting()
+    if verify is True:
+        return None
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError(
+            "Custom OpenAI SSL configuration requires the 'httpx' package. "
+            "Run: pip install -r requirements.txt"
+        ) from exc
+    return httpx.AsyncClient(verify=verify)
+
+
+def _client_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"api_key": _api_key()}
+    base_url = _base_url()
     if base_url:
         kwargs["base_url"] = base_url
-    return AsyncOpenAI(**kwargs)
+    http_client = _async_http_client()
+    if http_client is not None:
+        kwargs["http_client"] = http_client
+    return kwargs
+
+
+def _client():
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "MODEL_BACKEND=openai requires the 'openai' package. "
+            "Run: pip install -r requirements.txt"
+        ) from exc
+    return AsyncOpenAI(**_client_kwargs())
 
 
 def _model() -> str:
@@ -96,6 +161,153 @@ def _api_surface() -> str:
         f"Unsupported OPENAI_API_SURFACE={raw!r}. "
         "Use 'responses' or 'chat_completions'."
     )
+
+
+def _responses_state_mode() -> str:
+    mode = os.environ.get("OPENAI_RESPONSES_STATE_MODE", "stateless").strip().lower()
+    if mode not in {"stateless", "stateful"}:
+        raise RuntimeError("OPENAI_RESPONSES_STATE_MODE must be stateless or stateful")
+    return mode
+
+
+def _prompt_cache_enabled() -> bool:
+    return os.environ.get("OPENAI_PROMPT_CACHE", "auto").strip().lower() not in {
+        "0", "false", "no", "off", "disabled",
+    }
+
+
+def _prompt_cache_key(
+    instructions: str,
+    tools: list[dict[str, Any]],
+    response_model: type[BaseModel] | None,
+) -> str:
+    """Route calls with the same stable prefix to the same prompt cache."""
+    schema = response_model.model_json_schema() if response_model is not None else None
+    stable = json.dumps(
+        {"instructions": instructions, "tools": tools, "schema": schema},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "swe-agent:" + hashlib.sha256(stable.encode("utf-8")).hexdigest()[:32]
+
+
+def _prompt_cache_retention() -> str | None:
+    raw = os.environ.get("OPENAI_PROMPT_CACHE_RETENTION", "auto").strip().lower()
+    if raw in {"", "none", "off", "disabled"}:
+        return None
+    if raw != "auto":
+        return raw
+    model = _model().lower()
+    supported = (
+        "gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5-codex", "gpt-4.1",
+    )
+    return "24h" if model.startswith(supported) else None
+
+
+def _cache_request_kwargs(
+    instructions: str,
+    tools: list[dict[str, Any]],
+    response_model: type[BaseModel] | None,
+) -> dict[str, Any]:
+    if not _prompt_cache_enabled():
+        return {}
+    kwargs: dict[str, Any] = {
+        "prompt_cache_key": _prompt_cache_key(instructions, tools, response_model),
+    }
+    retention = _prompt_cache_retention()
+    if retention:
+        kwargs["prompt_cache_retention"] = retention
+    return kwargs
+
+
+def _cache_parameter_rejected(exc: Exception) -> bool:
+    text = str(exc).lower()
+    names = ("prompt_cache_key", "prompt_cache_retention")
+    rejection = ("unsupported", "unknown", "unrecognized", "unexpected", "invalid parameter")
+    return any(name in text for name in names) and any(word in text for word in rejection)
+
+
+async def _create_with_cache_fallback(create, kwargs: dict[str, Any]) -> object:
+    try:
+        return await create(**kwargs)
+    except Exception as exc:
+        if not _cache_parameter_rejected(exc):
+            raise
+        fallback = dict(kwargs)
+        fallback.pop("prompt_cache_key", None)
+        fallback.pop("prompt_cache_retention", None)
+        print(
+            "[openai] gateway rejected prompt-cache parameters; retrying with "
+            "automatic prefix caching only.",
+            flush=True,
+        )
+        return await create(**fallback)
+
+
+async def _timed_tool(handler: ToolHandler, args: dict[str, Any], cwd: Path | None,
+                      name: str) -> str:
+    started = time.perf_counter()
+    output_chars = 0
+    sent_chars = 0
+    try:
+        output = await handler(args, cwd)
+        output_chars = len(output)
+        output = _bound_tool_output(name, args, output)
+        sent_chars = len(output)
+        return output
+    finally:
+        metrics = current_call_metrics()
+        if metrics:
+            metrics.tool(
+                name,
+                time.perf_counter() - started,
+                output_chars=output_chars,
+                sent_chars=sent_chars,
+            )
+
+
+def _tool_output_limit() -> int:
+    return tool_output_max_chars()
+
+
+def _bound_tool_output(name: str, args: dict[str, Any], output: str) -> str:
+    """Bound replayed observations without hiding edit outcomes or errors."""
+    limit = _tool_output_limit()
+    if (
+        not limit
+        or len(output) <= limit
+        or name in {"mcp__patch__apply_search_replace", "mcp__patch__create_file"}
+        or output.startswith("ERROR:")
+    ):
+        return output
+
+    if name == "Read":
+        notice_budget = 220
+        prefix = output[: max(1, limit - notice_budget)]
+        if "\n" in prefix:
+            prefix = prefix.rsplit("\n", 1)[0]
+        shown_lines = max(1, prefix.count("\n"))
+        try:
+            next_offset = max(1, int(args.get("offset") or 1)) + shown_lines
+        except (TypeError, ValueError):
+            next_offset = shown_lines + 1
+        notice = (
+            f"\n[tool output clipped: {len(output) - len(prefix)} chars omitted; "
+            f"continue with Read offset={next_offset} and a narrower limit]"
+        )
+        return prefix + notice
+
+    notice = (
+        f"\n[tool output clipped: {len(output)} original chars; narrow the "
+        f"{name} query or inspect a specific file]"
+    )
+    content_budget = max(2, limit - len(notice))
+    head_budget = content_budget * 2 // 3
+    tail_budget = content_budget - head_budget
+    head = output[:head_budget].rsplit("\n", 1)[0]
+    tail = output[-tail_budget:].split("\n", 1)[-1]
+    return head + notice + tail
 
 
 def _tool_choice(tools: list[dict[str, Any]]) -> str | None:
@@ -408,6 +620,14 @@ async def _tool_apply_search_replace(args: dict[str, Any], cwd: Path | None) -> 
     return _content_text(result)
 
 
+async def _tool_create_file(args: dict[str, Any], cwd: Path | None) -> str:
+    _ = cwd
+    from src.tools.patch_tools import create_file
+
+    result = await create_file(args)
+    return _content_text(result)
+
+
 async def _tool_search_ltm(args: dict[str, Any], cwd: Path | None) -> str:
     _ = cwd
     from src.tools.ltm_tools import search_ltm_experiences
@@ -482,6 +702,19 @@ _TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["filepath", "blocks"],
         },
         "handler": _tool_apply_search_replace,
+    },
+    "mcp__patch__create_file": {
+        "description": "Create a new file in the target repository.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filepath": {"type": "string"},
+                "content": {"type": "string"},
+                "overwrite": {"type": "boolean"},
+            },
+            "required": ["filepath", "content"],
+        },
+        "handler": _tool_create_file,
     },
     "mcp__ltm__search_ltm_experiences": {
         "description": "Search long-term memory summary cards.",
@@ -583,7 +816,8 @@ async def _create_response(
         kwargs["reasoning"] = reasoning
     if response_model is not None:
         kwargs["text"] = {"format": _json_schema_format(response_model)}
-    return await _client().responses.create(**kwargs)
+    kwargs.update(_cache_request_kwargs(instructions, tools, response_model))
+    return await _create_with_cache_fallback(_client().responses.create, kwargs)
 
 
 def _chat_message_text(message: object) -> str:
@@ -650,13 +884,19 @@ async def _create_chat_completion(
         # OpenAI reasoning chat models accept reasoning_effort; compatible
         # gateways that do not support it can leave OPENAI_REASONING_EFFORT unset.
         kwargs["reasoning_effort"] = reasoning["effort"]
-    return await _client().chat.completions.create(**kwargs)
+    instructions = _chat_message_text(messages[0]) if messages else ""
+    kwargs.update(_cache_request_kwargs(instructions, tools, response_model))
+    return await _create_with_cache_fallback(_client().chat.completions.create, kwargs)
 
 
 def _chat_usage_response(completion: object) -> object:
+    class _InputDetails:
+        cached_tokens = 0
+
     class _Usage:
         input_tokens = 0
         output_tokens = 0
+        input_tokens_details = _InputDetails()
 
     class _Response:
         usage = _Usage()
@@ -665,6 +905,10 @@ def _chat_usage_response(completion: object) -> object:
     if usage is not None:
         _Response.usage.input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         _Response.usage.output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        details = getattr(usage, "prompt_tokens_details", None)
+        _Response.usage.input_tokens_details.cached_tokens = int(
+            getattr(details, "cached_tokens", 0) or 0
+        )
     return _Response()
 
 
@@ -687,12 +931,17 @@ async def _run_chat_structured_query(
     )
     last_error = ""
     for attempt in range(1, max_attempts + 1):
+        metrics = current_call_metrics()
+        if metrics:
+            metrics.retry(attempt)
         prompt = user_prompt if attempt == 1 else (user_prompt + retry_nudge)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
         for _turn in range(max_turns):
+            if metrics:
+                metrics.turn()
             completion = await _create_chat_completion(
                 messages=messages,
                 tools=tools,
@@ -715,7 +964,7 @@ async def _run_chat_structured_query(
                 if handler is None:
                     output = f"ERROR: tool {call['name']} is not available."
                 else:
-                    output = await handler(call["arguments"], repo_cwd)
+                    output = await _timed_tool(handler, call["arguments"], repo_cwd, call["name"])
                 messages.append(
                     {
                         "role": "tool",
@@ -779,13 +1028,19 @@ async def run_openai_structured_query(
     )
     last_error = ""
     for attempt in range(1, max_attempts + 1):
+        metrics = current_call_metrics()
+        if metrics:
+            metrics.retry(attempt)
         prompt = user_prompt if attempt == 1 else (user_prompt + retry_nudge)
         input_payload: Any = [{"role": "user", "content": prompt}]
+        previous_response_id: str | None = None
         for _turn in range(max_turns):
+            if metrics:
+                metrics.turn()
             response = await _create_response(
                 instructions=system_prompt,
                 input_payload=input_payload,
-                previous_response_id=None,
+                previous_response_id=previous_response_id,
                 tools=tools,
                 response_model=response_model,
             )
@@ -804,7 +1059,7 @@ async def run_openai_structured_query(
                 if handler is None:
                     output = f"ERROR: tool {call['name']} is not available."
                 else:
-                    output = await handler(call["arguments"], repo_cwd)
+                    output = await _timed_tool(handler, call["arguments"], repo_cwd, call["name"])
                 outputs.append(
                     {
                         "type": "function_call_output",
@@ -812,11 +1067,13 @@ async def run_openai_structured_query(
                         "output": output,
                     }
                 )
-            input_payload = [
-                *input_payload,
-                *_response_output_items(response),
-                *outputs,
-            ]
+            if _responses_state_mode() == "stateful":
+                previous_response_id = getattr(response, "id", None)
+                if not previous_response_id:
+                    raise RuntimeError("stateful Responses mode requires response.id")
+                input_payload = outputs
+            else:
+                input_payload = [*input_payload, *_response_output_items(response), *outputs]
         else:
             last_error = "error_max_turns"
 
@@ -882,7 +1139,7 @@ async def run_openai_tool_agent(
                     output = f"ERROR: tool {call['name']} is not available."
                 else:
                     try:
-                        output = await handler(call["arguments"], repo_cwd)
+                        output = await _timed_tool(handler, call["arguments"], repo_cwd, call["name"])
                     except Exception as exc:
                         output = f"ERROR: tool {call['name']} failed: {exc}"
                 messages.append(
@@ -899,12 +1156,16 @@ async def run_openai_tool_agent(
     repo_cwd = Path(cwd).resolve() if cwd else None
     input_payload: Any = [{"role": "user", "content": user_prompt}]
     last_response: object | None = None
+    previous_response_id: str | None = None
 
     for _turn in range(max_turns):
+        metrics = current_call_metrics()
+        if metrics:
+            metrics.turn()
         response = await _create_response(
             instructions=system_prompt,
             input_payload=input_payload,
-            previous_response_id=None,
+            previous_response_id=previous_response_id,
             tools=tools,
             response_model=response_model,
         )
@@ -926,7 +1187,7 @@ async def run_openai_tool_agent(
                 output = f"ERROR: tool {call['name']} is not available."
             else:
                 try:
-                    output = await handler(call["arguments"], repo_cwd)
+                    output = await _timed_tool(handler, call["arguments"], repo_cwd, call["name"])
                 except Exception as exc:
                     output = f"ERROR: tool {call['name']} failed: {exc}"
             outputs.append(
@@ -936,11 +1197,13 @@ async def run_openai_tool_agent(
                     "output": output,
                 }
             )
-        input_payload = [
-            *input_payload,
-            *_response_output_items(response),
-            *outputs,
-        ]
+        if _responses_state_mode() == "stateful":
+            previous_response_id = getattr(response, "id", None)
+            if not previous_response_id:
+                raise RuntimeError("stateful Responses mode requires response.id")
+            input_payload = outputs
+        else:
+            input_payload = [*input_payload, *_response_output_items(response), *outputs]
 
     text = _message_text(last_response) if last_response is not None else ""
     return OpenAIToolResult(result_text=text, subtype="error_max_turns")

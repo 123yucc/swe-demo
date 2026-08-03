@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,15 +37,38 @@ TERMINAL_OUTPUTS = {
     "patch.diff",
     "patch_outcome.json",
 }
+ANALYSIS_HANDOFF_CHECKPOINT = "checkpoint.analysis_handoff.json"
+ANALYSIS_HANDOFF_EVIDENCE = "evidence.analysis_handoff.json"
+PHASE3_TOP_LEVEL_ARTIFACTS = (
+    "dynamic_closure.json",
+    "eval_result",
+)
+FINAL_EVAL_PATCH_OUTCOMES = {
+    "BUILD_FAILED",
+    "BUILD_FAILED_NO_REPAIR",
+    "BUILD_FAILED_AFTER_REPAIR",
+    "PATCH_FAILED",
+    "PATCH_INCOMPLETE",
+    "PARTIAL_PATCH",
+}
 
 DOCKER_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
+ISSUE_LOCKS_LOCK = threading.Lock()
+ISSUE_LOCKS: dict[Path, threading.Lock] = {}
+OWNED_IMAGES_LOCK = threading.Lock()
 SECRET_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "CODEX_PRO_API_KEY",
 }
 DOCKER_PULL_TIMEOUT_SECONDS = 20 * 60
+DOCKER_PULL_MAX_ATTEMPTS = 4
+DOCKER_PULL_RETRY_DELAYS_SECONDS = (5, 15, 30)
+
+
+class DockerInfraError(RuntimeError):
+    """Docker/registry infrastructure failure outside harness patch quality."""
 
 
 @dataclass(frozen=True)
@@ -222,7 +246,7 @@ def auto_workers(per_task_gb: float, reserve_gb: float, hard_cap: int | None) ->
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json_atomic(path: Path, data: Any) -> None:
@@ -256,17 +280,25 @@ def issue_from_entry(entry: Any, workdir: Path) -> IssueSpec:
     return IssueSpec(issue_name=issue_dir.name, issue_dir=issue_dir, metadata_path=metadata_path)
 
 
-def normalize_model_entry(entry: Any) -> ModelSpec:
+def normalize_model_entry(
+    entry: Any,
+    default_env: dict[str, str] | None = None,
+) -> ModelSpec:
     if isinstance(entry, str):
         name = entry
-        env = {"ANTHROPIC_MODEL": entry}
+        env = {**(default_env or {}), "ANTHROPIC_MODEL": entry}
         return ModelSpec(name=name, env=env, output_subdir=model_output_dir_name(name))
 
     if not isinstance(entry, dict):
         raise TypeError(f"Invalid model entry: {entry!r}")
 
     name = str(entry.get("name") or entry.get("model") or entry.get("ANTHROPIC_MODEL") or entry.get("OPENAI_MODEL") or "unknown")
-    env = {str(k): str(v) for k, v in dict(entry.get("env") or {}).items() if v is not None}
+    env = dict(default_env or {})
+    env.update({
+        str(k): str(v)
+        for k, v in dict(entry.get("env") or {}).items()
+        if v is not None
+    })
     backend = entry.get("backend") or entry.get("MODEL_BACKEND")
     if backend:
         env["MODEL_BACKEND"] = str(backend)
@@ -286,7 +318,18 @@ def expand_manifest(manifest_path: Path, workdir: Path) -> tuple[list[TaskSpec],
     if not isinstance(manifest, dict):
         raise TypeError("Manifest must be a JSON object or a task list")
 
-    models = [normalize_model_entry(m) for m in manifest.get("models", [])]
+    defaults = manifest.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        raise TypeError("Manifest defaults must be an object")
+    default_env = {
+        str(k): str(v)
+        for k, v in dict(defaults.get("env") or {}).items()
+        if v is not None
+    }
+    models = [
+        normalize_model_entry(m, default_env)
+        for m in manifest.get("models", [])
+    ]
     model_by_name = {m.name: m for m in models}
     model_by_output = {m.output_subdir: m for m in models}
 
@@ -297,7 +340,7 @@ def expand_manifest(manifest_path: Path, workdir: Path) -> tuple[list[TaskSpec],
                 raise TypeError(f"Invalid task entry: {raw_task!r}")
             raw_model = raw_task.get("model") or raw_task.get("model_name") or raw_task.get("output_subdir")
             if isinstance(raw_model, dict):
-                model = normalize_model_entry(raw_model)
+                model = normalize_model_entry(raw_model, default_env)
             elif raw_model in model_by_name:
                 model = model_by_name[str(raw_model)]
             elif raw_model in model_by_output:
@@ -306,15 +349,30 @@ def expand_manifest(manifest_path: Path, workdir: Path) -> tuple[list[TaskSpec],
                 merged = dict(raw_task)
                 if raw_model:
                     merged["model"] = raw_model
-                model = normalize_model_entry(merged)
+                model = normalize_model_entry(merged, default_env)
             issue = issue_from_entry(raw_task.get("issue") or raw_task.get("issue_name") or raw_task, workdir)
             tasks.append(TaskSpec(model=model, issue=issue))
     else:
         if not models:
             raise ValueError("Manifest needs either tasks[] or models[]")
-        issues = [issue_from_entry(i, workdir) for i in manifest.get("issues", [])]
+        raw_issues = manifest.get("issues", [])
+        if raw_issues == "all":
+            raw_issues = [
+                path.name
+                for path in sorted(workdir.glob("swe_issue_*"))
+                if (path / "artifacts" / "instance_metadata.json").is_file()
+            ]
+        if not isinstance(raw_issues, list):
+            raise TypeError("Manifest issues must be a list or the string 'all'")
+        issues = [issue_from_entry(i, workdir) for i in raw_issues]
         if not issues:
             raise ValueError("Manifest needs issues[] when tasks[] is omitted")
+        expected_count = manifest.get("expected_issue_count")
+        if expected_count is not None and len(issues) != int(expected_count):
+            raise ValueError(
+                f"Manifest expected {int(expected_count)} issues but discovered "
+                f"{len(issues)} under {workdir}"
+            )
         for model in models:
             for issue in issues:
                 tasks.append(TaskSpec(model=model, issue=issue))
@@ -349,24 +407,163 @@ def image_candidates(metadata: dict[str, Any], dockerhub_users: list[str]) -> li
     return list(dict.fromkeys(candidates))
 
 
-def pull_first_image(candidates: list[str], platform: str | None, log_path: Path) -> str:
+def pull_first_image(
+    candidates: list[str],
+    platform: str | None,
+    log_path: Path,
+    pulled_images: set[str] | None = None,
+    owned_images_file: Path | None = None,
+) -> str:
     last = ""
     for image in candidates:
         inspect = docker_cmd(["image", "inspect", image], log_path=log_path)
         if inspect.returncode == 0:
             return image
-        args = ["pull"]
-        if platform:
-            args.extend(["--platform", platform])
-        args.append(image)
-        result = docker_cmd(args, log_path=log_path, timeout=DOCKER_PULL_TIMEOUT_SECONDS)
-        if result.returncode == 0:
-            return image
-        last = result.stdout
-        inspect = docker_cmd(["image", "inspect", image], log_path=log_path)
-        if inspect.returncode == 0:
-            return image
-    raise RuntimeError("No Docker image could be pulled or found locally:\n" + last[-2000:])
+        for attempt in range(1, DOCKER_PULL_MAX_ATTEMPTS + 1):
+            args = ["pull"]
+            if platform:
+                args.extend(["--platform", platform])
+            args.append(image)
+            try:
+                result = docker_cmd(
+                    args, log_path=log_path, timeout=DOCKER_PULL_TIMEOUT_SECONDS
+                )
+                last = result.stdout
+            except RuntimeError as exc:
+                result = None
+                last = f"Docker image pull timed out or failed for {image}: {exc}"
+            if result is not None and result.returncode == 0:
+                if pulled_images is not None:
+                    pulled_images.add(image)
+                update_owned_images(owned_images_file, add={image})
+                return image
+            inspect = docker_cmd(["image", "inspect", image], log_path=log_path)
+            if inspect.returncode == 0:
+                return image
+            if (
+                attempt >= DOCKER_PULL_MAX_ATTEMPTS
+                or not docker_pull_failure_is_transient(last)
+            ):
+                break
+            delay = DOCKER_PULL_RETRY_DELAYS_SECONDS[
+                min(attempt - 1, len(DOCKER_PULL_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            with log_path.open("a", encoding="utf-8", errors="replace") as f:
+                f.write(
+                    f"[pull-retry] image={image} attempt={attempt} "
+                    f"next_attempt={attempt + 1} delay_seconds={delay}\n"
+                )
+            time.sleep(delay)
+    raise DockerInfraError(
+        "No Docker image could be pulled or found locally:\n" + last[-2000:]
+    )
+
+
+def docker_pull_failure_is_transient(output: str) -> bool:
+    text = output.lower()
+    return any(
+        marker in text
+        for marker in (
+            "eof",
+            "failed to do request",
+            "i/o timeout",
+            "tls handshake timeout",
+            "connection reset",
+            "connection refused",
+            "temporary failure",
+            "temporarily unavailable",
+            "too many requests",
+            "toomanyrequests",
+            "429",
+            "500 internal server error",
+            "502 bad gateway",
+            "503 service unavailable",
+            "504 gateway timeout",
+        )
+    )
+
+
+def analysis_model_infra_failure_detail(
+    log_path: Path,
+    *,
+    run_id: str,
+) -> str | None:
+    """Classify only a terminal model/API failure from the current analysis run.
+
+    Analysis logs are append-only and may contain older failures or recovered
+    429s.  Restrict inspection to the current run marker and require a terminal
+    retry-exhaustion signature so closure/patch quality is never mislabeled as
+    infrastructure.
+    """
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 512 * 1024))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    marker = f"[harness-preflight] run_id={run_id}"
+    if marker in text:
+        text = text.rsplit(marker, 1)[-1]
+    lower = text.lower()
+    exhausted = (
+        "agents sdk returned no valid structured output after" in lower
+        or "agents sdk returned no valid result after" in lower
+        or "modelinfrastructureerror:" in lower
+    )
+    rate_limited = any(
+        value in lower
+        for value in (
+            "rate_limit_error",
+            "ratelimiterror:",
+            "concurrency limit exceeded",
+            "error code: 429",
+        )
+    )
+    connection_failed = any(
+        value in lower
+        for value in (
+            "apiconnectionerror:",
+            "connection attempts failed",
+            "transient openai connection failure",
+        )
+    )
+    unavailable = any(
+        value in lower
+        for value in (
+            "error code: 500",
+            "error code: 502",
+            "error code: 503",
+            "error code: 504",
+            "service temporarily unavailable",
+            "no available channel",
+            "model infrastructure circuit open",
+        )
+    )
+    quota_failed = any(
+        value in lower
+        for value in (
+            "insufficient_user_quota",
+            "额度不足",
+        )
+    )
+    if not exhausted or not (
+        rate_limited or connection_failed or unavailable or quota_failed
+    ):
+        return None
+    if quota_failed:
+        category = "API quota"
+    elif rate_limited:
+        category = "API rate limit"
+    elif unavailable:
+        category = "API unavailable"
+    else:
+        category = "API connection"
+    return (
+        f"analysis ended after exhausting {category} retries for run_id={run_id}; "
+        f"see {log_path}"
+    )
 
 
 def memory_to_docker_arg(memory_gb: float | None) -> str | None:
@@ -397,10 +594,13 @@ def create_container(
     memory_gb: float | None = None,
     platform: str | None = None,
     entrypoint: str | None = None,
+    network_disabled: bool = False,
 ) -> None:
     args = ["create", "--name", name]
     if platform:
         args.extend(["--platform", platform])
+    if network_disabled:
+        args.append("--network=none")
     memory = memory_to_docker_arg(memory_gb)
     if memory:
         args.extend([f"--memory={memory}", f"--memory-swap={memory}"])
@@ -440,15 +640,76 @@ def start_container_detached(name: str, log_path: Path) -> None:
         raise RuntimeError(f"docker start {name} failed with exit {result.returncode}")
 
 
-def cleanup_docker(names: list[str], images: list[str], log_path: Path, prune: bool) -> None:
+def exec_container_and_wait(name: str, command: list[str], log_path: Path) -> int:
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write(f"$ docker exec -w /app {name} {' '.join(command)}\n")
+        log.flush()
+        proc = subprocess.Popen(
+            ["docker", "exec", "-w", "/app", name, *command],
+            cwd=REPO_ROOT,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        proc.wait()
+    return proc.returncode or 0
+
+
+def load_owned_images(path: Path | None) -> set[str]:
+    if path is None or not path.is_file():
+        return set()
+    try:
+        value = load_json(path)
+    except Exception:
+        return set()
+    if not isinstance(value, dict):
+        return set()
+    return {
+        image
+        for image in value.get("images", [])
+        if isinstance(image, str) and image.strip()
+    }
+
+
+def update_owned_images(
+    path: Path | None,
+    *,
+    add: set[str] | None = None,
+    remove: set[str] | None = None,
+) -> set[str]:
+    if path is None:
+        return set()
+    with OWNED_IMAGES_LOCK:
+        images = load_owned_images(path)
+        images.update(add or set())
+        images.difference_update(remove or set())
+        write_json_atomic(
+            path,
+            {
+                "schema_version": 1,
+                "updated_at": utc_now(),
+                "images": sorted(images),
+            },
+        )
+        return images
+
+
+def cleanup_docker(
+    names: list[str],
+    images: list[str],
+    log_path: Path,
+    prune: bool,
+) -> set[str]:
+    removed_images: set[str] = set()
     with DOCKER_LOCK:
         for name in names:
             docker_cmd(["rm", "-f", name], log_path=log_path)
         if prune:
             for image in dict.fromkeys(images):
-                docker_cmd(["rmi", "-f", image], log_path=log_path)
-            docker_cmd(["image", "prune", "-a", "-f"], log_path=log_path)
-            docker_cmd(["container", "prune", "-f"], log_path=log_path)
+                result = docker_cmd(["rmi", "-f", image], log_path=log_path)
+                if result.returncode == 0:
+                    removed_images.add(image)
+    return removed_images
 
 
 def write_generation_script(task: TaskSpec, force_restart: bool) -> Path:
@@ -738,7 +999,105 @@ cd /demo
     return script_path
 
 
-def should_skip_task(task: TaskSpec, force_restart: bool, redo_eval: bool, eval_only: bool) -> tuple[bool, str]:
+def failed_patch_artifacts_ready_for_final_eval(task: TaskSpec) -> bool:
+    """Allow a best-effort patch to receive an official final-pass score.
+
+    This deliberately excludes empty patches, evidence failures, and model or
+    Docker infrastructure failures.  It is only used when the supervisor has
+    exhausted all patch-repair recovery passes.
+    """
+    output_dir = task.output_dir
+    return (
+        patch_has_effective_diff(output_dir / "patch.diff")
+        and (output_dir / "compile_check.json").is_file()
+        and read_patch_outcome(output_dir) in FINAL_EVAL_PATCH_OUTCOMES
+    )
+
+
+def phase3_patch_ready(
+    task: TaskSpec,
+    *,
+    allow_failed_patch_eval: bool = False,
+) -> bool:
+    return stage2_artifacts_ready(task) or (
+        allow_failed_patch_eval
+        and failed_patch_artifacts_ready_for_final_eval(task)
+    )
+
+
+def phase3_artifacts_ready(
+    task: TaskSpec,
+    *,
+    allow_failed_patch_eval: bool = False,
+) -> bool:
+    output_dir = task.output_dir
+    return (
+        phase3_patch_ready(
+            task,
+            allow_failed_patch_eval=allow_failed_patch_eval,
+        )
+        and (output_dir / "dynamic_closure.json").exists()
+        and (output_dir / "eval_result" / "eval_summary.json").exists()
+    )
+
+
+def archive_stale_phase3_artifacts(
+    task: TaskSpec,
+    *,
+    reason: str,
+    log_path: Path | None = None,
+) -> list[str]:
+    """Move phase3 artifacts aside before a new patch generation run.
+
+    Stage2/generate reuses the same output directory. If an older phase3/eval
+    run already populated eval_result or dynamic_closure.json, leaving them in
+    place can make later runs look complete even though the patch changed.
+    """
+    output_dir = task.output_dir
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    moved: list[str] = []
+    for name in PHASE3_TOP_LEVEL_ARTIFACTS:
+        src = output_dir / name
+        if not src.exists():
+            continue
+        dst = output_dir / f"{src.name}.{reason}.{timestamp}.stale"
+        suffix = 1
+        while dst.exists():
+            dst = output_dir / f"{src.name}.{reason}.{timestamp}.{suffix}.stale"
+            suffix += 1
+        shutil.move(str(src), str(dst))
+        moved.append(f"{src.name} -> {dst.name}")
+    if moved and log_path is not None:
+        with log_path.open("a", encoding="utf-8", errors="replace") as log:
+            log.write(
+                "[runner] archived stale phase3 artifacts before regeneration: "
+                + ", ".join(moved)
+                + "\n"
+            )
+    return moved
+
+
+def archive_existing_eval_result(task: TaskSpec, run_id: str) -> Path | None:
+    """Copy a prior official evaluation aside before an explicitly requested rerun."""
+    source = task.output_dir / "eval_result"
+    if not (source / "eval_summary.json").is_file():
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
+    target = task.output_dir / "history" / f"eval_result.{timestamp}.{safe_run_id}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+    return target
+
+
+def should_skip_task(
+    task: TaskSpec,
+    force_restart: bool,
+    redo_eval: bool,
+    eval_only: bool,
+    phase: str,
+    allow_failed_patch_eval: bool = False,
+) -> tuple[bool, str]:
     if force_restart or eval_only:
         return False, "force restart requested"
     output_dir = task.output_dir
@@ -748,15 +1107,17 @@ def should_skip_task(task: TaskSpec, force_restart: bool, redo_eval: bool, eval_
         return False, "checkpoint found; resume harness"
     if redo_eval and not (output_dir / "eval_result" / "eval_summary.json").exists():
         return False, "redo eval requested"
-    if (output_dir / "runner_task.json").exists():
-        try:
-            status = load_json(output_dir / "runner_task.json").get("status")
-            if status == "success":
-                return True, "runner_task.json already success"
-        except Exception:
-            pass
     if (output_dir / "eval_result" / "eval_summary.json").exists():
-        return True, "eval_result/eval_summary.json exists"
+        if phase == "phase3":
+            if phase3_artifacts_ready(
+                task,
+                allow_failed_patch_eval=allow_failed_patch_eval,
+            ):
+                return True, "phase3 artifacts already complete"
+            return False, "eval exists but phase3 artifacts are incomplete or stale"
+        if stage2_artifacts_ready(task):
+            return True, "eval_result/eval_summary.json exists"
+        return False, "eval exists but stage2 artifacts are unusable or stale"
     if TERMINAL_OUTPUTS <= {p.name for p in output_dir.iterdir() if p.is_file()}:
         return False, "terminal harness outputs exist; eval missing"
     return False, "output_subdir exists but is incomplete"
@@ -786,6 +1147,274 @@ def patch_has_effective_diff(patch_path: Path) -> bool:
     return any(line.startswith("diff --git ") for line in text.splitlines())
 
 
+def read_patch_outcome(output_dir: Path) -> str:
+    outcome_path = output_dir / "patch_outcome.json"
+    if not outcome_path.exists():
+        return ""
+    try:
+        return str(load_json(outcome_path).get("patch_outcome") or "")
+    except Exception:
+        return ""
+
+
+def stage2_artifacts_ready(task: TaskSpec) -> bool:
+    """Require a usable frozen patch, not merely terminal output files."""
+    output_dir = task.output_dir
+    if not patch_has_effective_diff(output_dir / "patch.diff"):
+        return False
+    outcome_path = output_dir / "patch_outcome.json"
+    compile_path = output_dir / "compile_check.json"
+    if not outcome_path.exists() or not compile_path.exists():
+        return False
+    try:
+        outcome = read_patch_outcome(output_dir)
+        compile_rows = load_json(compile_path)
+    except Exception:
+        return False
+    if outcome not in {"PATCH_SUCCESS", "BUILD_UNVERIFIABLE"}:
+        return False
+    if isinstance(compile_rows, list):
+        go_rows = [
+            row for row in compile_rows
+            if isinstance(row, dict) and str(row.get("system") or "") == "go"
+        ]
+        if go_rows:
+            cmd = str(go_rows[-1].get("command") or "")
+            if "go test -c" not in cmd:
+                return False
+    return True
+
+
+def generation_infra_failure_payload(
+    *,
+    task: TaskSpec,
+    run: RunContext,
+    phase: str,
+    started_at: str,
+    logs_dir: Path,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "status": "infra_failed",
+        "retryable": True,
+        "phase": phase,
+        "issue": task.issue.issue_name,
+        "model": task.model.name,
+        "output_subdir": task.model.output_subdir,
+        "run_id": run.run_id,
+        "patch_outcome": "MODEL_INFRA_FAILURE",
+        "failure_kind": (
+            "api_quota"
+            if "API quota" in detail
+            else "api_rate_limit"
+            if "API rate limit" in detail
+            else "api_unavailable"
+            if "API unavailable" in detail
+            else "api_connection"
+            if "API connection" in detail
+            else "model_infra"
+        ),
+        "error": detail,
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "logs_dir": str(logs_dir),
+    }
+
+
+def docker_infra_failure_payload(
+    *,
+    task: TaskSpec,
+    run: RunContext,
+    phase: str,
+    started_at: str,
+    logs_dir: Path,
+    detail: str,
+) -> dict[str, Any]:
+    return {
+        "status": "infra_failed",
+        "retryable": True,
+        "phase": phase,
+        "issue": task.issue.issue_name,
+        "model": task.model.name,
+        "output_subdir": task.model.output_subdir,
+        "run_id": run.run_id,
+        "patch_outcome": "DOCKER_INFRA_FAILURE",
+        "failure_kind": "docker_infra",
+        "error": detail,
+        "started_at": started_at,
+        "finished_at": utc_now(),
+        "logs_dir": str(logs_dir),
+    }
+
+
+def _analysis_handoff_paths(task: TaskSpec) -> tuple[Path, Path]:
+    output_dir = task.output_dir
+    return (
+        output_dir / ANALYSIS_HANDOFF_CHECKPOINT,
+        output_dir / ANALYSIS_HANDOFF_EVIDENCE,
+    )
+
+
+def analysis_checkpoint_ready(task: TaskSpec) -> bool:
+    checkpoint_path = task.output_dir / "checkpoint.json"
+    stage_path = task.output_dir / "analysis_stage.json"
+    if not checkpoint_path.exists() or not stage_path.exists():
+        return False
+    try:
+        checkpoint = load_json(checkpoint_path)
+        stage = load_json(stage_path)
+    except Exception:
+        return False
+    handoff_ready = (
+        stage.get("handoff_ready") is True
+        or stage.get("dynamic_grounding_deferred") is True
+    )
+    return (
+        checkpoint.get("pipeline_state") == "Closed"
+        and stage.get("status") == "analysis_complete"
+        and handoff_ready
+    )
+
+
+def generation_checkpoint_ready(task: TaskSpec) -> bool:
+    """Accept initial analysis handoff or an in-progress generation resume."""
+    checkpoint_path = task.output_dir / "checkpoint.json"
+    stage_path = task.output_dir / "analysis_stage.json"
+    if not checkpoint_path.exists() or not stage_path.exists():
+        return False
+    try:
+        checkpoint = load_json(checkpoint_path)
+        stage = load_json(stage_path)
+    except Exception:
+        return False
+    handoff_ready = (
+        stage.get("handoff_ready") is True
+        or stage.get("dynamic_grounding_deferred") is True
+    )
+    return (
+        stage.get("status") == "analysis_complete"
+        and handoff_ready
+        and checkpoint.get("pipeline_state") in {
+            "UnderSpecified", "EvidenceRefining", "Closed",
+            "PatchPlanning", "PatchVerifying",
+        }
+    )
+
+
+def saved_analysis_handoff_ready(task: TaskSpec) -> bool:
+    checkpoint_path, evidence_path = _analysis_handoff_paths(task)
+    stage_path = task.output_dir / "analysis_stage.json"
+    if not checkpoint_path.exists() or not evidence_path.exists():
+        return False
+    try:
+        checkpoint = load_json(checkpoint_path)
+        stage = load_json(stage_path) if stage_path.exists() else {}
+    except Exception:
+        return False
+    # The snapshot is created only from an analysis_checkpoint_ready() state.
+    # A later failed retry may legitimately remove the live analysis_stage.json;
+    # the immutable CLOSED snapshot remains the authoritative handoff.
+    return (
+        checkpoint.get("pipeline_state") == "Closed"
+        and (
+            stage.get("status") == "analysis_complete"
+            or not stage_path.exists()
+        )
+    )
+
+
+def save_analysis_handoff_snapshot(task: TaskSpec) -> bool:
+    """Persist the exact analysis handoff so Stage2 can rerun deterministically."""
+    if not analysis_checkpoint_ready(task):
+        return False
+    checkpoint_src = task.output_dir / "checkpoint.json"
+    evidence_src = task.output_dir / "evidence.json"
+    checkpoint_dst, evidence_dst = _analysis_handoff_paths(task)
+    checkpoint_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(checkpoint_src, checkpoint_dst)
+    if evidence_src.exists():
+        shutil.copy2(evidence_src, evidence_dst)
+    return True
+
+
+def restore_analysis_handoff_snapshot(task: TaskSpec) -> bool:
+    """Restore the last saved analysis handoff into the live output files."""
+    checkpoint_src, evidence_src = _analysis_handoff_paths(task)
+    if not checkpoint_src.exists():
+        return False
+    checkpoint_dst = task.output_dir / "checkpoint.json"
+    evidence_dst = task.output_dir / "evidence.json"
+    shutil.copy2(checkpoint_src, checkpoint_dst)
+    if evidence_src.exists():
+        shutil.copy2(evidence_src, evidence_dst)
+    return True
+
+
+def quarantine_unretryable_analysis_checkpoint(task: TaskSpec) -> list[str]:
+    """Preserve failed analysis state for bounded targeted recovery.
+
+    Older behavior archived an exhausted closure-only checkpoint and silently
+    restarted the complete analysis.  That discarded expensive evidence and
+    caused the same case to be billed again.  The orchestrator now reopens only
+    the blocking requirements, so no automatic full restart is permitted here.
+    """
+    checkpoint_path = task.output_dir / "checkpoint.json"
+    try:
+        checkpoint = load_json(checkpoint_path)
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    if checkpoint.get("pipeline_state") != "ClosureForcedFail":
+        return []
+    print(
+        f"[analysis-retry] {task.issue.issue_name}: preserving "
+        "ClosureForcedFail checkpoint for bounded targeted recovery",
+        flush=True,
+    )
+    return []
+
+
+def run_analysis(
+    task: TaskSpec,
+    env: dict[str, str],
+    force_restart: bool,
+    retry_failed_closure: bool,
+    log_path: Path,
+    run: RunContext,
+) -> int:
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.main",
+        "--instance-json",
+        str(task.issue.metadata_path),
+        "--repo-dir",
+        str(task.issue.issue_dir / "repo"),
+        "--output-dir",
+        str(task.output_dir),
+        "--stop-after-closure",
+    ]
+    if force_restart:
+        cmd.append("--force-restart")
+    if retry_failed_closure:
+        cmd.append("--retry-failed-closure")
+
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write("[harness-preflight] mode=host-analysis docker=disabled\n")
+        log.write(f"[harness-preflight] run_id={run.run_id}\n")
+        log.write("$ " + " ".join(str(part) for part in cmd) + "\n")
+        log.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        proc.wait()
+    return proc.returncode or 0
+
+
 def run_generation(
     task: TaskSpec,
     candidates: list[str],
@@ -795,10 +1424,18 @@ def run_generation(
     force_restart: bool,
     log_path: Path,
     run: RunContext,
+    pulled_images: set[str] | None = None,
+    owned_images_file: Path | None = None,
 ) -> tuple[str, int]:
     cname = container_name("gen", task, run.run_id)
     with DOCKER_LOCK:
-        image = pull_first_image(candidates, platform=platform, log_path=log_path)
+        image = pull_first_image(
+            candidates,
+            platform=platform,
+            log_path=log_path,
+            pulled_images=pulled_images,
+            owned_images_file=owned_images_file,
+        )
         create_container(
             name=cname,
             image=image,
@@ -868,6 +1505,7 @@ def run_eval(
     log_path: Path,
     eval_module: Any,
     run: RunContext,
+    existing_container: str | None = None,
 ) -> dict[str, Any]:
     patch_path = task.output_dir / "patch.diff"
     if not patch_path.exists():
@@ -883,19 +1521,24 @@ def run_eval(
     eval_module.write_files_local(str(workspace_dir), files)
     eval_module.write_patch_snapshot(str(eval_dir), uid, "", patch)
 
-    cname = container_name("eval", task, run.run_id)
-    with DOCKER_LOCK:
-        create_container(
-            name=cname,
-            image=image,
-            command=["-c", "bash /workspace/entryscript.sh"],
-            log_path=log_path,
-            volumes=[(workspace_dir.resolve(), "/workspace")],
-            memory_gb=memory_gb,
-            platform=platform,
-            entrypoint="/bin/bash",
+    cname = existing_container or container_name("eval", task, run.run_id)
+    if existing_container is None:
+        with DOCKER_LOCK:
+            create_container(
+                name=cname,
+                image=image,
+                command=["-c", "bash /workspace/entryscript.sh"],
+                log_path=log_path,
+                volumes=[(workspace_dir.resolve(), "/workspace")],
+                memory_gb=memory_gb,
+                platform=platform,
+                entrypoint="/bin/bash",
+            )
+        exit_code = start_container_and_wait(cname, log_path)
+    else:
+        exit_code = exec_container_and_wait(
+            cname, ["bash", "/workspace/entryscript.sh"], log_path
         )
-    exit_code = start_container_and_wait(cname, log_path)
 
     output = eval_module.collect_outputs_local(str(workspace_dir), str(eval_dir), uid, "")
     if output is None:
@@ -929,6 +1572,52 @@ def run_eval(
     return summary
 
 
+def run_dynamic_closure_stage(
+    task: TaskSpec,
+    *,
+    metadata: dict[str, Any],
+    container: str,
+    env: dict[str, str],
+    log_path: Path,
+) -> dict[str, Any]:
+    output_path = task.output_dir / "dynamic_closure.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "src.orchestrator.dynamic_closure",
+        "--evidence", str(task.output_dir / "evidence.json"),
+        "--repo", str(task.issue.issue_dir / "repo"),
+        "--patch", str(task.output_dir / "patch.diff"),
+        "--base-commit", str(metadata.get("base_commit") or "HEAD"),
+        "--container", container,
+        "--output", str(output_path),
+    ]
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write("$ " + " ".join(cmd) + "\n")
+        log.flush()
+        completed = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if completed.returncode != 0 or not output_path.is_file():
+        payload = {
+            "schema_version": 1,
+            "counts": {"PASS": 0, "FAIL": 0, "UNVERIFIABLE": 1},
+            "infrastructure_error": (
+                f"dynamic closure subprocess exited {completed.returncode}"
+            ),
+            "requirements": [],
+        }
+        write_json_atomic(output_path, payload)
+        return payload
+    return load_json(output_path)
+
+
 def load_runner_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"started_at": utc_now(), "tasks": {}}
@@ -950,7 +1639,117 @@ def update_state(path: Path, task: TaskSpec, payload: dict[str, Any]) -> None:
         write_json_atomic(path, state)
 
 
+def _case_estimated_cost_usd(output_dir: Path) -> float:
+    total = 0.0
+    for name in (
+        "run_metrics.analysis.json",
+        "run_metrics.json",
+        "dynamic_closure.json",
+    ):
+        try:
+            total += float(load_json(output_dir / name).get("estimated_cost_usd") or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return round(total, 6)
+
+
+def _artifact_progress_rank(task: TaskSpec) -> int:
+    if phase3_artifacts_ready(task, allow_failed_patch_eval=True):
+        return 3
+    if stage2_artifacts_ready(task) or failed_patch_artifacts_ready_for_final_eval(task):
+        return 2
+    if analysis_checkpoint_ready(task) or saved_analysis_handoff_ready(task):
+        return 1
+    return 0
+
+
+def persist_task_result(
+    task: TaskSpec,
+    state_file: Path,
+    payload: dict[str, Any],
+) -> None:
+    """Record every attempt without allowing regressions of canonical progress."""
+    payload = dict(payload)
+    previous_attempt_path = task.output_dir / "runner_attempt.latest.json"
+    previous_attempt: dict[str, Any] = {}
+    if previous_attempt_path.exists():
+        try:
+            loaded_attempt = load_json(previous_attempt_path)
+            if isinstance(loaded_attempt, dict):
+                previous_attempt = loaded_attempt
+        except (OSError, json.JSONDecodeError):
+            previous_attempt = {}
+    try:
+        previous_cost = float(
+            previous_attempt.get("estimated_case_cost_usd") or 0
+        )
+    except (TypeError, ValueError):
+        previous_cost = 0.0
+    cost = _case_estimated_cost_usd(task.output_dir)
+    payload["attempt_id"] = payload.get("run_id")
+    payload["parent_attempt_id"] = previous_attempt.get("attempt_id")
+    payload["retry_reason"] = (
+        payload.get("failure_kind")
+        or payload.get("reason")
+        or payload.get("phase")
+    )
+    payload["incremental_cost_usd"] = round(max(0.0, cost - previous_cost), 6)
+    payload["checkpoint_reused"] = bool(
+        (task.output_dir / "checkpoint.json").exists()
+        or saved_analysis_handoff_ready(task)
+    )
+    payload["estimated_case_cost_usd"] = cost
+    payload["cost_guard_status"] = (
+        "isolate_no_full_restart"
+        if cost > 2.0
+        else "warning"
+        if cost > 1.25
+        else "within_target"
+    )
+
+    history = task.output_dir / "history" / "runner_attempts"
+    history.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = safe_slug(str(payload.get("run_id") or "no-run"), limit=60)
+    phase = safe_slug(str(payload.get("phase") or "all"), limit=20)
+    write_json_atomic(history / f"{stamp}.{run_id}.{phase}.json", payload)
+    write_json_atomic(task.output_dir / "runner_attempt.latest.json", payload)
+
+    canonical = task.output_dir / "runner_task.json"
+    existing = load_json(canonical) if canonical.exists() else {}
+    progress_rank = _artifact_progress_rank(task)
+    status = str(payload.get("status") or "")
+    phase_rank = {
+        "analysis": 1,
+        "generate": 2,
+        "stage2": 2,
+        "evaluate": 3,
+        "phase3": 3,
+        "all": 3,
+    }.get(str(payload.get("phase") or ""), 0)
+    should_replace = (
+        not existing
+        or status == "success" and phase_rank >= progress_rank
+        or progress_rank == 0 and status in {"failed", "infra_failed"}
+    )
+    if should_replace:
+        write_json_atomic(canonical, payload)
+    update_state(state_file, task, payload)
+
+
 def run_task(
+    task: TaskSpec,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Serialize models sharing one mutable case repository."""
+    key = task.issue.issue_dir.resolve()
+    with ISSUE_LOCKS_LOCK:
+        issue_lock = ISSUE_LOCKS.setdefault(key, threading.Lock())
+    with issue_lock:
+        return _run_task_unlocked(task, **kwargs)
+
+
+def _run_task_unlocked(
     task: TaskSpec,
     *,
     base_env: dict[str, str],
@@ -958,12 +1757,16 @@ def run_task(
     memory_gb: float | None,
     platform: str | None,
     force_restart: bool,
+    retry_failed_closure: bool = False,
     redo_eval: bool,
     prune: bool,
     state_file: Path,
     eval_module: Any,
     run: RunContext,
     eval_only: bool,
+    phase: str,
+    owned_images_file: Path | None = None,
+    allow_failed_patch_eval: bool = False,
 ) -> dict[str, Any]:
     output_dir = task.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -974,7 +1777,87 @@ def run_task(
     cleanup_log = logs_dir / "docker_cleanup.log"
     task_status_path = output_dir / "runner_task.json"
 
-    skip, reason = should_skip_task(task, force_restart=force_restart, redo_eval=redo_eval, eval_only=eval_only)
+    # A completed generation/stage2 result is strictly beyond the analysis
+    # handoff.  Legacy monolithic runs commonly have no live CLOSED checkpoint
+    # because patch generation consumed it, so checking only
+    # analysis_checkpoint_ready() would rerun analysis and src.main would clear
+    # the already generated patch.  Preserve that work and let stage2/phase3
+    # decide what (if anything) remains.
+    if (
+        phase == "analysis"
+        and (
+            stage2_artifacts_ready(task)
+            or saved_analysis_handoff_ready(task)
+        )
+        and not force_restart
+    ):
+        payload = {
+            "status": "skipped",
+            "reason": (
+                "usable generated patch already exists"
+                if stage2_artifacts_ready(task)
+                else "saved completed analysis handoff already exists"
+            ),
+            "phase": phase,
+            "issue": task.issue.issue_name,
+            "model": task.model.name,
+            "output_subdir": task.model.output_subdir,
+            "updated_at": utc_now(),
+        }
+        persist_task_result(task, state_file, payload)
+        return payload
+
+    restart_full_analysis = False
+    if phase == "analysis" and retry_failed_closure and not force_restart:
+        restart_full_analysis = bool(quarantine_unretryable_analysis_checkpoint(task))
+
+    if phase == "analysis" and analysis_checkpoint_ready(task) and not force_restart:
+        payload = {
+            "status": "skipped",
+            "reason": "analysis checkpoint already complete",
+            "phase": phase,
+            "issue": task.issue.issue_name,
+            "model": task.model.name,
+            "output_subdir": task.model.output_subdir,
+            "updated_at": utc_now(),
+        }
+        persist_task_result(task, state_file, payload)
+        return payload
+    if phase == "generate" and patch_has_effective_diff(output_dir / "patch.diff") and not force_restart:
+        payload = {
+            "status": "skipped",
+            "reason": "patch already generated",
+            "phase": phase,
+            "issue": task.issue.issue_name,
+            "model": task.model.name,
+            "output_subdir": task.model.output_subdir,
+            "updated_at": utc_now(),
+        }
+        persist_task_result(task, state_file, payload)
+        return payload
+    if phase == "stage2" and stage2_artifacts_ready(task) and not force_restart:
+        payload = {
+            "status": "skipped",
+            "reason": "stage2 artifacts already complete",
+            "phase": phase,
+            "issue": task.issue.issue_name,
+            "model": task.model.name,
+            "output_subdir": task.model.output_subdir,
+            "updated_at": utc_now(),
+        }
+        persist_task_result(task, state_file, payload)
+        return payload
+
+    skip, reason = should_skip_task(
+        task,
+        force_restart=force_restart,
+        redo_eval=redo_eval,
+        eval_only=eval_only,
+        phase=phase,
+        allow_failed_patch_eval=allow_failed_patch_eval,
+    )
+    if phase in {"analysis", "generate", "stage2"}:
+        skip = False
     if skip:
         payload = {
             "status": "skipped",
@@ -984,8 +1867,7 @@ def run_task(
             "output_subdir": task.model.output_subdir,
             "updated_at": utc_now(),
         }
-        write_json_atomic(task_status_path, payload)
-        update_state(state_file, task, payload)
+        persist_task_result(task, state_file, payload)
         return payload
 
     started_at = utc_now()
@@ -999,7 +1881,8 @@ def run_task(
     })
 
     metadata = load_json(task.issue.metadata_path)
-    images_seen: list[str] = []
+    candidates = image_candidates(metadata, dockerhub_users)
+    images_pulled: set[str] = set()
     names = [
         container_name("gen", task, run.run_id),
         container_name("eval", task, run.run_id),
@@ -1010,35 +1893,207 @@ def run_task(
     env["no_proxy"] = "127.0.0.1,localhost," + env.get("no_proxy", "")
 
     try:
-        candidates = image_candidates(metadata, dockerhub_users)
+        if phase == "analysis":
+            analysis_exit = run_analysis(
+            task,
+            env=env,
+            force_restart=force_restart,
+            retry_failed_closure=retry_failed_closure and not restart_full_analysis,
+            log_path=gen_log,
+            run=run,
+        )
+            if analysis_exit != 0:
+                infra_detail = analysis_model_infra_failure_detail(
+                    gen_log,
+                    run_id=run.run_id,
+                )
+                if infra_detail is not None:
+                    return generation_infra_failure_payload(
+                        task=task,
+                        run=run,
+                        phase=phase,
+                        started_at=started_at,
+                        logs_dir=logs_dir,
+                        detail=infra_detail,
+                    )
+                raise RuntimeError(f"analysis harness exited {analysis_exit}; see {gen_log}")
+            if not analysis_checkpoint_ready(task):
+                raise RuntimeError(
+                    "analysis exited without a resumable CLOSED checkpoint; "
+                    f"see {gen_log}"
+                )
+            payload = {
+                "status": "success",
+                "phase": phase,
+                "issue": task.issue.issue_name,
+                "instance_id": metadata.get("instance_id"),
+                "model": task.model.name,
+                "output_subdir": task.model.output_subdir,
+                "run_id": run.run_id,
+                "analysis_checkpoint": str(output_dir / "checkpoint.json"),
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "logs_dir": str(logs_dir),
+            }
+            return payload
+
+        if (
+            phase in {"generate", "stage2"}
+            and not patch_has_effective_diff(output_dir / "patch.diff")
+            and not generation_checkpoint_ready(task)
+        ):
+            if phase == "stage2" and saved_analysis_handoff_ready(task):
+                pass
+            else:
+                raise RuntimeError(
+                    f"{phase} phase requires a completed analysis checkpoint; "
+                    "run --phase analysis first"
+                )
+
         if not candidates:
             raise RuntimeError(f"No Docker image candidates for {task.issue.issue_name}")
 
-        if can_eval_existing_patch(task, redo_eval=redo_eval, eval_only=eval_only):
+        if phase in {"generate", "stage2"} and analysis_checkpoint_ready(task):
+            save_analysis_handoff_snapshot(task)
+        elif (
+            phase == "stage2"
+            and not stage2_artifacts_ready(task)
+            and not generation_checkpoint_ready(task)
+        ):
+            if not restore_analysis_handoff_snapshot(task):
+                raise RuntimeError(
+                    "stage2 rerun requires a saved analysis handoff snapshot; "
+                    "rerun --phase analysis to regenerate it"
+                )
+
+        reuse_existing = (
+            phase not in {"generate", "stage2"}
+            and can_eval_existing_patch(task, redo_eval=redo_eval, eval_only=eval_only)
+        )
+        if reuse_existing:
+            if eval_only:
+                archived_eval = archive_existing_eval_result(task, run.run_id)
+                if archived_eval is not None:
+                    with eval_log.open("a", encoding="utf-8", errors="replace") as log:
+                        log.write(f"[runner] archived prior eval_result -> {archived_eval}\n")
+            if phase == "phase3" and not phase3_patch_ready(
+                task,
+                allow_failed_patch_eval=allow_failed_patch_eval,
+            ):
+                raise RuntimeError(
+                    "phase3 requires successful stage2 artifacts "
+                    "(or an explicitly allowed final-pass failed patch)"
+                )
             with DOCKER_LOCK:
-                image = pull_first_image(candidates, platform=platform, log_path=eval_log)
-            images_seen.append(image)
+                image = pull_first_image(
+                    candidates,
+                    platform=platform,
+                    log_path=eval_log,
+                    pulled_images=images_pulled,
+                    owned_images_file=owned_images_file,
+                )
         else:
             if eval_only:
                 raise RuntimeError(f"eval-only requested but patch.diff is unavailable for {task.issue.issue_name}")
+            if phase in {"generate", "stage2"}:
+                archive_stale_phase3_artifacts(
+                    task,
+                    reason=f"pre-{phase}",
+                    log_path=gen_log,
+                )
             image, gen_exit = run_generation(
                 task,
                 candidates=candidates,
                 env=env,
                 memory_gb=memory_gb,
                 platform=platform,
-                force_restart=force_restart,
+                force_restart=force_restart and phase == "all",
                 log_path=gen_log,
                 run=run,
+                pulled_images=images_pulled,
+                owned_images_file=owned_images_file,
             )
-            images_seen.append(image)
             if gen_exit != 0:
                 raise RuntimeError(f"patch generation container exited {gen_exit}; see {gen_log}")
             if not patch_has_effective_diff(output_dir / "patch.diff"):
+                if read_patch_outcome(output_dir) == "MODEL_INFRA_FAILURE":
+                    return generation_infra_failure_payload(
+                        task=task,
+                        run=run,
+                        phase=phase,
+                        started_at=started_at,
+                        logs_dir=logs_dir,
+                        detail=(
+                            "patch generation ended in model/relay infrastructure failure; "
+                            f"see {gen_log}"
+                        ),
+                    )
                 raise RuntimeError(
                     f"patch generation produced no effective diff for "
                     f"{task.issue.issue_name}; skipping eval"
                 )
+
+        if phase == "stage2" and not stage2_artifacts_ready(task):
+            if read_patch_outcome(output_dir) == "MODEL_INFRA_FAILURE":
+                return generation_infra_failure_payload(
+                    task=task,
+                    run=run,
+                    phase=phase,
+                    started_at=started_at,
+                    logs_dir=logs_dir,
+                    detail=(
+                        "stage2 ended in model/relay infrastructure failure before a usable "
+                        f"frozen patch was produced; see {gen_log}"
+                    ),
+                )
+            raise RuntimeError(
+                "stage2 did not produce a usable frozen patch and compile result; "
+                f"see {gen_log}"
+            )
+
+        if phase in {"generate", "stage2"}:
+            payload = {
+                "status": "success",
+                "phase": phase,
+                "issue": task.issue.issue_name,
+                "instance_id": metadata.get("instance_id"),
+                "model": task.model.name,
+                "output_subdir": task.model.output_subdir,
+                "run_id": run.run_id,
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "patch_path": str(output_dir / "patch.diff"),
+                "logs_dir": str(logs_dir),
+            }
+            return payload
+
+        phase3_container: str | None = None
+        dynamic_summary: dict[str, Any] | None = None
+        if phase == "phase3":
+            uid = str(metadata["instance_id"])
+            workspace_dir = output_dir / "eval_result" / uid / "workspace"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            phase3_container = container_name("eval", task, run.run_id)
+            with DOCKER_LOCK:
+                create_container(
+                    name=phase3_container,
+                    image=image,
+                    command=["-c", "trap 'exit 0' TERM INT; while true; do sleep 3600; done"],
+                    log_path=eval_log,
+                    volumes=[(workspace_dir.resolve(), "/workspace")],
+                    memory_gb=memory_gb,
+                    platform=platform,
+                    entrypoint="/bin/bash",
+                    network_disabled=True,
+                )
+                start_container_detached(phase3_container, eval_log)
+            dynamic_summary = run_dynamic_closure_stage(
+                task,
+                metadata=metadata,
+                container=phase3_container,
+                env=env,
+                log_path=logs_dir / "dynamic_closure.log",
+            )
 
         eval_summary = run_eval(
             task,
@@ -1049,9 +2104,11 @@ def run_task(
             log_path=eval_log,
             eval_module=eval_module,
             run=run,
+            existing_container=phase3_container,
         )
         payload = {
             "status": "success",
+            "retryable": False,
             "issue": task.issue.issue_name,
             "instance_id": metadata.get("instance_id"),
             "model": task.model.name,
@@ -1062,12 +2119,28 @@ def run_task(
             "finished_at": utc_now(),
             "patch_path": str(output_dir / "patch.diff"),
             "eval_summary": str(output_dir / "eval_result" / "eval_summary.json"),
+            "dynamic_closure": (
+                str(output_dir / "dynamic_closure.json")
+                if dynamic_summary is not None else None
+            ),
             "logs_dir": str(logs_dir),
         }
+        return payload
+    except DockerInfraError as exc:
+        payload = docker_infra_failure_payload(
+            task=task,
+            run=run,
+            phase=phase,
+            started_at=started_at,
+            logs_dir=logs_dir,
+            detail=str(exc),
+        )
         return payload
     except Exception as exc:
         payload = {
             "status": "failed",
+            "retryable": False,
+            "phase": phase,
             "issue": task.issue.issue_name,
             "model": task.model.name,
             "output_subdir": task.model.output_subdir,
@@ -1079,11 +2152,23 @@ def run_task(
         }
         return payload
     finally:
-        cleanup_docker(names=names, images=images_seen, log_path=cleanup_log, prune=prune)
+        if phase != "analysis":
+            owned_for_task = {
+                image
+                for image in candidates
+                if image in load_owned_images(owned_images_file)
+            }
+            removed_images = cleanup_docker(
+                names=names,
+                images=sorted(images_pulled | owned_for_task),
+                log_path=cleanup_log,
+                prune=prune,
+            )
+            if removed_images:
+                update_owned_images(owned_images_file, remove=removed_images)
         final_payload = locals().get("payload")
         if isinstance(final_payload, dict):
-            write_json_atomic(task_status_path, final_payload)
-            update_state(state_file, task, final_payload)
+            persist_task_result(task, state_file, final_payload)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1101,23 +2186,90 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-memory-limit", action="store_true", help="Do not pass --memory to task containers")
     parser.add_argument("--docker-platform", default=None, help="Optional platform, e.g. linux/amd64")
     parser.add_argument("--force-restart", action="store_true", help="Pass --force-restart to src.main and ignore skip checks")
+    parser.add_argument(
+        "--retry-failed-closure",
+        action="store_true",
+        help=(
+            "During --phase analysis, pass --retry-failed-closure to src.main "
+            "when its evidence is complete; archive and restart failed analysis "
+            "checkpoints that still contain unchecked requirements."
+        ),
+    )
     parser.add_argument("--redo-eval", action="store_true", help="Evaluate again if patch exists but eval_result is missing")
     parser.add_argument("--eval-only", action="store_true", help="Only evaluate existing patch.diff artifacts; never regenerate patches")
+    parser.add_argument(
+        "--allow-failed-patch-eval",
+        action="store_true",
+        help=(
+            "During final-pass phase3 only, evaluate an effective frozen patch "
+            "whose failure is patch/build quality rather than infrastructure."
+        ),
+    )
+    parser.add_argument(
+        "--phase",
+        choices=["all", "analysis", "generate", "evaluate", "stage2", "phase3"],
+        default="all",
+        help=(
+            "Run the legacy full flow, host-only analysis, Docker patch generation, "
+            "local-Docker evaluation, stage-2 static patch generation, or "
+            "stage-3 dynamic closure plus official evaluation"
+        ),
+    )
     parser.add_argument(
         "--no-prune",
         action="store_true",
         help="Keep pulled task images and disable docker prune cleanup after each task",
     )
+    parser.add_argument(
+        "--owned-images-file",
+        type=Path,
+        default=None,
+        help=(
+            "Batch-scoped ledger for images pulled by this harness. Stage2 can retain "
+            "them for phase3, which then removes only ledger-owned images."
+        ),
+    )
     return parser.parse_args()
+
+
+def runner_exit_code(counts: dict[str, int]) -> int:
+    """Distinguish terminal task failures from retryable infrastructure failures."""
+    if counts.get("failed"):
+        return 1
+    if counts.get("infra_failed"):
+        return 75
+    return 0
 
 
 def main() -> int:
     args = parse_args()
+    if args.phase in {"evaluate", "phase3"}:
+        args.eval_only = True
+    if args.eval_only and args.phase not in {"all", "evaluate", "phase3"}:
+        raise ValueError("--eval-only is only compatible with --phase all/evaluate/phase3")
+    if args.allow_failed_patch_eval and args.phase != "phase3":
+        raise ValueError("--allow-failed-patch-eval is only compatible with --phase phase3")
+    if args.force_restart and args.phase in {"generate", "stage2"}:
+        raise ValueError(
+            f"--force-restart cannot be used with --phase {args.phase}; rerun the "
+            "analysis phase with --force-restart first"
+        )
+    if args.retry_failed_closure and args.phase != "analysis":
+        raise ValueError("--retry-failed-closure is only compatible with --phase analysis")
+    if args.retry_failed_closure and args.force_restart:
+        raise ValueError("--retry-failed-closure cannot be combined with --force-restart")
     args.workdir = args.workdir.resolve()
     args.state_file = args.state_file.resolve()
+    if args.owned_images_file is not None:
+        args.owned_images_file = args.owned_images_file.resolve()
     run = RunContext(run_id=args.run_id or build_run_id())
-    docker_available()
-    eval_module = load_eval_module()
+    if args.phase != "analysis":
+        docker_available()
+    eval_module = (
+        load_eval_module()
+        if args.phase in {"all", "evaluate", "phase3"}
+        else None
+    )
 
     tasks, manifest = expand_manifest(args.manifest.resolve(), args.workdir)
     if not tasks:
@@ -1127,6 +2279,10 @@ def main() -> int:
     manifest_workers = manifest.get("max_workers") if isinstance(manifest, dict) else None
     if args.max_workers is not None:
         workers = args.max_workers
+    elif args.phase == "analysis":
+        workers = 8
+    elif args.phase in {"generate", "evaluate", "stage2", "phase3"}:
+        workers = 2
     elif manifest_workers is not None:
         workers = int(manifest_workers)
     else:
@@ -1135,11 +2291,18 @@ def main() -> int:
 
     base_env = os.environ.copy()
     base_env.update(parse_env_file(REPO_ROOT / ".env"))
+    if workers > 1 or len(tasks) > 1:
+        # Tasks share one serialized, persistent read-only LTM service instead
+        # of racing for port 9030 or restarting it between sequential cases.
+        base_env["MEMGOVERN_PERSIST"] = "1"
     dockerhub_users = [args.dockerhub_user, *args.fallback_dockerhub_user]
     dockerhub_users = [u for u in dict.fromkeys(dockerhub_users) if u]
     memory_gb = None if args.no_memory_limit else args.per_task_gb
 
-    print(f"[plan] tasks={len(tasks)} workers={workers} per_task_gb={memory_gb or 'unlimited'}")
+    print(
+        f"[plan] phase={args.phase} tasks={len(tasks)} workers={workers} "
+        f"per_task_gb={memory_gb or 'unlimited'}"
+    )
     print(f"[plan] state={args.state_file}")
     print(f"[plan] run_id={run.run_id}")
 
@@ -1154,12 +2317,16 @@ def main() -> int:
                 memory_gb=memory_gb,
                 platform=args.docker_platform,
                 force_restart=args.force_restart,
+                retry_failed_closure=args.retry_failed_closure,
                 redo_eval=args.redo_eval,
                 prune=not args.no_prune,
                 state_file=args.state_file,
                 eval_module=eval_module,
                 run=run,
                 eval_only=args.eval_only,
+                phase=args.phase,
+                owned_images_file=args.owned_images_file,
+                allow_failed_patch_eval=args.allow_failed_patch_eval,
             )
             for task in tasks
         ]
@@ -1175,7 +2342,7 @@ def main() -> int:
     for result in results:
         counts[result["status"]] = counts.get(result["status"], 0) + 1
     print(f"[summary] {counts}")
-    return 1 if counts.get("failed") else 0
+    return runner_exit_code(counts)
 
 
 if __name__ == "__main__":

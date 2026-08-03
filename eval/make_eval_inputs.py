@@ -22,22 +22,26 @@ def resolve_outputs_dir(issue_dir: Path, output_subdir: str | None) -> Path:
 
 
 def find_all_issues(output_subdir: str | None) -> list[str]:
-    """Scan workdir for swe_issue_* directories with metadata and a patch/gold patch."""
+    """Scan workdir for issue directories with a generated patch."""
     issues: list[str] = []
     for d in sorted(WORKDIR.iterdir()):
         if not d.is_dir() or not d.name.startswith("swe_issue_"):
             continue
         inst_path = d / "artifacts" / "instance_metadata.json"
         patch_path = resolve_outputs_dir(d, output_subdir) / "patch.diff"
-        if inst_path.exists() and (patch_path.exists() or inst_path.exists()):
+        if inst_path.exists() and patch_path.exists():
             issues.append(d.name)
     return issues
 
 
-def build_inputs(issues: list[str], output_subdir: str | None) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    patches_out = OUTPUT_DIR / "patches.json"
-    samples_out = OUTPUT_DIR / "samples.jsonl"
+def build_inputs(
+    issues: list[str],
+    output_subdir: str | None,
+    output_dir: Path = OUTPUT_DIR,
+) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    patches_out = output_dir / "patches.json"
+    samples_out = output_dir / "samples.jsonl"
 
     patches: list[dict[str, str]] = []
     samples_lines: list[str] = []
@@ -53,10 +57,10 @@ def build_inputs(issues: list[str], output_subdir: str | None) -> None:
 
         inst = json.loads(inst_path.read_text(encoding="utf-8"))
 
-        if patch_path.exists():
-            patch = patch_path.read_text(encoding="utf-8")
-        else:
-            patch = inst.get("patch", "")
+        if not patch_path.exists():
+            print(f"WARN: missing generated patch {patch_path}, skipping")
+            continue
+        patch = patch_path.read_text(encoding="utf-8")
 
         if not patch.strip():
             print(f"WARN: empty patch for {issue}, skipping")
@@ -95,6 +99,7 @@ def build_inputs(issues: list[str], output_subdir: str | None) -> None:
     print(f"  output subdir: {output_subdir or model_output_dir_name()}")
     print(f"  patches: {patches_out}")
     print(f"  samples: {samples_out}")
+    return patches_out, samples_out
 
 
 def main() -> None:
@@ -106,6 +111,12 @@ def main() -> None:
             "Per-issue harness output subdirectory to read. "
             "Defaults to outputs_<current-model>."
         ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=OUTPUT_DIR,
+        help="Directory for patches.json and samples.jsonl.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--issues", nargs="+", help="Issue directory names")
@@ -121,7 +132,7 @@ def main() -> None:
     else:
         issues = args.issues
 
-    build_inputs(issues, args.output_subdir)
+    build_inputs(issues, args.output_subdir, args.output_dir)
 
 
 if __name__ == "__main__":

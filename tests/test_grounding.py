@@ -141,6 +141,35 @@ def test_missing_element_actually_present_fails(tmp_path: Path):
     assert failures[0].kind == "missing_element_present"
 
 
+def test_missing_element_v3_interface_uses_name_not_type(tmp_path: Path):
+    _write(tmp_path, "mod.py", "class Function:\n    pass\n")
+    failures = ground_missing_elements(
+        ["Type: Function Name: fetch_events Path: monitoring/haproxy.py"],
+        tmp_path,
+    )
+    assert failures == []
+
+
+def test_missing_element_v3_interface_detects_existing_named_symbol(tmp_path: Path):
+    _write(tmp_path, "monitoring/haproxy.py", "def fetch_events():\n    pass\n")
+    failures = ground_missing_elements(
+        ["Type: Function Name: fetch_events Path: monitoring/haproxy.py"],
+        tmp_path,
+    )
+    assert len(failures) == 1
+    assert "`fetch_events`" in failures[0].detail
+    assert "`monitoring/haproxy.py`" in failures[0].detail
+
+
+def test_missing_element_v3_interface_ignores_same_name_in_other_file(tmp_path: Path):
+    _write(tmp_path, "other.py", "def main():\n    pass\n")
+    failures = ground_missing_elements(
+        ["Type: Function Name: main Path: monitoring/haproxy.py"],
+        tmp_path,
+    )
+    assert failures == []
+
+
 def test_missing_element_skips_referenced_types_in_signature(tmp_path: Path):
     """Only the introduced symbol is grounded, not referenced existing types.
 

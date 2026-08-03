@@ -1,6 +1,7 @@
 #!/usr/bin/env pwsh
 # Run selected issues sequentially inside their SWE-bench Pro Docker images.
-# Requires: ANTHROPIC_API_KEY set, and eval\docker\setup_wheels.ps1 run first.
+# Requires: model API credentials set in .env / process env, and
+# eval\docker\setup_wheels.ps1 run first.
 #
 # The harness runs INSIDE the instance's docker image with --repo-dir /app, so
 # the language toolchain (go, python, ...) is present and the post-patch build
@@ -43,11 +44,32 @@ function Import-DotEnv {
 
 Import-DotEnv "$DEMO_DIR\.env"
 
-function Get-ModelOutputDirName {
+function Get-EffectiveModelBackend {
     $backend = $env:MODEL_BACKEND
     if (-not $backend) { $backend = $env:LLM_BACKEND }
     if (-not $backend) { $backend = "anthropic" }
-    $backend = $backend.Trim().ToLowerInvariant()
+    return $backend.Trim().ToLowerInvariant()
+}
+
+function Resolve-DockerMountedFileSetting {
+    param(
+        [string]$Value,
+        [string]$VarName,
+        [string]$ContainerPath
+    )
+    if (-not $Value) { return $null }
+    $item = Get-Item -LiteralPath $Value -ErrorAction Stop
+    if ($item.PSIsContainer) {
+        throw "$VarName must point to a file, got directory: $Value"
+    }
+    return @{
+        Value = $ContainerPath
+        VolumeArgs = @("-v", "$($item.FullName):$ContainerPath:ro")
+    }
+}
+
+function Get-ModelOutputDirName {
+    $backend = Get-EffectiveModelBackend
 
     if ($backend -in @("openai", "codex", "codex-pro")) {
         $model = $env:OPENAI_MODEL
@@ -222,8 +244,13 @@ fi
 echo "PYBIN=`$PYBIN"
 "@
 
-if (-not $env:ANTHROPIC_API_KEY) {
-    Write-Error "ANTHROPIC_API_KEY is not set. Aborting."
+if ((Get-EffectiveModelBackend) -in @("openai", "codex", "codex-pro")) {
+    if (-not ($env:OPENAI_API_KEY -or $env:CODEX_PRO_API_KEY -or $env:ANTHROPIC_API_KEY)) {
+        Write-Error "OpenAI backend selected but no OPENAI_API_KEY / CODEX_PRO_API_KEY / ANTHROPIC_API_KEY is set. Aborting."
+        exit 1
+    }
+} elseif (-not $env:ANTHROPIC_API_KEY) {
+    Write-Error "Anthropic backend selected but ANTHROPIC_API_KEY is not set. Aborting."
     exit 1
 }
 
@@ -351,6 +378,29 @@ cd /demo
     # leftover with this name before starting.
     $cname = "swe_run_${num}"
     docker rm -f $cname 2>&1 | Out-Null
+    $openaiCaPathInContainer = $null
+    $openaiCaVolumeArgs = @()
+    if ($env:OPENAI_CA_CERT_PATH) {
+        $openaiCaMount = Resolve-DockerMountedFileSetting `
+            -Value $env:OPENAI_CA_CERT_PATH `
+            -VarName "OPENAI_CA_CERT_PATH" `
+            -ContainerPath "/run/secrets/openai-ca.pem"
+        $openaiCaPathInContainer = $openaiCaMount.Value
+        $openaiCaVolumeArgs = $openaiCaMount.VolumeArgs
+    }
+    $openaiSslVerifyValue = $env:OPENAI_SSL_VERIFY
+    $openaiSslVolumeArgs = @()
+    if (-not $openaiCaPathInContainer -and $openaiSslVerifyValue) {
+        $sslLower = $openaiSslVerifyValue.Trim().ToLowerInvariant()
+        if ($sslLower -notin @("1", "true", "yes", "on", "0", "false", "no", "off")) {
+            $openaiSslMount = Resolve-DockerMountedFileSetting `
+                -Value $openaiSslVerifyValue `
+                -VarName "OPENAI_SSL_VERIFY" `
+                -ContainerPath "/run/secrets/openai-ssl-verify.pem"
+            $openaiSslVerifyValue = $openaiSslMount.Value
+            $openaiSslVolumeArgs = $openaiSslMount.VolumeArgs
+        }
+    }
     $envArgs = @()
     $envArgs = Add-DockerEnvArg $envArgs "MODEL_BACKEND" $env:MODEL_BACKEND
     $envArgs = Add-DockerEnvArg $envArgs "LLM_BACKEND" $env:LLM_BACKEND
@@ -359,6 +409,8 @@ cd /demo
     $envArgs = Add-DockerEnvArg $envArgs "ANTHROPIC_MODEL" $env:ANTHROPIC_MODEL
     $envArgs = Add-DockerEnvArg $envArgs "OPENAI_API_KEY" $env:OPENAI_API_KEY
     $envArgs = Add-DockerEnvArg $envArgs "OPENAI_BASE_URL" $env:OPENAI_BASE_URL
+    $envArgs = Add-DockerEnvArg $envArgs "OPENAI_CA_CERT_PATH" $openaiCaPathInContainer
+    $envArgs = Add-DockerEnvArg $envArgs "OPENAI_SSL_VERIFY" $openaiSslVerifyValue
     $envArgs = Add-DockerEnvArg $envArgs "OPENAI_MODEL" $env:OPENAI_MODEL
     $envArgs = Add-DockerEnvArg $envArgs "OPENAI_API_SURFACE" $env:OPENAI_API_SURFACE
     $envArgs = Add-DockerEnvArg $envArgs "CODEX_PRO_API_KEY" $env:CODEX_PRO_API_KEY
@@ -373,6 +425,8 @@ cd /demo
     docker run --rm --name $cname `
         @memArgs `
         -v "${DEMO_DIR}:/demo" `
+        @openaiCaVolumeArgs `
+        @openaiSslVolumeArgs `
         @envArgs `
         $image `
         -c "bash /demo/workdir/swe_issue_${num}/_run_harness.sh" 2>&1 | ForEach-Object { "$_" }

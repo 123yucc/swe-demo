@@ -13,10 +13,11 @@ if [ -f "$script_dir/.env" ] && [ -d "$script_dir/eval" ]; then
 else
   repo_root=$(cd "$script_dir/.." && pwd)
 fi
-pid_path="$repo_root/${run_name}.pid"
-log_path="$repo_root/${run_name}.log"
-status_path="$repo_root/${run_name}.status"
-state_path="$repo_root/workdir/${run_name}.state.json"
+run_dir="$repo_root/logs/runs/$run_name"
+pid_path="$run_dir/runner.pid"
+log_path="$run_dir/runner.log"
+status_path="$run_dir/runner.status"
+state_path="$run_dir/runner.state.json"
 
 echo "RUN_NAME=$run_name"
 if [ -f "$pid_path" ]; then

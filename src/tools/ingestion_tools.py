@@ -105,6 +105,12 @@ def _normalize_compliant_requirements(evidence: EvidenceCards) -> None:
             origin=req.origin,
             short_reason=_short_reason(req.findings),
             evidence_locations=list(req.evidence_locations),
+            source_span=req.source_span,
+            parent_contract_id=req.parent_contract_id,
+            contract_kind=req.contract_kind,
+            explicit_paths=list(req.explicit_paths),
+            explicit_symbols=list(req.explicit_symbols),
+            source_block_hash=req.source_block_hash,
         )
     evidence.requirements = active
     evidence.requirement_status = list(statuses.values())
@@ -311,6 +317,12 @@ def reset_requirement_for_rework(
             findings="",
             scoped_evidence=ScopedEvidence(),
             rework_context=context,
+            source_span=status.source_span,
+            parent_contract_id=status.parent_contract_id,
+            contract_kind=status.contract_kind,
+            explicit_paths=list(status.explicit_paths),
+            explicit_symbols=list(status.explicit_symbols),
+            source_block_hash=status.source_block_hash,
         )
         evidence.requirements.append(target)
         evidence.requirement_status = [
@@ -746,6 +758,12 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
             origin=target.origin,
             short_reason=_short_reason(findings),
             evidence_locations=evidence_locations,
+            source_span=target.source_span,
+            parent_contract_id=target.parent_contract_id,
+            contract_kind=target.contract_kind,
+            explicit_paths=list(target.explicit_paths),
+            explicit_symbols=list(target.explicit_symbols),
+            source_block_hash=target.source_block_hash,
         )
         evidence.requirement_status = [
             item for item in evidence.requirement_status if item.id != req_id

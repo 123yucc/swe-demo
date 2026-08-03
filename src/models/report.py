@@ -167,6 +167,7 @@ class DeepSearchReport(BaseModel):
 
         return v
 
+
     @field_validator("similar_implementation_patterns", mode="before")
     @classmethod
     def normalize_similar_implementation_patterns(cls, value):
@@ -213,3 +214,30 @@ class DeepSearchReport(BaseModel):
             if text:
                 normalized.append(text)
         return normalized
+
+
+class RequirementInvestigationResult(BaseModel):
+    """Independent result for one member of an adaptive work package."""
+
+    requirement_id: str
+    scoped_report: DeepSearchReport
+
+    @property
+    def verdict(self) -> ActiveVerdict:
+        return self.scoped_report.requirement_verdict
+
+    @property
+    def findings(self) -> str:
+        return self.scoped_report.requirement_findings
+
+    @property
+    def evidence_locations(self) -> list[str]:
+        return self.scoped_report.requirement_evidence_locations
+
+
+class AdaptiveDeepSearchReport(BaseModel):
+    """Partial-success-safe output for multi-requirement investigation."""
+
+    requirement_results: list[RequirementInvestigationResult] = Field(default_factory=list)
+    unresolved_requirement_ids: list[str] = Field(default_factory=list)
+    shared_evidence: list[str] = Field(default_factory=list)

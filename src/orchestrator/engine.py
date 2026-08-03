@@ -21,12 +21,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import posixpath
 import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from src.agents._model_infra import ModelInfrastructureError
 
 _REQ_ID_RE = re.compile(r"req-\d{3,}")
 
@@ -85,6 +88,79 @@ def _conflicting_field_to_scope(conflicting_field: str | None) -> set[str] | Non
     return None
 
 
+def _semantic_field_feedback(conflicting_field: str | None) -> str:
+    """Translate closure's legacy field labels to fields deep-search can write."""
+    if conflicting_field == "repair_targets":
+        return (
+            "Closure calls this a repair_targets gap, but deep-search cannot "
+            "write parser-owned symptom.repair_targets. Satisfy the gap by "
+            "populating concrete writable localization fields: exact_code_regions "
+            "for edit/import sites, must_co_edit_relations for files/symbols that "
+            "must change together, and dependency_propagation for config/import/"
+            "call-chain propagation. Enumerate exact file paths and line/symbol "
+            "anchors instead of repeating a generic need for a repair target. "
+            "If the gap involves moving, extracting, centralizing, or splitting "
+            "logic, choose ONE concrete steady-state strategy and record it "
+            "prescriptively in must_co_edit_relations/dependency_propagation. "
+            "Do not leave an either/or plan such as 'update all imports OR keep "
+            "a shim'. State the canonical owner, whether old locations are "
+            "deleted, delegated, or re-exported, and the caller/import surface "
+            "covered by that strategy. If the requirement or interface block "
+            "names an explicit new Path/Name, use that exact path/name as the "
+            "canonical target; do not weaken it to 'or similarly named'. Treat "
+            "tests as compatibility evidence unless a language-specific rename "
+            "rule explicitly makes base tests part of the production edit "
+            "surface."
+        )
+    if conflicting_field == "missing_elements":
+        return (
+            "Closure calls this a missing_elements gap, but deep-search cannot "
+            "write parser-owned constraint.missing_elements_to_implement. Satisfy "
+            "the gap by documenting the missing implementation in findings and by "
+            "populating exact_code_regions, similar_implementation_patterns, "
+            "must_co_edit_relations, and dependency_propagation with concrete "
+            "implementation/integration anchors. If more than one implementation "
+            "strategy is possible, select ONE codebase-consistent strategy and "
+            "record it as a concrete edit/delegation/import propagation contract; "
+            "do not preserve unresolved alternatives for patch planning. If the "
+            "interface block names an explicit Path/Name, preserve that exact "
+            "Path/Name as the missing implementation target."
+        )
+    if conflicting_field == "evidence_locations":
+        return (
+            "Return line-numbered requirement_evidence_locations for existing "
+            "implementation or integration points. For a new file/symbol, cite "
+            "the existing file/line where it is imported, called, configured, "
+            "or otherwise mounted."
+        )
+    return (
+        "Use writable DeepSearchReport fields that match this gap: findings, "
+        "requirement_evidence_locations, exact_code_regions, must_co_edit_relations, "
+        "dependency_propagation, behavioral_constraints, semantic_boundaries, "
+        "backward_compatibility, and similar_implementation_patterns."
+    )
+
+
+def _eligible_closure_rework_ids(
+    conflict_req_ids: list[str],
+    frozen_req_ids: set[str],
+    rework_rounds_by_req: dict[str, int],
+    per_req_rework_rounds_max: int,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (eligible, frozen_excluded, capped_excluded) for closure rework."""
+    frozen = [rid for rid in conflict_req_ids if rid in frozen_req_ids]
+    not_frozen = [rid for rid in conflict_req_ids if rid not in frozen_req_ids]
+    capped = [
+        rid for rid in not_frozen
+        if rework_rounds_by_req.get(rid, 0) >= per_req_rework_rounds_max
+    ]
+    eligible = [
+        rid for rid in not_frozen
+        if rework_rounds_by_req.get(rid, 0) < per_req_rework_rounds_max
+    ]
+    return eligible, frozen, capped
+
+
 def _build_per_req_audit_feedback(
     verdict: "ClosureVerdict",
     conflict_req_ids: list[str],
@@ -119,6 +195,21 @@ def _build_per_req_audit_feedback(
             for rid in targets:
                 per_req_entries[rid].append(f"[{source_label}] {entry}")
 
+    for gap in verdict.shared_fact_gaps:
+        entry = (gap.fact or "").strip()
+        if gap.suggested_anchor:
+            entry = (
+                f"{entry}\nSuggested anchor: {gap.suggested_anchor}"
+                if entry else f"Suggested anchor: {gap.suggested_anchor}"
+            )
+        if not entry:
+            continue
+        targets = [rid for rid in gap.requirement_ids if rid in per_req_entries]
+        if not targets:
+            targets = list(per_req_entries.keys())
+        for rid in targets:
+            per_req_entries[rid].append(f"[shared_fact_gap] {entry}")
+
     out: dict[str, str] = {}
     for rid, entries in per_req_entries.items():
         body = "\n".join(entries) if entries else "(no entry cited this req)"
@@ -126,10 +217,25 @@ def _build_per_req_audit_feedback(
             f"Closure-checker rationale:\n{rationale}\n\n"
             f"Audit items concerning {rid}:\n{body}\n\n"
             "Instruction: on this rework iteration you MUST reconsider the "
-            "prior verdict. Read the cited code regions yourself, and if you "
-            "still reach the previous verdict, explicitly cite the code lines "
-            "that refute the audit item above.  Do not repeat the same "
-            "reasoning path that was driven by the prior verdict."
+            "prior verdict and localization. Read the cited code regions "
+            "yourself, and if you still reach the previous verdict, explicitly "
+            "cite the code lines that refute the audit item above. Do not "
+            "repeat the same reasoning path that was driven by the prior "
+            "verdict. If the audit item asks for repair_targets or "
+            "missing_elements, translate that into writable DeepSearchReport "
+            "fields: exact_code_regions, requirement_evidence_locations, "
+            "must_co_edit_relations, dependency_propagation, and "
+            "similar_implementation_patterns. When the feedback concerns a "
+            "move/extract/centralize/split refactor, choose one steady-state "
+            "strategy: name the canonical owner, name any old-location shim/"
+            "delegate/re-export behavior, and list the import/caller surface "
+            "that follows that strategy. Do not answer with unresolved "
+            "alternatives such as 'either update callers or keep a shim'. If "
+            "the requirement/interface text provides an exact new path or "
+            "symbol name, keep it exact. Do not generalize it to a sibling or "
+            "'similarly named' target. Treat tests as compatibility evidence "
+            "rather than required edit targets unless a language-specific "
+            "rename rule explicitly says otherwise."
         )
     return out
 
@@ -168,12 +274,17 @@ def _derive_rework_specs(
             feedback = (
                 "Sufficiency FAIL — the evidence does not yet support a single "
                 f"correct repair commit: {explanation}. Deepen the investigation "
-                f"(localization / constraints) for {field_label}."
+                f"(localization / constraints) for {field_label}.\n"
+                f"{_semantic_field_feedback(finding.conflicting_field)}"
             )
             targets = finding.requirement_ids or []
             for rid in targets:
                 _add(rid, RworkSpec("deepen", None, feedback))
         elif finding.dimension == "consistency":
+            if verdict.conflicts:
+                # Structured conflict edges below choose the weaker/recheck
+                # side. Do not reopen every id from the legacy flat finding.
+                continue
             cross = (
                 finding.conflicting_field == "<cross-req>"
                 or len(finding.requirement_ids) > 1
@@ -186,6 +297,19 @@ def _derive_rework_specs(
             )
             for rid in finding.requirement_ids:
                 _add(rid, RworkSpec("reconcile", scope, feedback))
+
+    for edge in verdict.conflicts:
+        targets = []
+        if edge.recommended_recheck_side in {"left", "both"}:
+            targets.append(edge.left_requirement_id)
+        if edge.recommended_recheck_side in {"right", "both"}:
+            targets.append(edge.right_requirement_id)
+        feedback = (
+            f"Structured conflict on {edge.conflicting_field}: {edge.explanation}. "
+            f"Shared evidence: {', '.join(edge.shared_evidence)}."
+        )
+        for rid in targets:
+            _add(rid, RworkSpec("reconcile", None, feedback))
 
     # Prescriptive boundary check (per-task AuditResult) → findings-only reconcile.
     for result in verdict.audited:
@@ -203,11 +327,16 @@ def _derive_rework_specs(
 
 from src.agents.closure_checker_agent import _run_closure_checker_async
 from src.agents.custom_router_agent import run_custom_router
-from src.agents.deep_search_agent import _run_deep_search_async
+from src.agents.deep_search_agent import _run_adaptive_deep_search_async, _run_deep_search_async
+from src.agents.call_metrics import model_label, write_event
 from src.agents.ltm_agent import run_agentic_ltm_retrieval
 from src.agents.parser_agent import _run_parser_async
-from src.agents.patch_generator_agent import _run_patch_generator_async
-from src.agents.patch_planner_agent import _run_patch_planner_async
+from src.agents.patch_generator_agent import (
+    PatchGeneratorInfraError,
+    _run_patch_generator_async,
+)
+from src.agents.patch_planner_agent import _run_patch_planner_async, _split_heavy_edits
+from src.agents._structured import close_structured_clients
 from src.memory import (
     Experience,
     append_custom_recommendations_log,
@@ -220,9 +349,10 @@ from src.memory import (
 from src.models.context import EvidenceCards
 from src.models.custom_rules import RouteTags
 from src.models.evidence import RequirementItem
-from src.models.patch import PatchPlan
+from src.models.patch import FileEditPlan, PatchPlan
 from src.models.verdict import ClosureVerdict
 from src.orchestrator.audit import build_audit_manifest
+from src.models.audit import DimensionFinding
 from src.orchestrator.artifact_verify import (
     ArtifactFinding,
     render_artifact_feedback,
@@ -232,6 +362,7 @@ from src.orchestrator.build_verify import (
     BuildCheckResult,
     BuildError,
     changed_python_production_files,
+    changed_go_packages,
     detect_build_system,
     diff_new_errors,
     render_errors_for_feedback,
@@ -243,20 +374,28 @@ from src.orchestrator.consistency_checks import (
     check_contract_drift,
     check_go_unexport_consistency,
     check_parallel_impl_consistency,
+    check_python_moved_class_dunder_methods,
+    check_python_config_subscript_fallback,
+    check_python_helper_api_usage,
+    check_python_noniterable_class_loop,
     check_removed_symbol_test_refs,
     check_rename_residue,
     check_undefined_config_symbol,
+    is_test_file,
     render_config_entry_shape_for_feedback,
     render_contract_drift_for_feedback,
     render_go_unexport_for_feedback,
     render_parallel_impl_for_feedback,
+    render_python_moved_class_dunder_methods_for_feedback,
+    render_python_config_subscript_fallback_for_feedback,
+    render_python_helper_api_usage_for_feedback,
+    render_python_noniterable_class_loop_for_feedback,
     render_removed_symbol_test_refs_for_feedback,
     render_residue_for_feedback,
     render_undefined_config_symbol_for_feedback,
     revert_test_file_edits,
 )
 from src.orchestrator.grounding import run_static_grounding
-from src.orchestrator.dynamic_grounding import run_dynamic_grounding
 from src.orchestrator.guards import (
     DeepSearchBudget,
     check_consistency_anchors_format,
@@ -270,6 +409,7 @@ from src.orchestrator.states import (
     PipelineState,
     is_valid_transition,
 )
+from src.orchestrator.work_packages import build_anchor_index, create_work_packages
 from src.tools.ingestion_tools import (
     DEEP_SEARCH_OWNED_FIELDS,
     get_submitted_evidence,
@@ -409,6 +549,8 @@ def _verify_plan_coverage(
     missing: list[str] = []
     for path in planned_files:
         norm = path.replace("\\", "/")
+        if is_test_file(norm):
+            continue
         if norm not in diff_paths:
             missing.append(norm)
     return missing
@@ -418,6 +560,7 @@ def _compute_baseline_build(
     repo_dir: Path,
     system: str,
     python_targets: list[str] | None = None,
+    go_targets: list[str] | None = None,
 ) -> BuildCheckResult | None:
     """Compute the build result at clean base_commit, restoring the patch after.
 
@@ -454,6 +597,7 @@ def _compute_baseline_build(
             repo_dir,
             system,
             python_targets=python_targets,
+            go_targets=go_targets,
         )
         print(
             f"[build-verify] baseline build at base_commit: ok={baseline.ok} "
@@ -476,6 +620,272 @@ _GO_SIG_ERROR_RE = re.compile(
     r"too many arguments|cannot use"
 )
 _GO_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+_GO_UNDEFINED_RE = re.compile(r"undefined:\s+([A-Za-z_]\w*)\b")
+_GO_UNDEFINED_QUALIFIED_RE = re.compile(r"undefined:\s+([A-Za-z_]\w*)\.([A-Za-z_]\w*)")
+_GO_UNKNOWN_FIELD_RE = re.compile(r"unknown field\s+([A-Za-z_]\w*)\s+in struct literal")
+_GO_CALL_QUALIFIED_RE = re.compile(
+    r"(?:in call to|cannot use)\s+([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b"
+)
+_GO_TYPE_MEMBER_MISSING_RE = re.compile(
+    r"type\s+([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s+has no field or method\s+([A-Za-z_]\w*)"
+)
+_GO_LOCAL_IMPORT_ERROR_RE = re.compile(
+    r"(?:package|module provides package)\s+(?P<path>[A-Za-z0-9_./-]*internal/[A-Za-z0-9_./-]+)"
+)
+_GO_IMPORT_RE = re.compile(
+    r'(?m)^\s*(?:(?P<alias>[A-Za-z_]\w*)\s+)?'
+    r'"(?P<path>[^"]+)"'
+)
+_GO_SINGLE_IMPORT_RE = re.compile(
+    r'(?m)^\s*import\s+(?:(?P<alias>[A-Za-z_]\w*)\s+)?'
+    r'"(?P<path>[^"]+)"'
+)
+_GO_EXPORTED_DEF_RE = re.compile(
+    r"^\s*(?:func\s+(?:\([^)]*\)\s*)?(?P<func>[A-Z]\w*)\s*\(|"
+    r"type\s+(?P<type>[A-Z]\w*)\b|"
+    r"(?:const|var)\s+(?P<single>[A-Z]\w*)\b|"
+    r"(?P<block>[A-Z]\w*)\s*(?:=|[A-Za-z_][\w.\[\]*{}]*))"
+)
+_REMOVED_SYMBOL_NAME_RE = re.compile(
+    r"(?:definition of|surface/member named) '([^']+)'"
+)
+_UNDEFINED_CONFIG_SYMBOL_RE = re.compile(r"undefined config symbol:\s+'([^']+)'")
+
+
+def _exact_symbols_from_build_error(message: str) -> list[str]:
+    symbols: list[str] = []
+    qualified_aliases: set[str] = set()
+    for match in _UNDEFINED_CONFIG_SYMBOL_RE.findall(message or ""):
+        if match not in symbols:
+            symbols.append(match)
+    for alias, match in _GO_UNDEFINED_QUALIFIED_RE.findall(message or ""):
+        qualified_aliases.add(alias)
+        if match not in symbols:
+            symbols.append(match)
+    for _, match in _GO_CALL_QUALIFIED_RE.findall(message or ""):
+        if match not in symbols:
+            symbols.append(match)
+    for _, _, match in _GO_TYPE_MEMBER_MISSING_RE.findall(message or ""):
+        if match not in symbols:
+            symbols.append(match)
+    for match in _GO_UNDEFINED_RE.findall(message or ""):
+        if "." in match or match in symbols or match in qualified_aliases:
+            continue
+        symbols.append(match)
+    for match in _GO_UNKNOWN_FIELD_RE.findall(message or ""):
+        if match not in symbols:
+            symbols.append(match)
+    return symbols
+
+
+def _go_module_path(repo_dir: Path) -> str:
+    try:
+        text = (repo_dir / "go.mod").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("module "):
+            return line.split(None, 1)[1].strip()
+    return ""
+
+
+def _go_import_aliases(file_text: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for match in list(_GO_IMPORT_RE.finditer(file_text)) + list(_GO_SINGLE_IMPORT_RE.finditer(file_text)):
+        path = match.group("path")
+        alias = match.group("alias") or path.rsplit("/", 1)[-1]
+        if alias in {".", "_"}:
+            continue
+        aliases[alias] = path
+    return aliases
+
+
+def _go_package_export_summary(repo_dir: Path, package_dir: Path, limit: int = 80) -> list[str]:
+    exports: list[str] = []
+    seen: set[str] = set()
+    if not package_dir.exists() or not package_dir.is_dir():
+        return exports
+    for path in sorted(package_dir.glob("*.go")):
+        if path.name.endswith("_test.go"):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            m = _GO_EXPORTED_DEF_RE.match(line)
+            if not m:
+                continue
+            name = next((v for v in m.groupdict().values() if v), "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                rel = path.relative_to(repo_dir).as_posix()
+            except ValueError:
+                rel = path.as_posix()
+            exports.append(f"  {rel}: {name} :: {stripped[:140]}")
+            if len(exports) >= limit:
+                return exports
+    return exports
+
+
+def _enrich_go_errors_with_package_exports(
+    repo_dir: Path,
+    errors: list[BuildError],
+    limit_packages: int = 6,
+) -> str:
+    """Attach exported names for packages cited by ``undefined: pkg.X``."""
+    module = _go_module_path(repo_dir)
+    if not module:
+        return ""
+    package_requests: dict[tuple[str, str], set[str]] = {}
+    file_cache: dict[str, str] = {}
+    for err in errors:
+        if not err.file.endswith(".go"):
+            continue
+        matches = _GO_UNDEFINED_QUALIFIED_RE.findall(err.message)
+        if not matches:
+            continue
+        if err.file not in file_cache:
+            try:
+                file_cache[err.file] = (repo_dir / err.file).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                file_cache[err.file] = ""
+        aliases = _go_import_aliases(file_cache[err.file])
+        for alias, symbol in matches:
+            import_path = aliases.get(alias)
+            if not import_path or not import_path.startswith(module + "/"):
+                continue
+            package_requests.setdefault((alias, import_path), set()).add(symbol)
+
+    blocks: list[str] = []
+    for (alias, import_path), missing in list(package_requests.items())[:limit_packages]:
+        rel_dir = import_path[len(module) + 1 :]
+        exports = _go_package_export_summary(repo_dir, repo_dir / rel_dir)
+        if not exports:
+            continue
+        blocks.append(
+            f"Package {alias} ({import_path}) was referenced with missing "
+            f"symbol(s): {', '.join(sorted(missing))}. Actual exported names "
+            "currently present in that package:\n" + "\n".join(exports[:40])
+        )
+    if not blocks:
+        return ""
+    return (
+        "Go package export context for undefined qualified symbols. Use these "
+        "actual names or add an explicit compatibility alias in the defining "
+        "package; do not invent analogous names:\n\n" + "\n\n".join(blocks)
+    )
+
+
+def _enrich_go_errors_with_module_import_paths(
+    repo_dir: Path,
+    errors: list[BuildError],
+) -> str:
+    """Render concrete module-qualified replacements for bad local imports."""
+    module = _go_module_path(repo_dir)
+    if not module:
+        return ""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for err in errors:
+        for match in _GO_LOCAL_IMPORT_ERROR_RE.finditer(err.message):
+            bad = match.group("path").strip().strip('"')
+            idx = bad.find("internal/")
+            if idx < 0:
+                continue
+            suffix = bad[idx:]
+            desired = f"{module}/{suffix}"
+            if desired in seen:
+                continue
+            seen.add(desired)
+            exists_note = (
+                "directory exists"
+                if (repo_dir / suffix).is_dir()
+                else "directory not found; verify the intended local package"
+            )
+            loc = f"{err.file}:{err.line}" if err.line is not None else err.file
+            lines.append(
+                f"- {loc}: {err.message}\n"
+                f"  go.mod module is {module}; local internal package imports "
+                f"must use {desired} ({exists_note}). Do not use bare "
+                f"{suffix} or another repository's module prefix."
+            )
+    if not lines:
+        return ""
+    return "Go local import path correction:\n" + "\n".join(lines)
+
+
+def _extract_python_symbol_block(source: str, symbol: str, max_lines: int = 140) -> str:
+    lines = source.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if not (
+            re.match(rf"(?:async\s+)?def\s+{re.escape(symbol)}\s*\(", stripped)
+            or re.match(rf"class\s+{re.escape(symbol)}\b", stripped)
+            or re.match(rf"{re.escape(symbol)}\s*(?::[^=]+)?=", stripped)
+        ):
+            continue
+        start = idx
+        while start > 0 and lines[start - 1].lstrip().startswith("@"):
+            start -= 1
+        end = idx + 1
+        while end < len(lines) and end - start < max_lines:
+            nxt = lines[end]
+            if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent:
+                break
+            end += 1
+        return "\n".join(lines[start:end]).rstrip()
+    return ""
+
+
+def _enrich_removed_symbol_errors_with_base_definitions(
+    repo_dir: Path,
+    errors: list[BuildError],
+    limit_symbols: int = 8,
+) -> str:
+    """Attach base-version definitions for removed-symbol static repairs."""
+    blocks: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for err in errors:
+        m = _REMOVED_SYMBOL_NAME_RE.search(err.message)
+        if not m or not err.file:
+            continue
+        symbol = m.group(1)
+        key = (err.file, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        rc, base_text, _ = _run_git(repo_dir, "show", f"HEAD:{err.file}")
+        if rc != 0 or not base_text:
+            continue
+        block = _extract_python_symbol_block(base_text, symbol) if err.file.endswith(".py") else ""
+        if not block:
+            lines = base_text.splitlines()
+            for idx, line in enumerate(lines):
+                if re.search(rf"\b{re.escape(symbol)}\b", line):
+                    start = max(0, idx - 5)
+                    end = min(len(lines), idx + 25)
+                    block = "\n".join(lines[start:end]).rstrip()
+                    break
+        if not block:
+            continue
+        blocks.append(
+            f"Base definition for {symbol} in {err.file}; restore a compatible "
+            "production shim/API unless the requirement explicitly removes it:\n"
+            f"```text\n{block}\n```"
+        )
+        if len(blocks) >= limit_symbols:
+            break
+    if not blocks:
+        return ""
+    return "Deleted-symbol base definitions for static repair:\n\n" + "\n\n".join(blocks)
 
 
 def _enrich_go_errors_with_definitions(
@@ -535,6 +945,69 @@ def _enrich_go_errors_with_definitions(
     )
 
 
+def _go_local_import_path_to_dir(repo_dir: Path, import_path: str) -> Path | None:
+    module = _go_module_path(repo_dir)
+    if not module or not import_path.startswith(module + "/"):
+        return None
+    rel_dir = import_path[len(module) + 1 :].strip("/")
+    if not rel_dir:
+        return None
+    package_dir = repo_dir / rel_dir
+    if not package_dir.is_dir():
+        return None
+    return package_dir
+
+
+def _go_package_definition_files(
+    repo_dir: Path,
+    package_dir: Path,
+    symbol: str,
+    *,
+    limit: int = 3,
+) -> list[str]:
+    if not symbol:
+        return []
+    patterns = (
+        rf"^\s*func\s+(?:\([^)]*\)\s*)?{re.escape(symbol)}\s*\(",
+        rf"^\s*type\s+{re.escape(symbol)}\b",
+        rf"^\s*(?:const|var)\s+{re.escape(symbol)}\b",
+        rf"^\s*{re.escape(symbol)}\s*(?:=|[A-Za-z_][\w.\[\]*{{}}]*)",
+    )
+    hits: list[str] = []
+    for path in sorted(package_dir.glob("*.go")):
+        if path.name.endswith("_test.go"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not any(re.search(pattern, text, flags=re.MULTILINE) for pattern in patterns):
+            continue
+        try:
+            rel = path.relative_to(repo_dir).as_posix()
+        except ValueError:
+            rel = path.as_posix()
+        hits.append(rel)
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def _go_file_mentions_symbol(
+    repo_dir: Path,
+    relpath: str,
+    symbol: str,
+) -> bool:
+    if not symbol:
+        return False
+    path = repo_dir / relpath
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return re.search(rf"\b{re.escape(symbol)}\b", text) is not None
+
+
 def _pick_next_requirement(
     evidence: EvidenceCards,
     frozen_ids: set[str] | None = None,
@@ -551,6 +1024,60 @@ def _pick_next_requirement(
                 continue
             return req
     return None
+
+
+_DEEP_SEARCH_ITERATION_OUTCOME_RE = re.compile(r"^iter(\d+):")
+
+
+def _restore_deep_search_iteration(saved: int, action_history: list) -> int:
+    """Restore a monotonic deep-search count, including legacy checkpoints.
+
+    Older checkpoints accidentally persisted ``budget.iterations`` while the
+    budget class increments ``budget.iteration``.  Their saved value is usually
+    zero even after many completed searches.  Recover the largest recorded
+    iteration from action history so resuming such a checkpoint cannot silently
+    grant another full budget.
+    """
+    restored = max(0, int(saved or 0))
+    for event in action_history:
+        if getattr(event, "subagent", "") != "deep-search":
+            continue
+        match = _DEEP_SEARCH_ITERATION_OUTCOME_RE.match(
+            getattr(event, "outcome", "")
+        )
+        if match:
+            restored = max(restored, int(match.group(1)))
+    return restored
+
+
+def _deep_search_iteration_limit(requirement_count: int) -> int:
+    """Size the search budget so every parsed requirement can be inspected.
+
+    The historical fixed limit of 30 made issues with more than 30 requirement
+    fragments fail deterministically: the final fragments stayed UNCHECKED
+    before the first closure pass.  Keep the established 30-iteration floor for
+    ordinary issues, while reserving bounded headroom for closure-directed
+    rework on larger issues.
+    """
+    count = max(0, int(requirement_count or 0))
+    return max(30, count + 10)
+
+
+def _should_run_compile_repair(
+    rounds_used: int,
+    rounds_max: int,
+    current_error_count: int,
+    previous_error_count: int | None,
+) -> bool:
+    """Grant one bonus round only when compile repair is nearly converged."""
+    if rounds_used < rounds_max:
+        return True
+    return (
+        rounds_used == rounds_max
+        and 0 < current_error_count <= 3
+        and previous_error_count is not None
+        and current_error_count < previous_error_count
+    )
 
 
 # ── Phase-27 heuristic-gate plumbing ────────────────────────────────────────
@@ -595,12 +1122,68 @@ def _errs_to_log(errors: list[BuildError]) -> list[dict[str, Any]]:
     ]
 
 
+def _python_module_to_source_path(repo_dir: Path, module: str) -> str | None:
+    rel = Path(*module.split("."))
+    py = repo_dir / f"{rel.as_posix()}.py"
+    if py.is_file():
+        return py.relative_to(repo_dir).as_posix()
+    init = repo_dir / rel / "__init__.py"
+    if init.is_file():
+        return init.relative_to(repo_dir).as_posix()
+    return None
+
+
+def _js_missing_import_target_path(
+    repo_dir: Path,
+    importer_path: str,
+    target: str,
+) -> str | None:
+    if not importer_path or not target or not target.startswith("."):
+        return None
+    importer = Path(importer_path.replace("\\", "/").strip().lstrip("./"))
+    base = Path("/") / importer.parent / target
+    rel_base = posixpath.normpath(base.as_posix()).lstrip("/")
+    importer_suffix = importer.suffix.lower()
+    suffixes = []
+    if importer_suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}:
+        suffixes.append(importer_suffix)
+    suffixes.extend([".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".mts", ".cts"])
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for suffix in suffixes:
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        candidates.append(f"{rel_base}{suffix}")
+        candidates.append(f"{rel_base}/index{suffix}")
+    for candidate in candidates:
+        normalized = posixpath.normpath(candidate)
+        if (repo_dir / normalized).is_file():
+            return normalized
+    return posixpath.normpath(f"{rel_base}{suffixes[0]}")
+
+
+def _js_existing_import_target_path(
+    repo_dir: Path,
+    importer_path: str,
+    target: str,
+) -> str | None:
+    candidate = _js_missing_import_target_path(repo_dir, importer_path, target)
+    if not candidate:
+        return None
+    return candidate if (repo_dir / candidate).is_file() else None
+
+
 def _artifact_findings_to_errors(
+    repo_dir: Path,
     findings: list[ArtifactFinding],
 ) -> list[BuildError]:
     """Adapt artifact findings to the existing repatch error plumbing."""
     errors: list[BuildError] = []
     for finding in findings:
+        error_file = finding.file
+        if finding.code == "IMPORT_SYMBOL_MISSING" and finding.target:
+            error_file = _python_module_to_source_path(repo_dir, finding.target) or error_file
         msg = finding.message
         if finding.symbol:
             msg = f"{msg} [symbol={finding.symbol}]"
@@ -608,12 +1191,58 @@ def _artifact_findings_to_errors(
             msg = f"{msg} [target={finding.target}]"
         errors.append(
             BuildError(
-                file=finding.file,
+                file=error_file,
                 line=None,
                 message=f"{finding.code}: {msg}",
                 raw=finding.raw or finding.message,
             )
         )
+        if (
+            finding.code == "IMPORT_SYMBOL_MISSING"
+            and finding.target
+            and finding.target.startswith(".")
+        ):
+            target_path = _js_existing_import_target_path(
+                repo_dir, finding.file, finding.target
+            )
+            if target_path:
+                errors.append(
+                    BuildError(
+                        file=target_path,
+                        line=None,
+                        message=(
+                            f"IMPORT_SYMBOL_MISSING: importer {finding.file} expects "
+                            f"`{finding.symbol}` to resolve from {finding.target}. "
+                            f"Export or re-export that exact symbol from {target_path}."
+                        ),
+                        raw=finding.raw or finding.message,
+                    )
+                )
+        if finding.code == "IMPORT_TARGET_MISSING":
+            missing_js_target = _js_missing_import_target_path(
+                repo_dir, finding.file, finding.target
+            )
+            if missing_js_target:
+                symbol_hint = Path(finding.target).name.strip()
+                hint = (
+                    f" If this import path is intended, create/export the module at "
+                    f"{missing_js_target}"
+                    + (
+                        f" and define/export `{symbol_hint}` there."
+                        if symbol_hint else "."
+                    )
+                )
+                errors.append(
+                    BuildError(
+                        file=missing_js_target,
+                        line=None,
+                        message=(
+                            f"IMPORT_TARGET_MISSING: importer {finding.file} references "
+                            f"missing relative module {finding.target}.{hint}"
+                        ),
+                        raw=finding.raw or finding.message,
+                    )
+                )
     return errors
 
 
@@ -662,12 +1291,624 @@ def _prune_plan_to_error_files(
     return PatchPlan(overview=plan.overview, edits=kept), dropped
 
 
+def _augment_repair_plan_with_errors(
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+    *,
+    reason: str,
+) -> "PatchPlan | None":
+    """Ensure a direct repair plan carries the concrete verifier failures.
+
+    Direct Stage2 repair bypasses the planner and invokes the patch-generator
+    against a narrowed PatchPlan.  If the error text is only placed in working
+    memory, a focused per-file prompt can still anchor on stale preserved
+    findings.  Attach the blocking verifier messages to each implicated
+    FileEditPlan as hard preserved findings, and synthesize a minimal edit plan
+    when the original plan did not include the error file.
+    """
+    grouped: dict[str, list[str]] = {}
+    symbols_by_path: dict[str, list[str]] = {}
+
+    def _norm(path: str) -> str:
+        return path.replace("\\", "/").strip().lstrip("./")
+
+    def _should_attach_exact_symbol(err: BuildError) -> bool:
+        message = err.message or ""
+        if _GO_UNKNOWN_FIELD_RE.search(message):
+            return True
+        if _GO_UNDEFINED_QUALIFIED_RE.search(message):
+            return True
+        if _GO_CALL_QUALIFIED_RE.search(message):
+            return True
+        if _GO_TYPE_MEMBER_MISSING_RE.search(message):
+            return True
+        if "IMPORT_SYMBOL_MISSING" in message:
+            return True
+        if "IMPORT_TARGET_MISSING" in message:
+            return True
+        if _UNDEFINED_CONFIG_SYMBOL_RE.search(message):
+            return True
+        if "removed symbol still referenced" in message:
+            return True
+        if _GO_UNDEFINED_RE.search(message):
+            return err.line is None
+        return False
+
+    def _attach_exact_symbol_to_error_path(path: str, err: BuildError) -> bool:
+        message = err.message or ""
+        if (
+            _UNDEFINED_CONFIG_SYMBOL_RE.search(message)
+            and not path.endswith(".go")
+        ):
+            return False
+        if (
+            (_GO_UNDEFINED_QUALIFIED_RE.search(message) or _GO_CALL_QUALIFIED_RE.search(message))
+            and "cross-package compile repair context" not in message
+        ):
+            return False
+        return True
+
+    def _removed_symbol_compatibility_finding(path: str, message: str) -> str | None:
+        m = _REMOVED_SYMBOL_NAME_RE.search(message)
+        if not m:
+            return None
+        symbol = m.group(1)
+        return (
+            f"{reason}: {path}: MANDATORY compatibility repair for deleted "
+            f"surface/member '{symbol}'. Restore a production code surface in "
+            f"{path} spelled '{symbol}' with the same syntactic form that "
+            "existing tests still compile against. If tests still construct or "
+            "access it as a field/member, keep a compatibility field/member "
+            "with that exact spelling on the owning production shape. If tests "
+            "still import or call it, keep a thin alias, re-export, wrapper, "
+            "or delegating shim unless the requirement explicitly removes the "
+            "old API. For move/extract/refactor patches, keep the new canonical "
+            "implementation, but also preserve the old compatibility surface. "
+            "Do not edit tests, and do not merely update callers; both the "
+            "canonical new path and the old compatibility path must resolve."
+        )
+
+    for err in errors:
+        path = _norm(err.file or "")
+        if not path or path == "(build)":
+            continue
+        loc = f"{path}:{err.line}" if err.line is not None else path
+        bucket = grouped.setdefault(path, [])
+        bucket.append(f"{reason}: {loc}: {err.message}")
+        compat = _removed_symbol_compatibility_finding(path, err.message)
+        if compat:
+            bucket.append(compat)
+        attach_exact_symbol = (
+            _should_attach_exact_symbol(err)
+            and _attach_exact_symbol_to_error_path(path, err)
+        )
+        if attach_exact_symbol:
+            for symbol in _exact_symbols_from_build_error(err.message):
+                bucket_symbols = symbols_by_path.setdefault(path, [])
+                if symbol not in bucket_symbols:
+                    bucket_symbols.append(symbol)
+
+    if not grouped:
+        return plan
+
+    edits: list[FileEditPlan] = []
+    seen_files: set[str] = set()
+    merged_files: set[str] = set()
+    if plan is not None:
+        by_path: dict[str, list[FileEditPlan]] = {}
+        order: list[str] = []
+        for edit in plan.edits:
+            path = _norm(edit.filepath)
+            seen_files.add(path)
+            if path not in by_path:
+                by_path[path] = []
+                order.append(path)
+            by_path[path].append(edit)
+
+        for path in order:
+            existing = by_path[path]
+            additions = grouped.get(path, [])
+            if not additions:
+                edits.extend(existing)
+                continue
+            merged_files.add(path)
+            findings: list[str] = []
+            co_edits: list[str] = []
+            expected_symbols: list[str] = []
+            requirement_ids: list[str] = []
+            rationales: list[str] = []
+            target_functions: list[str] = []
+            for edit in existing:
+                for target in edit.target_functions:
+                    if target not in target_functions:
+                        target_functions.append(target)
+                for item in edit.preserved_findings:
+                    if item not in findings:
+                        findings.append(item)
+                for dep in edit.co_edit_dependencies:
+                    if dep not in co_edits:
+                        co_edits.append(dep)
+                for symbol in edit.expected_symbols:
+                    if symbol not in expected_symbols:
+                        expected_symbols.append(symbol)
+                for req_id in edit.required_by_requirement_ids:
+                    if req_id not in requirement_ids:
+                        requirement_ids.append(req_id)
+                rationale = (edit.change_rationale or "").strip()
+                if rationale and rationale not in rationales:
+                    rationales.append(rationale)
+            for item in additions:
+                if item not in findings:
+                    findings.append(item)
+            for symbol in symbols_by_path.get(path, []):
+                if symbol not in expected_symbols:
+                    expected_symbols.append(symbol)
+            keep_target_scope = bool(target_functions)
+            edits.append(
+                FileEditPlan(
+                    filepath=existing[0].filepath,
+                    target_functions=target_functions if keep_target_scope else [],
+                    change_rationale=_compose_change_rationale(
+                        header=(
+                            f"Direct Stage2 repair for {reason}; resolve the "
+                            "blocking verifier findings across this file in one "
+                            + (
+                                "coherent targeted repair while preserving the "
+                                "planner's original localization."
+                                if keep_target_scope else
+                                "coherent file-wide pass while preserving the "
+                                "intended requirement-level behavior."
+                            )
+                        ),
+                        rationales=rationales,
+                    ),
+                    preserved_findings=findings,
+                    co_edit_dependencies=co_edits,
+                    reference_only=all(edit.reference_only for edit in existing),
+                    expected_diff_required=any(
+                        edit.expected_diff_required for edit in existing
+                    ),
+                    creates_new_file=any(edit.creates_new_file for edit in existing),
+                    expected_symbols=expected_symbols,
+                    required_by_requirement_ids=requirement_ids,
+                )
+            )
+
+    for path, messages in grouped.items():
+        if path in seen_files or path in merged_files:
+            continue
+        creates_new_file = any(
+            "create/export the module at" in message for message in messages
+        )
+        edits.append(
+            FileEditPlan(
+                filepath=path,
+                target_functions=[],
+                change_rationale=(
+                    f"Direct Stage2 repair for {reason}; fix the blocking "
+                    "verification findings in this production file."
+                ),
+                preserved_findings=messages,
+                co_edit_dependencies=[],
+                creates_new_file=creates_new_file,
+                expected_symbols=list(symbols_by_path.get(path, [])),
+            )
+        )
+
+    if not edits:
+        return plan
+
+    overview = (
+        plan.overview if plan is not None else
+        f"Direct Stage2 repair for {reason} verifier findings."
+    )
+    repaired = PatchPlan(overview=overview, edits=edits)
+    # Compile errors in one production file form one consistency problem.
+    # Re-splitting by finding count caused duplicate helper definitions and
+    # repeated model calls in later repair rounds.
+    return repaired
+
+
+def _reroute_test_compile_errors_to_production_files(
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+) -> list[BuildError]:
+    """Map test-file compile errors onto nearby production edit targets.
+
+    Stage2 compile repair must not spend budget editing evaluator-owned tests:
+    those edits are reverted immediately before verification. When a package
+    test fails to compile against patched production code, route the failure to
+    same-directory production files already present in the narrowed repair
+    context so the generator repairs the compatibility surface instead.
+    """
+
+    def _norm(path: str) -> str:
+        return path.replace("\\", "/").strip().lstrip("./")
+
+    planned_by_dir: dict[str, list[str]] = {}
+    if plan is not None:
+        for edit in plan.edits:
+            path = _norm(edit.filepath)
+            if not path or is_test_file(path):
+                continue
+            dir_path = path.rsplit("/", 1)[0] if "/" in path else ""
+            planned_by_dir.setdefault(dir_path, []).append(path)
+
+    routed: list[BuildError] = []
+    seen: set[tuple[str, int | None, str]] = set()
+    for err in errors:
+        path = _norm(err.file or "")
+        if not path or not is_test_file(path):
+            key = (err.file, err.line, err.message)
+            if key not in seen:
+                seen.add(key)
+                routed.append(err)
+            continue
+        dir_path = path.rsplit("/", 1)[0] if "/" in path else ""
+        targets = planned_by_dir.get(dir_path) or []
+        if not targets:
+            key = (err.file, err.line, err.message)
+            if key not in seen:
+                seen.add(key)
+                routed.append(err)
+            continue
+        origin = f"{path}:{err.line}" if err.line is not None else path
+        for target in targets:
+            message = (
+                f"test compile compatibility failure from {origin}: "
+                f"{err.message}"
+            )
+            key = (target, None, message)
+            if key in seen:
+                continue
+            seen.add(key)
+            routed.append(BuildError(file=target, line=None, message=message, raw=err.raw))
+    return routed
+
+
+def _expand_go_same_package_repair_context(
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+) -> list[BuildError]:
+    """Broaden Go compile repair to sibling production files in the same package.
+
+    Undefined-symbol and similar compatibility errors often surface at the
+    callsite file while the real fix belongs in a sibling file in the same Go
+    package that defines the production surface. Keep the original error, then
+    mirror it onto other planned production files in that directory so repair
+    can touch both callsite and definition files in one round.
+    """
+
+    def _norm(path: str) -> str:
+        return path.replace("\\", "/").strip().lstrip("./")
+
+    planned_by_dir: dict[str, list[str]] = {}
+    if plan is not None:
+        for edit in plan.edits:
+            path = _norm(edit.filepath)
+            if not path or is_test_file(path) or not path.endswith(".go"):
+                continue
+            dir_path = path.rsplit("/", 1)[0] if "/" in path else ""
+            planned_by_dir.setdefault(dir_path, []).append(path)
+
+    expanded: list[BuildError] = list(errors)
+    seen = {(err.file, err.line, err.message) for err in errors}
+    for err in errors:
+        path = _norm(err.file or "")
+        if not path.endswith(".go") or is_test_file(path):
+            continue
+        if not _GO_SIG_ERROR_RE.search(err.message or ""):
+            continue
+        dir_path = path.rsplit("/", 1)[0] if "/" in path else ""
+        targets = planned_by_dir.get(dir_path) or []
+        if len(targets) < 2:
+            continue
+        origin = f"{path}:{err.line}" if err.line is not None else path
+        for target in targets:
+            if target == path:
+                continue
+            message = f"same-package compile repair context from {origin}: {err.message}"
+            key = (target, None, message)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(BuildError(file=target, line=None, message=message, raw=err.raw))
+    return expanded
+
+
+def _expand_go_cross_package_owner_context(
+    repo_dir: Path,
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+) -> list[BuildError]:
+    """Mirror Go compile errors onto imported local-package owner files.
+
+    Same-package context is insufficient when a caller drifts from an imported
+    package's real API. If the narrowed repair plan already contains likely
+    owner files in that imported package, surface the same verifier failure on
+    those files too so direct repair can revise caller and provider together.
+    """
+
+    def _norm(path: str) -> str:
+        return path.replace("\\", "/").strip().lstrip("./")
+
+    planned_by_dir: dict[str, list[str]] = {}
+    if plan is not None:
+        for edit in plan.edits:
+            path = _norm(edit.filepath)
+            if not path or is_test_file(path) or not path.endswith(".go"):
+                continue
+            dir_path = path.rsplit("/", 1)[0] if "/" in path else ""
+            planned_by_dir.setdefault(dir_path, []).append(path)
+
+    module = _go_module_path(repo_dir)
+    if not module:
+        return errors
+
+    expanded: list[BuildError] = list(errors)
+    seen = {(err.file, err.line, err.message) for err in errors}
+    file_cache: dict[str, str] = {}
+
+    for err in errors:
+        caller = _norm(err.file or "")
+        if not caller.endswith(".go") or is_test_file(caller):
+            continue
+        if caller not in file_cache:
+            try:
+                file_cache[caller] = (repo_dir / caller).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                file_cache[caller] = ""
+        aliases = _go_import_aliases(file_cache[caller])
+        if not aliases:
+            continue
+
+        requests: list[tuple[str, str]] = []
+        requests.extend(_GO_UNDEFINED_QUALIFIED_RE.findall(err.message or ""))
+        requests.extend(_GO_CALL_QUALIFIED_RE.findall(err.message or ""))
+        for alias, type_name, member in _GO_TYPE_MEMBER_MISSING_RE.findall(err.message or ""):
+            requests.append((alias, type_name))
+            requests.append((alias, member))
+
+        origin = f"{caller}:{err.line}" if err.line is not None else caller
+        routed_targets: set[str] = set()
+        caller_dir = caller.rsplit("/", 1)[0] if "/" in caller else ""
+        for alias, symbol in requests:
+            import_path = aliases.get(alias)
+            if not import_path or not import_path.startswith(module + "/"):
+                continue
+            package_dir = _go_local_import_path_to_dir(repo_dir, import_path)
+            if package_dir is None:
+                continue
+            try:
+                rel_dir = package_dir.relative_to(repo_dir).as_posix()
+            except ValueError:
+                continue
+            if rel_dir == caller_dir:
+                continue
+
+            targets = _go_package_definition_files(repo_dir, package_dir, symbol)
+            if not targets:
+                targets = list(planned_by_dir.get(rel_dir, []))
+            if not targets:
+                continue
+
+            for target in targets:
+                if target in routed_targets:
+                    continue
+                routed_targets.add(target)
+                message = (
+                    f"cross-package compile repair context from {origin} via "
+                    f"import {alias}={import_path}: {err.message}"
+                )
+                key = (target, None, message)
+                if key in seen:
+                    continue
+                seen.add(key)
+                expanded.append(
+                    BuildError(file=target, line=None, message=message, raw=err.raw)
+                )
+    return expanded
+
+
+def _expand_config_symbol_owner_context(
+    repo_dir: Path,
+    plan: "PatchPlan | None",
+    errors: list[BuildError],
+) -> list[BuildError]:
+    """Mirror undefined config-symbol findings onto likely production owners.
+
+    Static closure can report the drift on a schema/config artifact even though
+    the actual repair belongs in production config code. Expand those findings
+    onto likely owner-side Go files so direct Stage2 repair can touch the
+    definition site instead of anchoring only on the artifact file.
+    """
+
+    def _norm(path: str) -> str:
+        return path.replace("\\", "/").strip().lstrip("./")
+
+    planned_go_files: list[str] = []
+    if plan is not None:
+        for edit in plan.edits:
+            path = _norm(edit.filepath)
+            if not path or is_test_file(path) or not path.endswith(".go"):
+                continue
+            planned_go_files.append(path)
+
+    repo_go_files: list[str] = []
+    for path in sorted(repo_dir.rglob("*.go")):
+        if path.name.endswith("_test.go"):
+            continue
+        try:
+            rel = path.relative_to(repo_dir).as_posix()
+        except ValueError:
+            continue
+        repo_go_files.append(rel)
+
+    def _config_scored(candidates: list[str]) -> list[str]:
+        scored: list[tuple[int, str]] = []
+        for candidate in candidates:
+            score = 0
+            lowered = candidate.lower()
+            if "/config/" in lowered or lowered.startswith("config/"):
+                score += 4
+            if lowered.endswith("/config.go") or lowered.endswith("config.go"):
+                score += 2
+            scored.append((score, candidate))
+        return [path for _, path in sorted(scored, key=lambda item: (-item[0], item[1]))]
+
+    expanded: list[BuildError] = list(errors)
+    seen = {(err.file, err.line, err.message) for err in errors}
+    for err in errors:
+        match = _UNDEFINED_CONFIG_SYMBOL_RE.search(err.message or "")
+        source_path = _norm(err.file or "")
+        if not match or not source_path or source_path == "(build)":
+            continue
+        symbol = match.group(1)
+        owner_targets: list[str] = []
+        for candidate in _config_scored(planned_go_files):
+            if _go_file_mentions_symbol(repo_dir, candidate, symbol) and candidate not in owner_targets:
+                owner_targets.append(candidate)
+        if not owner_targets:
+            for candidate in _config_scored(repo_go_files):
+                if _go_file_mentions_symbol(repo_dir, candidate, symbol) and candidate not in owner_targets:
+                    owner_targets.append(candidate)
+                if len(owner_targets) >= 3:
+                    break
+        if not owner_targets:
+            fallback_pool = _config_scored(planned_go_files) or _config_scored(repo_go_files)
+            owner_targets.extend(fallback_pool[:2])
+        for target in owner_targets:
+            if target == source_path:
+                continue
+            message = (
+                f"config-symbol repair context from {source_path} for symbol "
+                f"{symbol}: {err.message}"
+            )
+            key = (target, None, message)
+            if key in seen:
+                continue
+            seen.add(key)
+            expanded.append(
+                BuildError(file=target, line=None, message=message, raw=err.raw)
+            )
+    return expanded
+
+
+_RATIONALE_THEME_MAX_ITEMS = 8
+_RATIONALE_THEME_MAX_CHARS = 2400
+
+
+def _normalize_rationale_theme(text: str) -> str:
+    """Strip nested boilerplate so repair themes do not grow recursively."""
+    normalized = (text or "").strip()
+    if not normalized:
+        return ""
+    if "\nOriginal planner themes:\n" in normalized:
+        normalized = normalized.split("\nOriginal planner themes:\n", 1)[0].strip()
+    normalized = " ".join(normalized.split())
+    return normalized
+
+
+def _compact_rationale_themes(rationales: list[str]) -> list[str]:
+    """Deduplicate and bound rationale themes for repair/merge prompts."""
+    kept: list[str] = []
+    total_chars = 0
+    for raw in rationales:
+        theme = _normalize_rationale_theme(raw)
+        if not theme or theme in kept:
+            continue
+        if len(theme) > 280:
+            theme = theme[:277].rstrip() + "..."
+        projected = total_chars + len(theme)
+        if kept and (
+            len(kept) >= _RATIONALE_THEME_MAX_ITEMS
+            or projected > _RATIONALE_THEME_MAX_CHARS
+        ):
+            break
+        kept.append(theme)
+        total_chars = projected
+    return kept
+
+
+def _compose_change_rationale(
+    *,
+    header: str,
+    rationales: list[str] | None = None,
+) -> str:
+    """Compose a bounded rationale string from a header and prior themes."""
+    compact = _compact_rationale_themes(list(rationales or []))
+    if not compact:
+        return header
+    return header + "\nOriginal planner themes:\n- " + "\n- ".join(compact)
+
+
+def _merge_patch_plans(
+    base: "PatchPlan | None",
+    extra: "PatchPlan | None",
+) -> "PatchPlan | None":
+    """Union two plans so final artifact verification keeps all obligations."""
+    if base is None:
+        return extra
+    if extra is None:
+        return base
+
+    def _merge_lists(left: list[str], right: list[str]) -> list[str]:
+        merged = list(left)
+        for item in right:
+            if item not in merged:
+                merged.append(item)
+        return merged
+
+    merged_by_path: dict[str, FileEditPlan] = {}
+    order: list[str] = []
+    for edit in [*base.edits, *extra.edits]:
+        path = edit.filepath
+        if path not in merged_by_path:
+            merged_by_path[path] = edit.model_copy(deep=True)
+            order.append(path)
+            continue
+        current = merged_by_path[path]
+        merged_by_path[path] = FileEditPlan(
+            filepath=current.filepath,
+            target_functions=_merge_lists(current.target_functions, edit.target_functions),
+            change_rationale=_compose_change_rationale(
+                header=_normalize_rationale_theme(current.change_rationale)
+                or _normalize_rationale_theme(edit.change_rationale)
+                or "Merged repair themes for this file.",
+                rationales=[current.change_rationale, edit.change_rationale],
+            ),
+            preserved_findings=_merge_lists(current.preserved_findings, edit.preserved_findings),
+            co_edit_dependencies=_merge_lists(current.co_edit_dependencies, edit.co_edit_dependencies),
+            reference_only=current.reference_only and edit.reference_only,
+            expected_diff_required=current.expected_diff_required or edit.expected_diff_required,
+            creates_new_file=current.creates_new_file or edit.creates_new_file,
+            expected_symbols=_merge_lists(current.expected_symbols, edit.expected_symbols),
+            required_by_requirement_ids=_merge_lists(
+                current.required_by_requirement_ids,
+                edit.required_by_requirement_ids,
+            ),
+        )
+
+    merged_plan = PatchPlan(
+        overview=base.overview if base.overview == extra.overview else base.overview,
+        edits=[merged_by_path[path] for path in order],
+    )
+    _split_heavy_edits(merged_plan)
+    return merged_plan
+
+
 def _render_heuristic_feedback(
     contract_drift: list[BuildError],
     parallel_impl: list[BuildError],
     removed_sym_refs: list[BuildError],
     go_unexport: list[BuildError],
     config_shape: list[BuildError],
+    python_noniterable: list[BuildError],
+    python_helper_api: list[BuildError],
+    python_config_subscript: list[BuildError],
+    python_moved_class_dunder: list[BuildError],
     active: list[BuildError],
     residues: list[BuildError] | None = None,
     config_sym_errors: list[BuildError] | None = None,
@@ -693,6 +1934,10 @@ def _render_heuristic_feedback(
         (removed_sym_refs, render_removed_symbol_test_refs_for_feedback),
         (go_unexport, render_go_unexport_for_feedback),
         (config_shape, render_config_entry_shape_for_feedback),
+        (python_noniterable, render_python_noniterable_class_loop_for_feedback),
+        (python_helper_api, render_python_helper_api_usage_for_feedback),
+        (python_config_subscript, render_python_config_subscript_fallback_for_feedback),
+        (python_moved_class_dunder, render_python_moved_class_dunder_methods_for_feedback),
     ):
         kept = _keep(errs)
         if kept:
@@ -768,11 +2013,12 @@ def _build_deep_search_todo(
     if rework_context:
         base += (
             "\n\n── REWORK CONTEXT ─────────────────────────────\n"
-            "The previous verdict for this requirement was flagged by the "
-            "closure-checker as inconsistent with other requirements' "
-            "verdicts. Re-read the cited file regions carefully and decide "
-            "a verdict that is consistent across the contradicting "
-            "requirements. Do not simply repeat the prior verdict.\n\n"
+            "The previous verdict/localization for this requirement was "
+            "flagged by the closure-checker as semantically insufficient or "
+            "inconsistent. Re-read the cited file regions carefully and "
+            "produce a verdict plus concrete writable evidence fields that "
+            "resolve the closure feedback. Do not simply repeat the prior "
+            "verdict or the same localization path.\n\n"
             f"{rework_context}"
         )
     return base
@@ -901,6 +2147,26 @@ def _write_patch_outcome(
     print(f"[orchestrator] Patch outcome saved -> {patch_outcome_path}", flush=True)
 
 
+def _reconcile_final_patch_outcome(
+    patch_outcome: str | None,
+    closure_approved: bool,
+    *,
+    artifact_ok: bool,
+    artifact_empty_patch: bool,
+) -> tuple[str | None, bool]:
+    """Apply final artifact-verification downgrades without erasing infra exits."""
+    if artifact_ok:
+        return patch_outcome, closure_approved
+    closure_approved = False
+    if artifact_empty_patch:
+        if patch_outcome != "MODEL_INFRA_FAILURE":
+            patch_outcome = "NO_EFFECT_PATCH"
+        return patch_outcome, closure_approved
+    if patch_outcome in (None, "PATCH_SUCCESS", "PATCH_FAILED"):
+        patch_outcome = "PATCH_INCOMPLETE"
+    return patch_outcome, closure_approved
+
+
 async def _progressive_retrieve_ltm(
     *,
     stage: str,
@@ -932,6 +2198,8 @@ async def _progressive_retrieve_ltm(
             flush=True,
         )
         return summaries, experiences
+    except ModelInfrastructureError:
+        raise
     except Exception as exc:
         log_path = append_recommendations_log(
             output_dir,
@@ -981,6 +2249,8 @@ async def _route_and_match_custom_rules(
 
     try:
         route = await run_custom_router(query)
+    except ModelInfrastructureError:
+        raise
     except Exception as exc:
         append_custom_recommendations_log(
             output_dir,
@@ -1056,6 +2326,7 @@ def _save_checkpoint(
     counters: dict,
     ltm_query: str = "",
     custom_route_query: str = "",
+    aggregate_patch_plan: "PatchPlan | None" = None,
 ) -> None:
     payload = {
         "version": "1",
@@ -1066,6 +2337,11 @@ def _save_checkpoint(
         "custom_route_query": custom_route_query,
         "budget_counters": counters,
         "working_memory": json.loads(memory.model_dump_json()),
+        "aggregate_patch_plan": (
+            None
+            if aggregate_patch_plan is None
+            else json.loads(aggregate_patch_plan.model_dump_json())
+        ),
     }
     (output_dir / _CHECKPOINT_FILENAME).write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1095,16 +2371,16 @@ def _pack_counters(
     plan_coverage_rounds_used: int,
     per_req_unchecked_count: dict,
     closure_failure_streak: int,
-    dynamic_grounding_done: bool,
+    rework_rounds_by_req: dict[str, int] | None = None,
 ) -> dict:
     return {
-        "deep_search_iterations_done": budget.iterations,
+        "deep_search_iterations_done": budget.iteration,
         "rework_rounds_used": rework_rounds_used,
+        "rework_rounds_by_req": dict(rework_rounds_by_req or {}),
         "patch_verify_rounds_used": patch_verify_rounds_used,
         "plan_coverage_rounds_used": plan_coverage_rounds_used,
         "per_req_unchecked_count": per_req_unchecked_count,
         "closure_failure_streak": closure_failure_streak,
-        "dynamic_grounding_done": dynamic_grounding_done,
     }
 
 
@@ -1113,6 +2389,9 @@ async def run_pipeline_from_checkpoint(
     repo_dir: "str | Path",
     output_dir: "str | Path",
     checkpoint: dict,
+    *,
+    stop_after_closure: bool = False,
+    retry_failed_closure: bool = False,
 ) -> Path:
     """Resume a pipeline run from a previously saved checkpoint.
 
@@ -1141,13 +2420,56 @@ async def run_pipeline_from_checkpoint(
     )
 
     initial_state = PipelineState(checkpoint["pipeline_state"])
+    counters = checkpoint.get("budget_counters") or {}
+    if retry_failed_closure:
+        if not stop_after_closure:
+            raise ValueError(
+                "closure-only retry requires stop_after_closure=True"
+            )
+        legacy_exhausted_handoff = (
+            initial_state == PipelineState.UNDER_SPECIFIED
+            and int(counters.get("deep_search_iterations_done", 0)) >= 30
+            and int(counters.get("rework_rounds_used", 0)) >= 3
+        )
+        if (
+            initial_state != PipelineState.CLOSURE_FORCED_FAIL
+            and not legacy_exhausted_handoff
+        ):
+            raise ValueError(
+                "closure-only retry requires a ClosureForcedFail checkpoint "
+                "or a legacy exhausted 30/30, 3/3 analysis checkpoint"
+            )
+        unchecked = [
+            req.id
+            for req in memory.evidence_cards.requirements
+            if req.verdict == "UNCHECKED"
+        ]
+        if unchecked:
+            raise ValueError(
+                "closure-only retry refuses unchecked requirements: "
+                + ", ".join(unchecked)
+            )
+        memory.record_action(
+            phase="closure-check",
+            subagent="closure-checker",
+            outcome="closure_only_retry:budget_preserved",
+        )
+        initial_state = PipelineState.EVIDENCE_REFINING
+        print(
+            "[resume] Explicit closure-only retry: preserving evidence, action "
+            "history and all budget counters; deep-search remains exhausted.",
+            flush=True,
+        )
+    if stop_after_closure and initial_state == PipelineState.CLOSED:
+        print("[resume] Analysis checkpoint is already CLOSED.", flush=True)
+        return evidence_path
     print(
         f"[resume] Restoring pipeline at state={initial_state.value} "
         f"(checkpoint saved {checkpoint.get('saved_at', '?')})",
         flush=True,
     )
 
-    return await _run_state_machine(
+    return await _run_state_machine_managed(
         issue_id=issue_id,
         repo_dir=repo_dir,
         output_dir=output_dir,
@@ -1157,6 +2479,13 @@ async def run_pipeline_from_checkpoint(
         ltm_query=checkpoint.get("ltm_query", ""),
         custom_route_query=checkpoint.get("custom_route_query", ""),
         initial_counters=checkpoint.get("budget_counters"),
+        initial_aggregate_patch_plan=(
+            PatchPlan.model_validate(checkpoint["aggregate_patch_plan"])
+            if checkpoint.get("aggregate_patch_plan")
+            else None
+        ),
+        stop_after_closure=stop_after_closure,
+        closure_only_retry=retry_failed_closure,
     )
 
 
@@ -1170,6 +2499,8 @@ async def run_pipeline(
     artifact_text: str,
     output_dir: str | Path,
     problem_statement: str = "",
+    *,
+    stop_after_closure: bool = False,
 ) -> Path:
     """Drive the full repair pipeline via a code-driven state-machine loop.
 
@@ -1245,7 +2576,7 @@ async def run_pipeline(
     print(f"[orchestrator] Evidence cards saved -> {evidence_path}", flush=True)
     set_evidence_json_path(evidence_path.resolve())
 
-    return await _run_state_machine(
+    return await _run_state_machine_managed(
         issue_id=issue_id,
         repo_dir=repo_dir,
         output_dir=output_dir,
@@ -1254,6 +2585,7 @@ async def run_pipeline(
         initial_state=PipelineState.UNDER_SPECIFIED,
         ltm_query=ltm_query,
         custom_route_query=custom_route_query,
+        stop_after_closure=stop_after_closure,
     )
 
 
@@ -1285,7 +2617,7 @@ async def run_pipeline_from_evidence(
     evidence_path = (output_dir / "evidence.json").resolve()
     set_evidence_json_path(evidence_path)
 
-    return await _run_state_machine(
+    return await _run_state_machine_managed(
         issue_id=issue_id,
         repo_dir=repo_dir,
         output_dir=output_dir,
@@ -1294,6 +2626,13 @@ async def run_pipeline_from_evidence(
         initial_state=PipelineState.EVIDENCE_REFINING,
         ltm_query=(problem_statement or memory.issue_context).strip(),
     )
+
+
+async def _run_state_machine_managed(**kwargs) -> Path:
+    try:
+        return await _run_state_machine(**kwargs)
+    finally:
+        await close_structured_clients()
 
 
 async def _run_state_machine(
@@ -1306,12 +2645,28 @@ async def _run_state_machine(
     ltm_query: str = "",
     custom_route_query: str = "",
     initial_counters: dict | None = None,
+    initial_aggregate_patch_plan: "PatchPlan | None" = None,
+    stop_after_closure: bool = False,
+    closure_only_retry: bool = False,
 ) -> Path:
     """Core state-machine loop shared by run_pipeline and run_pipeline_from_evidence."""
     state = initial_state
     _c = initial_counters or {}
-    budget = DeepSearchBudget(max_iterations=30)
-    budget.iterations = _c.get("deep_search_iterations_done", 0)
+    initial_evidence = get_submitted_evidence()
+    requirement_count = (
+        len(initial_evidence.requirements) if initial_evidence is not None else 0
+    )
+    deep_search_limit = _deep_search_iteration_limit(requirement_count)
+    budget = DeepSearchBudget(max_iterations=deep_search_limit)
+    if deep_search_limit > 30:
+        print(
+            "[budget] expanded deep-search budget for "
+            f"{requirement_count} requirements: {deep_search_limit}",
+            flush=True,
+        )
+    budget.iteration = _restore_deep_search_iteration(
+        _c.get("deep_search_iterations_done", 0), memory.action_history,
+    )
     # Hard wall-clock cap per deep-search round. The SDK already has per-query
     # max_turns / max_budget_usd, but a wedged subprocess (e.g. an OOM-killed
     # child the parent never reaps) can hang the await forever. wait_for turns
@@ -1336,20 +2691,29 @@ async def _run_state_machine(
     # Rework budget: each EVIDENCE_MISSING with parseable req IDs re-opens
     # those requirements (verdict=UNCHECKED, scope cleared) and feeds the
     # closure-checker's rationale into deep-search as rework context.  The
-    # round counter tracks how many rework rounds have been consumed so far.
+    # total counter is retained for metrics.  Eligibility is enforced per
+    # requirement so one stubborn req cannot consume every precise rework slot
+    # and prevent a newly identified blocking req from being investigated.
     rework_rounds_used = _c.get("rework_rounds_used", 0)
-    rework_rounds_max = 3
+    rework_rounds_by_req = {
+        str(k): int(v)
+        for k, v in (_c.get("rework_rounds_by_req", {}) or {}).items()
+    }
+    per_req_rework_rounds_max = 3
 
     # Per-requirement retry counter: prevents infinite loops where the same
     # requirement keeps returning UNCHECKED and starving other requirements.
     per_req_unchecked_count: dict[str, int] = _c.get("per_req_unchecked_count", {})
     per_req_unchecked_max = 3
 
-    # Post-patch build verification: on NEW compile/collection errors the
-    # pipeline re-opens patch planning (CLOSED) with the errors fed back via
-    # memory.build_error_feedback. Capped at patch_verify_rounds_max.
+    # Post-patch compile verification permits a small number of direct
+    # patch-generator repairs for new file/line-attributable errors. It never
+    # re-enters planning. Static gates still get at most one repair attempt
+    # because repeated static warnings usually add no new information.
     patch_verify_rounds_used = _c.get("patch_verify_rounds_used", 0)
     patch_verify_rounds_max = 3
+    artifact_repair_rounds_used = 0
+    artifact_repair_rounds_max = 1
     # True once a build command demonstrably ran this session — a later
     # "unverifiable" verdict is then likely transient and retried once.
     toolchain_seen_working = False
@@ -1370,7 +2734,10 @@ async def _run_state_machine(
     # git-diff promotes ALL created files (a repatch overwrites memory.patch_plan
     # with the fixup plan, which would otherwise drop first-round new files).
     all_planned_files: set[str] = set()
-    # Per-round build verification records, written to build_verification.json.
+    aggregate_patch_plan = initial_aggregate_patch_plan
+    if aggregate_patch_plan is not None:
+        all_planned_files.update(edit.filepath for edit in aggregate_patch_plan.edits)
+    # Initial/final compile records, written to compile_check.json.
     build_verify_log: list[dict[str, Any]] = []
     # Per-round patch artifact verification records, written to
     # artifact_verification.json.
@@ -1408,13 +2775,6 @@ async def _run_state_machine(
     _ds_hollow_counts: dict[str, int] = {}
     _DS_HOLLOW_FORCE_READ = 1
 
-    # Dynamic grounding (phase 26): opt-in, runs at most once per case at the
-    # evidence stage (before the closure-checker LLM). Tracks whether the single
-    # pass has been consumed, plus the per-requirement reachability notes it
-    # produced (injected into the closure-checker as a soft consistency input).
-    _dynamic_grounding_done = _c.get("dynamic_grounding_done", False)
-    dynamic_notes: list[str] = []
-
     _terminal_states = (
         PipelineState.PATCH_SUCCESS,
         PipelineState.PATCH_FAILED,
@@ -1431,6 +2791,18 @@ async def _run_state_machine(
         """
         nonlocal degraded_patch_mode, patch_outcome
         grounded = _grounded_requirement_ids(get_submitted_evidence())
+        if stop_after_closure:
+            patch_outcome = "EVIDENCE_INCOMPLETE"
+            print(
+                "[orchestrator] analysis-only closure failed; refusing degraded "
+                "patch planning and leaving no resumable CLOSED checkpoint.",
+                flush=True,
+            )
+            memory.record_action(
+                phase="closure-check", subagent="closure-checker",
+                outcome="analysis_closure_failed:no_degraded_patch",
+            )
+            return PipelineState.CLOSURE_FORCED_FAIL
         if len(grounded) >= _DEGRADED_MIN_GROUNDED:
             degraded_patch_mode = True
             print(
@@ -1476,6 +2848,34 @@ async def _run_state_machine(
             # Pick the next UNCHECKED requirement to investigate
             current_evidence = get_submitted_evidence()
             target = _pick_next_requirement(current_evidence, _ds_frozen_reqs) if current_evidence else None
+            adaptive_package = None
+            adaptive_tasks: list[str] = []
+            batch_mode = os.environ.get("DEEP_SEARCH_BATCH_MODE", "single").strip().lower()
+            if batch_mode not in {"single", "adaptive"}:
+                raise ValueError("DEEP_SEARCH_BATCH_MODE must be single or adaptive")
+            if current_evidence is not None and batch_mode == "adaptive":
+                unchecked_items = [
+                    req for req in current_evidence.requirements
+                    if req.verdict == "UNCHECKED" and req.id not in _ds_frozen_reqs
+                ]
+                anchor_index = build_anchor_index(current_evidence, repo_dir)
+                adaptive_package = next(
+                    (
+                        package
+                        for package in create_work_packages(unchecked_items, anchor_index)
+                        if len(package.requirement_ids) > 1
+                    ),
+                    None,
+                )
+                if adaptive_package is not None:
+                    by_id = {req.id: req for req in unchecked_items}
+                    target = by_id[adaptive_package.requirement_ids[0]]
+                    adaptive_tasks = [
+                        _build_deep_search_todo(
+                            by_id[rid], rework_context=by_id[rid].rework_context,
+                        )
+                        for rid in adaptive_package.requirement_ids
+                    ]
 
             if current_evidence is None:
                 print(
@@ -1489,16 +2889,36 @@ async def _run_state_machine(
                 continue
 
             if target is None:
-                print(
-                    "[orchestrator] All requirements checked — transitioning "
-                    "to EVIDENCE_REFINING without new deep-search.",
-                    flush=True,
-                )
-                memory.record_action(
-                    phase="deep-search",
-                    subagent="deep-search",
-                    outcome="skipped_all_requirements_checked",
-                )
+                unchecked_without_target = check_sufficiency(current_evidence)
+                if unchecked_without_target:
+                    # The picker intentionally excludes frozen requirements.
+                    # If a later gate reset one to UNCHECKED, bouncing between
+                    # UNDER_SPECIFIED and EVIDENCE_REFINING cannot make progress:
+                    # no model call occurs, so the normal counter never moves.
+                    # Fail safely through the one forced closure pass instead.
+                    print(
+                        "[orchestrator] no selectable deep-search target but "
+                        f"unchecked requirements remain {unchecked_without_target[:5]} "
+                        "— forcing final closure evaluation.",
+                        flush=True,
+                    )
+                    budget.force_exhausted()
+                    memory.record_action(
+                        phase="deep-search",
+                        subagent="deep-search",
+                        outcome="forced_closure:no_selectable_unchecked_target",
+                    )
+                else:
+                    print(
+                        "[orchestrator] All requirements checked — transitioning "
+                        "to EVIDENCE_REFINING without new deep-search.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="deep-search",
+                        subagent="deep-search",
+                        outcome="skipped_all_requirements_checked",
+                    )
                 assert is_valid_transition(state, PipelineState.EVIDENCE_REFINING)
                 state = PipelineState.EVIDENCE_REFINING
                 continue
@@ -1535,20 +2955,52 @@ async def _run_state_machine(
             # Inject the rendered SharedWorkingMemory section (LTM summaries,
             # custom repair discipline, build-error feedback) so the deep-search
             # agent actually sees the same context the orchestrator gathered.
-            working_memory_block = memory.format_for_prompt()
+            working_memory_block = memory.format_for_deep_search(target)
             print(
                 f"[orchestrator] Dispatching deep-search for {target.id}: "
                 f"{target.text[:80]!r}",
                 flush=True,
             )
             try:
-                report = await asyncio.wait_for(
-                    _run_deep_search_async(
-                        todo_task, current_evidence, repo_dir,
-                        working_memory_block=working_memory_block,
-                    ),
-                    timeout=deep_search_timeout_s,
-                )
+                additional_reports = []
+                if adaptive_package and len(adaptive_package.requirement_ids) > 1:
+                    package_report = await asyncio.wait_for(
+                        _run_adaptive_deep_search_async(
+                            adaptive_package, adaptive_tasks, current_evidence,
+                            repo_dir, working_memory_block=working_memory_block,
+                        ), timeout=deep_search_timeout_s,
+                    )
+                    completed = {
+                        item.requirement_id: item.scoped_report
+                        for item in package_report.requirement_results
+                    }
+                    report = completed.get(target.id)
+                    additional_reports = [
+                        item for rid, item in completed.items() if rid != target.id
+                    ]
+                    if report is None:
+                        print(
+                            f"[orchestrator] adaptive package left {target.id} "
+                            "unresolved; falling back to single-requirement search",
+                            flush=True,
+                        )
+                        report = await asyncio.wait_for(
+                            _run_deep_search_async(
+                                todo_task, current_evidence, repo_dir,
+                                working_memory_block=working_memory_block,
+                            ), timeout=deep_search_timeout_s,
+                        )
+                else:
+                    report = await asyncio.wait_for(
+                        _run_deep_search_async(
+                            todo_task, current_evidence, repo_dir,
+                            working_memory_block=working_memory_block,
+                        ), timeout=deep_search_timeout_s,
+                    )
+            except ModelInfrastructureError:
+                # Provider/relay outages are not evidence failures.  Preserve
+                # the last durable checkpoint and let the runner retry later.
+                raise
             except (Exception, asyncio.TimeoutError) as exc:
                 budget.record_iteration()
                 reason = (
@@ -1556,6 +3008,12 @@ async def _run_state_machine(
                     if isinstance(exc, asyncio.TimeoutError)
                     else f"{type(exc).__name__}: {exc}"
                 )
+                write_event({
+                    "component": "deep-search-timeout" if isinstance(exc, asyncio.TimeoutError) else "deep-search-error",
+                    "model": model_label(), "requirement_ids": [target.id],
+                    "call_reason": "timeout" if isinstance(exc, asyncio.TimeoutError) else "structured_retry",
+                    "exception": reason,
+                })
                 print(
                     "[orchestrator] deep-search failed for "
                     f"{target.id}: {reason}",
@@ -1576,6 +3034,15 @@ async def _run_state_machine(
             # when the new verdict is persisted inside _persist_report_findings.
 
             # Persist findings — verdict + AS-IS observations under scope
+            for extra_report in additional_reports:
+                await _persist_report_findings(
+                    extra_report, scope_requirement_id=extra_report.target_requirement_id,
+                )
+                memory.record_action(
+                    phase="deep-search", subagent="deep-search-adaptive",
+                    outcome=f"iter{budget.iteration}:{extra_report.requirement_verdict}",
+                    requirement_id=extra_report.target_requirement_id,
+                )
             await _persist_report_findings(report, scope_requirement_id=target.id)
             memory.record_action(
                 phase="deep-search",
@@ -1696,12 +3163,26 @@ async def _run_state_machine(
                 _pack_counters(
                     budget, rework_rounds_used, patch_verify_rounds_used,
                     plan_coverage_rounds_used, per_req_unchecked_count,
-                    closure_failure_streak, _dynamic_grounding_done,
+                    closure_failure_streak, rework_rounds_by_req,
                 ),
                 ltm_query, custom_route_query,
+                aggregate_patch_plan=aggregate_patch_plan,
             )
 
-            # Transition to EvidenceRefining
+            # Drain the pending investigation queue in-place. Merely having
+            # another UNCHECKED item is queue progress, not a sufficiency
+            # failure and should not grow closure/prompt history.
+            refreshed = get_submitted_evidence()
+            next_target = (
+                _pick_next_requirement(refreshed, _ds_frozen_reqs)
+                if refreshed is not None else None
+            )
+            if next_target is not None and not budget.is_exhausted():
+                memory.record_action(
+                    phase="deep-search", subagent="deep-search",
+                    outcome="queue_progress", requirement_id=next_target.id,
+                )
+                continue
             assert is_valid_transition(state, PipelineState.EVIDENCE_REFINING)
             state = PipelineState.EVIDENCE_REFINING
 
@@ -1744,19 +3225,31 @@ async def _run_state_machine(
                     f"{bad_attribution[:5]}. Returning to deep-search.",
                     flush=True,
                 )
+                reset_ids_attr: list[str] = []
                 for rid in bad_attribution:
-                    reset_requirement_for_rework(
+                    if rid in _ds_frozen_reqs:
+                        print(
+                            f"[orchestrator] attribution gate: {rid} failed "
+                            "but is frozen — skipping reset (would loop).",
+                            flush=True,
+                        )
+                        continue
+                    if reset_requirement_for_rework(
                         rid,
                         audit_feedback="Attribution check failed: non-compliant verdict "
                         "requires valid evidence_locations (path:LINE or path:LINE-LINE).",
+                    ):
+                        reset_ids_attr.append(rid)
+                if reset_ids_attr:
+                    memory.record_action(
+                        phase="evidence-refining",
+                        outcome=(
+                            f"attribution_failed:{len(reset_ids_attr)}_missing_locations"
+                        ),
                     )
-                memory.record_action(
-                    phase="evidence-refining",
-                    outcome=f"attribution_failed:{len(bad_attribution)}_missing_locations",
-                )
-                assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
-                state = PipelineState.UNDER_SPECIFIED
-                continue
+                    assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
+                    state = PipelineState.UNDER_SPECIFIED
+                    continue
 
             # Consistency-anchor format check (phase 23). Each anchor must
             # split into LHS/RHS as 'path:locator <-> path:locator'.
@@ -1764,16 +3257,15 @@ async def _run_state_machine(
             if anchor_format_bad and not budget.is_exhausted():
                 print(
                     f"[orchestrator] consistency-anchor format check failed: "
-                    f"{anchor_format_bad[:3]}. Returning to deep-search.",
+                    f"{anchor_format_bad[:3]}. Forcing final closure instead of "
+                    "bouncing without a reset target.",
                     flush=True,
                 )
                 memory.record_action(
                     phase="evidence-refining",
                     outcome=f"anchor_format_failed:{len(anchor_format_bad)}_bad",
                 )
-                assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
-                state = PipelineState.UNDER_SPECIFIED
-                continue
+                budget.force_exhausted()
 
             # Consistency-anchor factual check (phase 23). Pure file/grep —
             # no LLM. Failures are routed back to the requirement that owns
@@ -1788,6 +3280,13 @@ async def _run_state_machine(
                 reset_ids: list[str] = []
                 for rid, lines in per_req.items():
                     if rid == "<global>":
+                        continue
+                    if rid in _ds_frozen_reqs:
+                        print(
+                            f"[orchestrator] consistency-anchor gate: {rid} failed "
+                            "but is frozen — skipping reset (would loop).",
+                            flush=True,
+                        )
                         continue
                     feedback = (
                         "Consistency-anchor code gate found endpoint(s) that "
@@ -1901,61 +3400,6 @@ async def _run_state_machine(
                         outcome=f"grounding_global_failed:{len(global_lines_g)}",
                     )
 
-            # ── Dynamic grounding gate (phase 26, ③ runtime layer) ───────
-            # Opt-in, at most ONCE per case. Reproduces the bug on base_commit,
-            # applies the symptom gate, and mechanically matches the observed
-            # failure path against each requirement's cited regions. NEVER
-            # gates flow on its own (no reset): dynamic_reached is positive
-            # confidence context; dynamic_not_reached is a soft consistency
-            # note for the closure-checker; unverifiable is a no-op. The static
-            # results above stand regardless. Working tree is restored inside
-            # run_dynamic_grounding (base_commit hygiene).
-            if not _dynamic_grounding_done:
-                _dynamic_grounding_done = True
-                try:
-                    dyn_results = await run_dynamic_grounding(
-                        current_evidence,
-                        repo_dir,
-                        problem_statement=memory.issue_context,
-                    )
-                except Exception as exc:
-                    dyn_results = []
-                    print(
-                        "[orchestrator] dynamic-grounding raised "
-                        f"{type(exc).__name__}: {exc} — treating as unverifiable",
-                        flush=True,
-                    )
-                reached = [d for d in dyn_results if d.grounded_by == "dynamic_reached"]
-                not_reached = [
-                    d for d in dyn_results if d.grounded_by == "dynamic_not_reached"
-                ]
-                if reached:
-                    pos_block = "\n".join(f"  - {d.render()}" for d in reached)
-                    memory.build_error_feedback = (
-                        (memory.build_error_feedback + "\n\n"
-                         if memory.build_error_feedback else "")
-                        + "Dynamic grounding (runtime confidence — failure path "
-                        "traversed these cited locations):\n" + pos_block
-                    )
-                    print(
-                        f"[orchestrator] dynamic-grounding: {len(reached)} req(s) "
-                        "on reproduced failure path (positive context).",
-                        flush=True,
-                    )
-                # not_reached notes are injected into the closure-checker as a
-                # soft consistency input (never auto-reset — repro may be
-                # incomplete).
-                for d in not_reached:
-                    dynamic_notes.append(d.render())
-                if dyn_results:
-                    memory.record_action(
-                        phase="evidence-refining",
-                        outcome=(
-                            f"dynamic_grounding:reached={len(reached)},"
-                            f"not_reached={len(not_reached)}"
-                        ),
-                    )
-
             # ── Structural invariants (phase 18.A) ───────────────────────
             # I2 violations (new_interface + AS_IS_COMPLIANT) are mechanical
             # contradictions → reset to UNCHECKED and re-dispatch deep-search
@@ -1967,6 +3411,13 @@ async def _run_state_machine(
                 i2_req_ids = _extract_req_ids(i2_failures)
                 reset_ids_i2: list[str] = []
                 for rid in i2_req_ids:
+                    if rid in _ds_frozen_reqs:
+                        print(
+                            f"[orchestrator] structural I2 gate: {rid} failed "
+                            "but is frozen — skipping reset (would loop).",
+                            flush=True,
+                        )
+                        continue
                     feedback = (
                         "Closure-checker structural invariant I2 violation:\n"
                         "This requirement's origin is 'new_interfaces', which "
@@ -2013,17 +3464,25 @@ async def _run_state_machine(
             print("[orchestrator] Dispatching closure-checker...", flush=True)
             verdict: ClosureVerdict | None = None
             closure_exc: Exception | None = None
+            closure_validation_feedback = ""
             max_attempts = closure_retry_limit + 1
             for attempt in range(1, max_attempts + 1):
                 try:
                     verdict = await _run_closure_checker_async(
-                        current_evidence, manifest, repo_dir,
-                        dynamic_notes=dynamic_notes,
+                        current_evidence,
+                        manifest,
+                        repo_dir,
+                        validation_feedback=closure_validation_feedback,
                     )
                     closure_exc = None
                     break
+                except ModelInfrastructureError:
+                    # Never consume closure semantic retries or mutate the
+                    # closure failure streak for an infrastructure outage.
+                    raise
                 except Exception as exc:
                     closure_exc = exc
+                    closure_validation_feedback = f"{type(exc).__name__}: {exc}"
                     print(
                         "[orchestrator] closure-checker failed "
                         f"(attempt {attempt}/{max_attempts}): "
@@ -2105,11 +3564,21 @@ async def _run_state_machine(
                         + coverage_msg
                     ),
                     audited=verdict.audited,
+                    dimension_findings=list(verdict.dimension_findings) + [
+                        DimensionFinding(
+                            dimension="sufficiency", status="FAIL",
+                            requirement_ids=[rid],
+                            conflicting_field="findings",
+                            explanation="Required prescriptive audit result is missing.",
+                        ) for rid in uncovered
+                    ],
                     missing=list(verdict.missing) + [coverage_msg]
                         + [f"uncovered req {rid}" for rid in uncovered],
                     suggested_tasks=list(
                         dict.fromkeys(list(verdict.suggested_tasks) + uncovered)
                     ),
+                    conflicts=verdict.conflicts,
+                    shared_fact_gaps=verdict.shared_fact_gaps,
                 )
                 last_verdict = verdict
 
@@ -2128,14 +3597,37 @@ async def _run_state_machine(
                     _pack_counters(
                         budget, rework_rounds_used, patch_verify_rounds_used,
                         plan_coverage_rounds_used, per_req_unchecked_count,
-                        closure_failure_streak, _dynamic_grounding_done,
+                        closure_failure_streak, rework_rounds_by_req,
                     ),
                     ltm_query, custom_route_query,
+                    aggregate_patch_plan=aggregate_patch_plan,
                 )
+                if stop_after_closure:
+                    print(
+                        "[orchestrator] Analysis stage complete; preserving CLOSED "
+                        "checkpoint for generation stage.",
+                        flush=True,
+                    )
+                    return evidence_path
             else:
+                closure_diagnostics = list(verdict.missing[:3])
+                if not closure_diagnostics:
+                    closure_diagnostics.extend(
+                        f"{finding.dimension} FAIL "
+                        f"({','.join(finding.requirement_ids) or '<no-req>'}; "
+                        f"field={finding.conflicting_field or 'evidence'})"
+                        for finding in verdict.dimension_findings
+                        if finding.status == "FAIL"
+                    )
+                if verdict.conflicts:
+                    closure_diagnostics.extend(
+                        f"conflict {edge.left_requirement_id}<->{edge.right_requirement_id} "
+                        f"on {edge.conflicting_field}; recheck={edge.recommended_recheck_side}"
+                        for edge in verdict.conflicts
+                    )
                 print(
                     f"[orchestrator] EVIDENCE_MISSING: "
-                    f"{', '.join(verdict.missing[:3])}",
+                    f"{'; '.join(closure_diagnostics[:4]) or '<no structured diagnostic>'}",
                     flush=True,
                 )
                 memory.record_action(
@@ -2143,6 +3635,50 @@ async def _run_state_machine(
                     subagent="closure-checker",
                     outcome="EVIDENCE_MISSING" + ("_forced" if forced else ""),
                 )
+                if closure_only_retry and not forced:
+                    targeted_ids = list(verdict.suggested_tasks)
+                    targeted_ids.extend(
+                        rid
+                        for finding in verdict.dimension_findings
+                        if finding.status == "FAIL"
+                        for rid in finding.requirement_ids
+                    )
+                    targeted_ids.extend(_extract_req_ids(list(verdict.missing)))
+                    targeted_ids = list(dict.fromkeys(
+                        rid for rid in targeted_ids if rid
+                    ))
+                    print(
+                        "[orchestrator] closure-only retry received "
+                        "EVIDENCE_MISSING; preserving prior evidence and "
+                        "opening one bounded targeted evidence pass for "
+                        f"{targeted_ids or ['<most-blocking>']}.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="closure-check",
+                        subagent="closure-checker",
+                        outcome="closure_only_retry_targeted:EVIDENCE_MISSING",
+                    )
+                    # The preserved checkpoint commonly exhausted its original
+                    # budget.  Grant exactly one additional search per named
+                    # blocking requirement, then use the normal bounded rework
+                    # path.  Disable this branch so it cannot recursively grant
+                    # another recovery round.
+                    extra_rounds = max(1, len(targeted_ids))
+                    budget.max_iterations = max(
+                        budget.max_iterations,
+                        budget.iteration + extra_rounds,
+                    )
+                    for rid in targeted_ids:
+                        rework_rounds_by_req[rid] = min(
+                            rework_rounds_by_req.get(rid, 0),
+                            per_req_rework_rounds_max - 1,
+                        )
+                        per_req_unchecked_count[rid] = min(
+                            per_req_unchecked_count.get(rid, 0),
+                            per_req_unchecked_max - 1,
+                        )
+                    closure_only_retry = False
                 if forced:
                     # Budget already exhausted and closure still failed —
                     # do NOT loop back to deep-search. Route to degraded patch
@@ -2161,28 +3697,33 @@ async def _run_state_machine(
                     # Req ids cited in missing/suggested_tasks but absent from
                     # the dimension findings (e.g. coverage-fail synthesized ids)
                     # have no spec → fall back to a deepen full reset.
-                    cited_req_ids = _extract_req_ids(
-                        verdict.missing + verdict.suggested_tasks
-                    )
-                    for rid in cited_req_ids:
-                        if rid not in rework_specs:
-                            rework_specs[rid] = RworkSpec(
-                                "deepen", None,
-                                "Flagged for rework without a specific dimension "
-                                "finding; re-investigate this requirement fully.",
-                            )
+                    # Free-text missing/suggested_tasks are diagnostic only.
+                    # Rework scope must come from structured dimension findings
+                    # or validated conflict edges; never regex-reset ids from prose.
 
-                    conflict_req_ids = [
-                        rid for rid in rework_specs.keys()
-                        if rid not in _ds_frozen_reqs
-                    ]
-                    if _ds_frozen_reqs & set(rework_specs.keys()):
+                    raw_conflict_req_ids = list(rework_specs.keys())
+                    conflict_req_ids, frozen_req_ids, capped_req_ids = (
+                        _eligible_closure_rework_ids(
+                            raw_conflict_req_ids,
+                            _ds_frozen_reqs,
+                            rework_rounds_by_req,
+                            per_req_rework_rounds_max,
+                        )
+                    )
+                    if frozen_req_ids:
                         print(
                             "[orchestrator] excluding frozen (stalled) reqs from "
-                            f"rework pool: {sorted(_ds_frozen_reqs & set(rework_specs.keys()))}",
+                            f"rework pool: {frozen_req_ids}",
                             flush=True,
                         )
-                    if rework_rounds_used < rework_rounds_max and conflict_req_ids:
+                    if capped_req_ids:
+                        print(
+                            "[orchestrator] excluding reqs that reached per-req "
+                            f"closure rework cap {per_req_rework_rounds_max}: "
+                            f"{capped_req_ids}",
+                            flush=True,
+                        )
+                    if conflict_req_ids:
                         per_req_feedback = _build_per_req_audit_feedback(
                             verdict, conflict_req_ids,
                         )
@@ -2204,15 +3745,20 @@ async def _run_state_machine(
 
                     if reset_ids:
                         rework_rounds_used += 1
+                        for rid in reset_ids:
+                            rework_rounds_by_req[rid] = (
+                                rework_rounds_by_req.get(rid, 0) + 1
+                            )
                         scope_note = ", ".join(
                             f"{rid}:{rework_specs[rid].operator}="
                             f"{'findings' if rework_specs[rid].fields_to_reset == {'findings'} else 'full'}"
+                            f":req_round={rework_rounds_by_req.get(rid, 0)}/{per_req_rework_rounds_max}"
                             for rid in reset_ids
                         )
                         print(
                             "[orchestrator] EVIDENCE_MISSING → rework: "
                             f"re-opened {reset_ids} [{scope_note}] "
-                            f"(round {rework_rounds_used}/{rework_rounds_max})",
+                            f"(total_rounds={rework_rounds_used})",
                             flush=True,
                         )
                         operators = ",".join(
@@ -2223,7 +3769,7 @@ async def _run_state_machine(
                             subagent="closure-checker",
                             outcome=(
                                 f"rework:{operators}:reopen={len(reset_ids)}_reqs:"
-                                f"round={rework_rounds_used}/{rework_rounds_max}"
+                                f"total_rounds={rework_rounds_used}"
                             ),
                         )
                         assert is_valid_transition(state, PipelineState.UNDER_SPECIFIED)
@@ -2231,8 +3777,8 @@ async def _run_state_machine(
                     else:
                         reason = (
                             "no parseable req IDs in closure output"
-                            if not conflict_req_ids
-                            else "rework rounds exhausted"
+                            if not raw_conflict_req_ids
+                            else "per-req rework cap exhausted"
                         )
                         print(
                             f"[orchestrator] EVIDENCE_MISSING unresolved "
@@ -2372,10 +3918,25 @@ async def _run_state_machine(
             # promotes every created file even after a repatch overwrites
             # memory.patch_plan with the fixup plan.
             if memory.patch_plan is not None:
+                aggregate_patch_plan = _merge_patch_plans(
+                    aggregate_patch_plan, memory.patch_plan
+                )
                 all_planned_files.update(e.filepath for e in memory.patch_plan.edits)
 
             print("[orchestrator] Dispatching patch-generator...", flush=True)
-            success = await _run_patch_generator_async(memory, repo_dir, output_dir)
+            try:
+                success = await _run_patch_generator_async(memory, repo_dir, output_dir)
+            except PatchGeneratorInfraError as exc:
+                memory.record_action(
+                    phase="patch-generation",
+                    subagent="patch-generator",
+                    outcome="MODEL_INFRA_FAILURE",
+                )
+                patch_outcome = "MODEL_INFRA_FAILURE"
+                print(f"[patch-generator] infrastructure failure: {exc}", flush=True)
+                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                state = PipelineState.PATCH_FAILED
+                continue
             if success:
                 memory.record_action(
                     phase="patch-generation",
@@ -2416,17 +3977,20 @@ async def _run_state_machine(
                     outcome=f"test_edits_reverted:{len(reverted_tests)}",
                 )
 
+            round_verification_plan = _merge_patch_plans(
+                aggregate_patch_plan, memory.patch_plan
+            )
             current_plan_files = [
                 edit.filepath
-                for edit in memory.patch_plan.edits
-            ] if memory.patch_plan is not None else []
+                for edit in round_verification_plan.edits
+            ] if round_verification_plan is not None else []
             artifact_diff_text = _collect_git_diff(
                 repo_dir,
                 planned_files=sorted(all_planned_files | set(current_plan_files)),
             )
             artifact_result = verify_patch_artifacts(
                 repo_dir,
-                memory.patch_plan,
+                round_verification_plan,
                 artifact_diff_text,
             )
             artifact_verify_log.append(
@@ -2445,66 +4009,100 @@ async def _run_state_machine(
                 flush=True,
             )
             if not artifact_result.ok:
-                artifact_errors = _artifact_findings_to_errors(
-                    artifact_result.findings
-                )
-                if patch_verify_rounds_used < patch_verify_rounds_max:
-                    patch_verify_rounds_used += 1
-                    memory.build_error_feedback = render_artifact_feedback(
-                        artifact_result.findings
+                if artifact_result.empty_patch:
+                    memory.record_action(
+                        phase="artifact-verify", outcome="NO_EFFECT_PATCH_terminal"
                     )
-                    pruned_plan, dropped_edits = _prune_plan_to_error_files(
-                        memory.patch_plan, artifact_errors
+                    patch_outcome = "NO_EFFECT_PATCH"
+                    assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                    state = PipelineState.PATCH_FAILED
+                    continue
+                if artifact_repair_rounds_used < artifact_repair_rounds_max:
+                    artifact_repair_rounds_used += 1
+                    artifact_errors = _artifact_findings_to_errors(
+                        repo_dir, artifact_result.findings
                     )
-                    memory.patch_plan = pruned_plan
-                    if dropped_edits:
-                        print(
-                            f"[artifact-verify] pruned prior patch plan to "
-                            f"artifact finding files: dropped {dropped_edits} "
-                            f"edit(s), kept "
-                            f"{len(pruned_plan.edits) if pruned_plan else 0}.",
-                            flush=True,
+                    memory.build_error_feedback = (
+                        "Patch artifact verification failed. These structural "
+                        "findings are blocking Stage2 artifacts; fix production "
+                        "code or plan/diff coverage, do not edit tests, and do "
+                        "not bypass the gate.\n\n"
+                        f"{render_artifact_feedback(artifact_result.findings, repo_dir)}"
+                    )
+                    if artifact_errors:
+                        repair_context_plan = _merge_patch_plans(
+                            aggregate_patch_plan, memory.patch_plan
                         )
-                    focus_files = sorted({
-                        e.file.replace("\\", "/").strip().lstrip("./")
-                        for e in artifact_errors
-                        if e.file and e.file not in {"(patch.diff)", "(build)"}
-                    })
-                    memory.evidence_focus_files = focus_files
+                        pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                            repair_context_plan, artifact_errors
+                        )
+                        memory.patch_plan = _augment_repair_plan_with_errors(
+                            pruned_plan,
+                            artifact_errors,
+                            reason="patch artifact verification gate",
+                        )
+                        if memory.patch_plan is not None:
+                            aggregate_patch_plan = _merge_patch_plans(
+                                aggregate_patch_plan, memory.patch_plan
+                            )
+                            all_planned_files.update(
+                                edit.filepath for edit in memory.patch_plan.edits
+                            )
+                        memory.evidence_focus_files = sorted({
+                            e.file.replace("\\", "/").strip().lstrip("./")
+                            for e in artifact_errors
+                            if e.file and e.file != "(build)"
+                        })
+                    else:
+                        dropped_edits = 0
+                        memory.evidence_focus_files = []
+                    artifact_verify_log[-1]["repair_triggered"] = True
+                    artifact_verify_log[-1]["repair_round"] = artifact_repair_rounds_used
+                    artifact_verify_log[-1]["repair_focus_files"] = list(
+                        memory.evidence_focus_files
+                    )
+                    artifact_verify_log[-1]["dropped_plan_edits"] = dropped_edits
                     print(
-                        "[artifact-verify] artifact mismatch -> repatch "
-                        f"(round {patch_verify_rounds_used}/"
-                        f"{patch_verify_rounds_max}).",
+                        "[artifact-verify] failed; running direct artifact "
+                        f"repair round {artifact_repair_rounds_used}/"
+                        f"{artifact_repair_rounds_max} before build/static gates.",
                         flush=True,
                     )
                     memory.record_action(
-                        phase="artifact-verify",
-                        outcome=(
-                            f"repatch:round={patch_verify_rounds_used}/"
-                            f"{patch_verify_rounds_max}:"
-                            f"{len(artifact_result.findings)}_findings"
-                        ),
+                        phase="artifact-repair",
+                        outcome=f"direct_repair:{len(artifact_result.findings)}",
                     )
-                    assert is_valid_transition(state, PipelineState.CLOSED)
-                    state = PipelineState.CLOSED
+                    try:
+                        repaired = await _run_patch_generator_async(
+                            memory, repo_dir, output_dir
+                        )
+                    except PatchGeneratorInfraError as exc:
+                        artifact_verify_log[-1]["repair_failed"] = True
+                        artifact_verify_log[-1]["infra_failure"] = str(exc)
+                        patch_outcome = "MODEL_INFRA_FAILURE"
+                        print(f"[patch-generator] infrastructure failure: {exc}", flush=True)
+                        assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                        state = PipelineState.PATCH_FAILED
+                        continue
+                    if not repaired:
+                        artifact_verify_log[-1]["repair_failed"] = True
+                        patch_outcome = "PATCH_INCOMPLETE"
+                        assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                        state = PipelineState.PATCH_SUCCESS
+                        continue
                     continue
-
-                terminal = (
-                    "NO_EFFECT_PATCH"
-                    if artifact_result.empty_patch else "PATCH_INCOMPLETE"
-                )
                 print(
-                    "[artifact-verify] artifact findings persist and repatch "
-                    f"budget exhausted; terminating as {terminal}.",
+                    "[artifact-verify] still failing after direct repair; patch "
+                    "will not be accepted as a usable Stage2 artifact.",
                     flush=True,
                 )
                 memory.record_action(
                     phase="artifact-verify",
-                    outcome=f"{terminal}_terminal",
+                    outcome=f"artifact_gate_failed:{len(artifact_result.findings)}",
                 )
-                patch_outcome = terminal
-                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
-                state = PipelineState.PATCH_FAILED
+                patch_outcome = "PATCH_INCOMPLETE"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
                 continue
 
             system = detect_build_system(repo_dir)
@@ -2522,12 +4120,28 @@ async def _run_state_machine(
             removed_sym_refs = check_removed_symbol_test_refs(repo_dir, base_commit=None)
             go_unexport = check_go_unexport_consistency(repo_dir, base_commit=None)
             config_shape = check_config_entry_shape(repo_dir, base_commit=None)
+            python_noniterable = check_python_noniterable_class_loop(
+                repo_dir, base_commit=None
+            )
+            python_helper_api = check_python_helper_api_usage(
+                repo_dir, base_commit=None
+            )
+            python_config_subscript = check_python_config_subscript_fallback(
+                repo_dir, base_commit=None
+            )
+            python_moved_class_dunder = check_python_moved_class_dunder_methods(
+                repo_dir, base_commit=None
+            )
             for label, errs in (
                 ("contract-drift", contract_drift),
                 ("parallel-impl", parallel_impl),
                 ("removed-symbol-test-refs", removed_sym_refs),
                 ("go-unexport", go_unexport),
                 ("config-entry-shape", config_shape),
+                ("python-noniterable-class-loop", python_noniterable),
+                ("python-helper-api", python_helper_api),
+                ("python-config-subscript", python_config_subscript),
+                ("python-moved-class-dunder", python_moved_class_dunder),
             ):
                 print(
                     f"[build-verify] {label} gate: "
@@ -2535,97 +4149,58 @@ async def _run_state_machine(
                     flush=True,
                 )
 
-            if system in ("node", "unknown"):
-                # No compile step — but the heuristic gates still apply.
-                heuristic_errors = (
-                    list(contract_drift) + list(parallel_impl)
-                    + list(removed_sym_refs) + list(go_unexport)
-                    + list(config_shape)
+            heuristic_errors = (
+                list(contract_drift) + list(parallel_impl)
+                + list(removed_sym_refs) + list(go_unexport)
+                + list(config_shape) + list(python_noniterable)
+                + list(python_helper_api) + list(python_config_subscript)
+                + list(python_moved_class_dunder)
+            )
+            if heuristic_errors:
+                memory.record_action(
+                    phase="build-verify",
+                    outcome=f"heuristic_warnings:{len(heuristic_errors)}",
                 )
-                active, downgraded = _partition_by_fuse(
-                    heuristic_errors, fed_back_gate_signatures
-                )
-                build_verify_log.append(
-                    {"round": patch_verify_rounds_used, "system": system,
-                     "skipped_build": True,
-                     "reverted_tests": reverted_tests,
-                     "heuristic_findings": _errs_to_log(heuristic_errors),
-                     "downgraded_signatures": sorted(downgraded)}
-                )
-                if not active:
-                    print(
-                        f"[build-verify] no compile step for '{system}' and no "
-                        "active heuristic findings; accepting patch.",
-                        flush=True,
+
+            if system in ("node", "java", "unknown"):
+                if heuristic_errors:
+                    build_verify_log.append(
+                        {"system": system, "outcome": "STATIC_GATE_FAILED",
+                         "reverted_tests": reverted_tests,
+                         "static_warnings": _errs_to_log(heuristic_errors)}
                     )
                     memory.record_action(
-                        phase="build-verify", outcome=f"accepted:{system}"
+                        phase="build-verify",
+                        outcome=f"static_gate_failed:{len(heuristic_errors)}",
                     )
-                    patch_outcome = "PATCH_SUCCESS"
+                    patch_outcome = "BUILD_FAILED_NO_REPAIR"
                     assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                     state = PipelineState.PATCH_SUCCESS
                     continue
-                if patch_verify_rounds_used < patch_verify_rounds_max:
-                    patch_verify_rounds_used += 1
-                    memory.build_error_feedback = _render_heuristic_feedback(
-                        contract_drift, parallel_impl, removed_sym_refs,
-                        go_unexport, config_shape, active,
-                    )
-                    _record_fed_back(active, fed_back_gate_signatures)
-                    # Same prior-plan pruning as the compiled-language path: on
-                    # a node/unknown repatch, keep only edits implicated by the
-                    # active heuristic findings so the full plan does not bloat
-                    # the planner prompt (issue 010).
-                    pruned_plan, dropped_edits = _prune_plan_to_error_files(
-                        memory.patch_plan, active
-                    )
-                    memory.patch_plan = pruned_plan
-                    if dropped_edits:
-                        print(
-                            f"[build-verify] pruned prior patch plan to finding "
-                            f"files: dropped {dropped_edits} edit(s), kept "
-                            f"{len(pruned_plan.edits) if pruned_plan else 0}.",
-                            flush=True,
-                        )
-                    print(
-                        f"[build-verify] heuristic findings on '{system}' repo → "
-                        f"repatch (round {patch_verify_rounds_used}/"
-                        f"{patch_verify_rounds_max}) with {len(active)} finding(s).",
-                        flush=True,
-                    )
-                    memory.record_action(
-                        phase="build-verify",
-                        outcome=f"repatch_heuristic:round={patch_verify_rounds_used}",
-                    )
-                    assert is_valid_transition(state, PipelineState.CLOSED)
-                    state = PipelineState.CLOSED
-                else:
-                    print(
-                        "[build-verify] heuristic findings persist and repatch "
-                        "budget exhausted; accepting patch with warnings "
-                        "(heuristic gates are advisory, not a hard build failure).",
-                        flush=True,
-                    )
-                    memory.record_action(
-                        phase="build-verify",
-                        outcome="accepted_with_heuristic_warnings",
-                    )
-                    patch_outcome = "PATCH_SUCCESS"
-                    assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
-                    state = PipelineState.PATCH_SUCCESS
+                build_verify_log.append(
+                    {"system": system, "outcome": "SKIPPED",
+                     "reverted_tests": reverted_tests,
+                     "heuristic_warnings": _errs_to_log(heuristic_errors)}
+                )
+                memory.record_action(phase="build-verify", outcome=f"skipped:{system}")
+                patch_outcome = "PATCH_SUCCESS"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
                 continue
 
             python_targets = (
                 changed_python_production_files(repo_dir)
                 if system == "python" else None
             )
+            go_targets = (
+                changed_go_packages(repo_dir) if system == "go" else None
+            )
             post = run_build_check(
                 repo_dir,
                 system,
                 python_targets=python_targets,
+                go_targets=go_targets,
             )
-            if not post.unverifiable and not post.skipped:
-                toolchain_seen_working = True
             print(
                 f"[build-verify] post-patch: ok={post.ok} "
                 f"errors={len(post.errors)} timed_out={post.timed_out} "
@@ -2652,254 +4227,309 @@ async def _run_state_machine(
                 flush=True,
             )
 
-            # All git-only deterministic findings, subject to the false-positive
-            # fuse (a finding the planner already saw and kept is downgraded).
-            raw_deterministic = (
-                list(residues) + list(config_sym_errors)
-                + list(contract_drift) + list(parallel_impl)
-                + list(removed_sym_refs) + list(go_unexport) + list(config_shape)
-            )
-            deterministic_errors, downgraded = _partition_by_fuse(
-                raw_deterministic, fed_back_gate_signatures
-            )
+            static_warnings = list(residues) + list(config_sym_errors) + heuristic_errors
 
-            # Toolchain MISSING → the build gate has no opinion. Retry once
-            # if the toolchain demonstrably worked earlier this session (a
-            # transient hiccup), then fall back to BUILD_UNVERIFIABLE. Honour
-            # the git-only gates regardless; capture raw output for diagnosis.
-            if post.unverifiable and post.toolchain_missing and toolchain_seen_working:
+            if static_warnings:
+                if patch_verify_rounds_used < 1:
+                    patch_verify_rounds_used += 1
+                    feedback = _render_heuristic_feedback(
+                        contract_drift,
+                        parallel_impl,
+                        removed_sym_refs,
+                        go_unexport,
+                        config_shape,
+                        python_noniterable,
+                        python_helper_api,
+                        python_config_subscript,
+                        python_moved_class_dunder,
+                        static_warnings,
+                        residues=residues,
+                        config_sym_errors=config_sym_errors,
+                    )
+                    if not feedback:
+                        feedback = render_errors_for_feedback(static_warnings)
+                    removed_defs = _enrich_removed_symbol_errors_with_base_definitions(
+                        repo_dir, static_warnings
+                    )
+                    if removed_defs:
+                        feedback += "\n\n" + removed_defs
+                    memory.build_error_feedback = (
+                        "Static patch-closure gate failed. These findings are "
+                        "blocking Stage2 artifacts; fix production code, do "
+                        "not edit tests, and do not weaken or bypass the gate.\n\n"
+                        f"{feedback}"
+                    )
+                    repair_context_plan = _merge_patch_plans(
+                        aggregate_patch_plan, memory.patch_plan
+                    )
+                    static_repair_errors = _expand_config_symbol_owner_context(
+                        repo_dir, repair_context_plan, static_warnings
+                    )
+                    pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                        repair_context_plan, static_repair_errors
+                    )
+                    memory.patch_plan = _augment_repair_plan_with_errors(
+                        pruned_plan,
+                        static_repair_errors,
+                        reason="static patch-closure gate",
+                    )
+                    if memory.patch_plan is not None:
+                        aggregate_patch_plan = _merge_patch_plans(
+                            aggregate_patch_plan, memory.patch_plan
+                        )
+                        all_planned_files.update(
+                            edit.filepath for edit in memory.patch_plan.edits
+                        )
+                    focus_files = sorted({
+                        e.file.replace("\\", "/").strip().lstrip("./")
+                        for e in static_repair_errors
+                        if e.file and e.file != "(build)"
+                    })
+                    memory.evidence_focus_files = focus_files
+                    build_verify_log.append(
+                        {
+                            "system": system,
+                            "outcome": "STATIC_GATE_REPAIR",
+                            "command": post.command,
+                            "python_targets": python_targets or [],
+                            "reverted_tests": reverted_tests,
+                            "static_warnings": _errs_to_log(static_warnings),
+                            "repair_triggered": True,
+                            "dropped_plan_edits": dropped_edits,
+                        }
+                    )
+                    print(
+                        "[build-verify] static gate failed; running the single "
+                        "direct static repair before accepting/rejecting Stage2.",
+                        flush=True,
+                    )
+                    memory.record_action(
+                        phase="static-gate-repair",
+                        outcome=f"direct_repair:{len(static_warnings)}",
+                    )
+                    try:
+                        repaired = await _run_patch_generator_async(memory, repo_dir, output_dir)
+                    except PatchGeneratorInfraError as exc:
+                        build_verify_log[-1]["outcome"] = "MODEL_INFRA_FAILURE"
+                        build_verify_log[-1]["infra_failure"] = str(exc)
+                        patch_outcome = "MODEL_INFRA_FAILURE"
+                        print(f"[patch-generator] infrastructure failure: {exc}", flush=True)
+                        assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                        state = PipelineState.PATCH_FAILED
+                        continue
+                    if not repaired:
+                        build_verify_log[-1]["outcome"] = "STATIC_GATE_REPAIR_FAILED"
+                        patch_outcome = "BUILD_FAILED_NO_REPAIR"
+                        assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                        state = PipelineState.PATCH_SUCCESS
+                        continue
+                    continue
+
                 print(
-                    "[build-verify] toolchain missing but it worked earlier; "
-                    "retrying build once.",
+                    "[build-verify] static gate failed; patch will not be "
+                    "accepted as a usable Stage2 artifact.",
                     flush=True,
                 )
-                post = run_build_check(
-                    repo_dir,
-                    system,
-                    python_targets=python_targets,
+                memory.record_action(
+                    phase="build-verify",
+                    outcome=f"static_gate_failed:{len(static_warnings)}",
                 )
-                if not post.unverifiable:
-                    toolchain_seen_working = True
-                print(
-                    f"[build-verify] retry: ok={post.ok} "
-                    f"unverifiable={post.unverifiable}",
-                    flush=True,
+                build_verify_log.append(
+                    {
+                        "system": system,
+                        "outcome": "STATIC_GATE_FAILED",
+                        "command": post.command,
+                        "python_targets": python_targets or [],
+                        "reverted_tests": reverted_tests,
+                        "static_warnings": _errs_to_log(static_warnings),
+                    }
                 )
+                patch_outcome = "BUILD_FAILED_NO_REPAIR"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
+                continue
 
-            # Only a genuinely MISSING toolchain (rc=127) earns an unverified
-            # pass — the gate cannot compile, so it honestly has no opinion.
-            # A toolchain that DID run but exited non-zero with no parseable
-            # error (post.unverifiable and NOT toolchain_missing) is a real,
-            # un-attributable failure: do NOT accept it here. It falls through
-            # to the BUILD_FAILED path below, where a synthetic error carrying
-            # the raw output tail is fed back to the planner for a repatch.
-            if post.unverifiable and post.toolchain_missing and not deterministic_errors:
+            if post.unverifiable:
                 raw_tail = (post.raw_output or "")[-2000:]
                 print(
-                    "[build-verify] BUILD_UNVERIFIABLE: toolchain unavailable "
-                    f"(cmd='{post.command}'); accepting patch unverified. Run "
-                    "the docker eval for a real build/test verdict.",
+                    "[build-verify] compile result is un-attributable; no model "
+                    "repair will run. Official evaluation remains authoritative.",
                     flush=True,
                 )
                 memory.record_action(phase="build-verify", outcome="unverifiable")
                 build_verify_log.append(
-                    {"round": patch_verify_rounds_used, "system": system,
-                     "ok": False, "unverifiable": True, "toolchain_missing": True,
+                    {"system": system, "outcome": "UNVERIFIABLE",
                      "command": post.command, "timed_out": post.timed_out,
                      "python_targets": python_targets or [],
                      "reverted_tests": reverted_tests,
                      "raw_output_tail": raw_tail,
-                     "downgraded_signatures": sorted(downgraded)}
+                     "static_warnings": _errs_to_log(static_warnings)}
                 )
                 patch_outcome = "BUILD_UNVERIFIABLE"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                 state = PipelineState.PATCH_SUCCESS
                 continue
 
-            if post.ok and not deterministic_errors:
+            if post.ok:
                 memory.record_action(phase="build-verify", outcome="ok")
                 build_verify_log.append(
-                    {"round": patch_verify_rounds_used, "system": system,
-                     "ok": True, "command": post.command,
+                    {"system": system, "outcome": "PASSED", "command": post.command,
                      "python_targets": python_targets or [],
                      "reverted_tests": reverted_tests,
-                     "downgraded_signatures": sorted(downgraded)}
+                     "static_warnings": _errs_to_log(static_warnings)}
                 )
                 patch_outcome = "PATCH_SUCCESS"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                 state = PipelineState.PATCH_SUCCESS
                 continue
 
-            # Build failed (or unverifiable-with-deterministic-findings) —
-            # distinguish patch-induced compile errors from pre-existing ones.
-            if post.ok:
-                baseline = None
-                new_errors = []
-            elif post.unverifiable:
-                # Reached only when the toolchain RAN but exited non-zero with
-                # no parseable error (toolchain_missing was handled above). We
-                # cannot attribute the failure to a line, but it is a real
-                # failure — synthesize one error carrying the raw output tail so
-                # it enters combined_errors and drives a repatch / BUILD_FAILED
-                # instead of being silently accepted as "pre-existing only".
-                baseline = None
-                raw_tail = (post.raw_output or "")[-1500:]
-                new_errors = [
-                    BuildError(
-                        file="(build)",
-                        line=None,
-                        message=(
-                            "build command failed but produced no parseable "
-                            "error line; raw tail:\n" + raw_tail
-                        ),
-                        raw=raw_tail,
-                    )
-                ]
-                print(
-                    "[build-verify] command failed un-attributably (toolchain "
-                    "present); treating as a build failure, not unverifiable.",
-                    flush=True,
-                )
-            else:
-                baseline = _compute_baseline_build(
-                    repo_dir,
-                    system,
-                    python_targets=python_targets,
-                )
-                new_errors = diff_new_errors(baseline, post)
-                print(
-                    f"[build-verify] new (patch-induced) errors: {len(new_errors)} "
-                    f"(baseline_errors="
-                    f"{len(baseline.errors) if baseline else 'n/a'})",
-                    flush=True,
-                )
-
-            combined_errors = list(new_errors) + deterministic_errors
+            baseline = _compute_baseline_build(
+                repo_dir, system, python_targets=python_targets,
+                go_targets=go_targets,
+            )
+            new_errors = diff_new_errors(baseline, post)
+            attributable = [
+                err for err in new_errors
+                if err.file not in {"", "(build)"} and err.line is not None
+            ]
             build_verify_log.append(
                 {
-                    "round": patch_verify_rounds_used,
                     "system": system,
-                    "ok": post.ok,
-                    "unverifiable": post.unverifiable,
+                    "outcome": "FAILED_NO_REPAIR" if not attributable else "FAILED",
                     "command": post.command,
                     "python_targets": python_targets or [],
                     "timed_out": post.timed_out,
                     "baseline_computed": baseline is not None,
                     "reverted_tests": reverted_tests,
                     "new_errors": _errs_to_log(new_errors),
-                    "rename_residues": _errs_to_log(residues),
-                    "undefined_config_symbols": _errs_to_log(config_sym_errors),
-                    "contract_drift": _errs_to_log(contract_drift),
-                    "parallel_impl": _errs_to_log(parallel_impl),
-                    "removed_symbol_test_refs": _errs_to_log(removed_sym_refs),
-                    "go_unexport": _errs_to_log(go_unexport),
-                    "config_entry_shape": _errs_to_log(config_shape),
-                    "downgraded_signatures": sorted(downgraded),
-                    "raw_output_tail": (post.raw_output or "")[-2000:]
-                    if post.unverifiable else "",
+                    "attributable_errors": _errs_to_log(attributable),
+                    "static_warnings": _errs_to_log(static_warnings),
                 }
             )
 
-            if not combined_errors:
+            if not attributable:
                 print(
-                    "[build-verify] all build errors pre-existed at base and no "
-                    "active deterministic findings; accepting patch.",
+                    "[build-verify] no new file/line-attributable compile error; "
+                    "skipping model repair.",
                     flush=True,
                 )
-                memory.record_action(
-                    phase="build-verify", outcome="ok_preexisting_only"
-                )
-                patch_outcome = "PATCH_SUCCESS"
+                memory.record_action(phase="build-verify", outcome="failed_no_repair")
+                patch_outcome = "BUILD_FAILED_NO_REPAIR"
                 assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
                 state = PipelineState.PATCH_SUCCESS
                 continue
 
-            if patch_verify_rounds_used < patch_verify_rounds_max:
-                patch_verify_rounds_used += 1
-                feedback_parts: list[str] = []
-                if new_errors:
-                    feedback_parts.append(render_errors_for_feedback(new_errors))
-                    enriched = _enrich_go_errors_with_definitions(
-                        repo_dir, new_errors
-                    )
-                    if enriched:
-                        feedback_parts.append(enriched)
-                feedback_parts.append(
-                    _render_heuristic_feedback(
-                        contract_drift, parallel_impl, removed_sym_refs,
-                        go_unexport, config_shape, deterministic_errors,
-                        residues=residues, config_sym_errors=config_sym_errors,
-                    )
-                )
-                memory.build_error_feedback = "\n\n".join(
-                    p for p in feedback_parts if p
-                )
-                _record_fed_back(deterministic_errors, fed_back_gate_signatures)
-                # Keep only the prior-plan edits implicated by this round's
-                # errors. The full plan would otherwise be re-inlined into the
-                # planner prompt (issue 010: bloat → empty structured_output
-                # crash); the edits the plan got right are dropped, and
-                # build_error_feedback carries the "what to fix" signal.
-                pruned_plan, dropped_edits = _prune_plan_to_error_files(
-                    memory.patch_plan, combined_errors
-                )
-                memory.patch_plan = pruned_plan
-                if dropped_edits:
+            previous_error_counts = [
+                len(entry.get("attributable_errors", []))
+                for entry in build_verify_log[:-1]
+                if entry.get("repair_triggered")
+            ]
+            allow_compile_repair = _should_run_compile_repair(
+                patch_verify_rounds_used,
+                patch_verify_rounds_max,
+                len(attributable),
+                previous_error_counts[-1] if previous_error_counts else None,
+            )
+            if allow_compile_repair:
+                if patch_verify_rounds_used >= patch_verify_rounds_max:
+                    patch_verify_rounds_max += 1
                     print(
-                        f"[build-verify] pruned prior patch plan to error files: "
-                        f"dropped {dropped_edits} edit(s), kept "
-                        f"{len(pruned_plan.edits) if pruned_plan else 0}.",
+                        "[build-verify] compile errors are converging; granting "
+                        "one bounded bonus repair round.",
                         flush=True,
                     )
-                # Slice the evidence the planner sees to just the files that
-                # failed this round (issue 010): the full EvidenceCards dump
-                # was ~56% of a 72k-char prompt — half of it the aggregate
-                # cards duplicating each requirement's scoped_evidence — which
-                # pushed the planner SDK into empty-structured_output. The
-                # per-requirement scoped_evidence is the SOURCE; the aggregate
-                # is a redundant rebuild we drop on repatch.
+                patch_verify_rounds_used += 1
+                build_verify_log[-1]["repair_triggered"] = True
+                repair_context_plan = _merge_patch_plans(
+                    aggregate_patch_plan, memory.patch_plan
+                )
+                repair_errors = _reroute_test_compile_errors_to_production_files(
+                    repair_context_plan,
+                    attributable,
+                )
+                repair_errors = _expand_go_same_package_repair_context(
+                    repair_context_plan,
+                    repair_errors,
+                )
+                repair_errors = _expand_go_cross_package_owner_context(
+                    repo_dir,
+                    repair_context_plan,
+                    repair_errors,
+                )
+                memory.build_error_feedback = render_errors_for_feedback(repair_errors)
+                enriched = _enrich_go_errors_with_definitions(repo_dir, repair_errors)
+                if enriched:
+                    memory.build_error_feedback += "\n\n" + enriched
+                package_exports = _enrich_go_errors_with_package_exports(
+                    repo_dir, repair_errors
+                )
+                if package_exports:
+                    memory.build_error_feedback += "\n\n" + package_exports
+                import_paths = _enrich_go_errors_with_module_import_paths(
+                    repo_dir, repair_errors
+                )
+                if import_paths:
+                    memory.build_error_feedback += "\n\n" + import_paths
+                pruned_plan, dropped_edits = _prune_plan_to_error_files(
+                    repair_context_plan, repair_errors
+                )
+                memory.patch_plan = _augment_repair_plan_with_errors(
+                    pruned_plan,
+                    repair_errors,
+                    reason="focused compile gate",
+                )
+                if memory.patch_plan is not None:
+                    aggregate_patch_plan = _merge_patch_plans(
+                        aggregate_patch_plan, memory.patch_plan
+                    )
+                    all_planned_files.update(
+                        edit.filepath for edit in memory.patch_plan.edits
+                    )
                 focus_files = sorted({
                     e.file.replace("\\", "/").strip().lstrip("./")
-                    for e in combined_errors
-                    if e.file and e.file != "(build)"
+                    for e in repair_errors
                 })
                 memory.evidence_focus_files = focus_files
-                if focus_files:
-                    print(
-                        f"[build-verify] sliced evidence to {len(focus_files)} "
-                        f"implicated file(s) for repatch planner prompt.",
-                        flush=True,
-                    )
                 print(
-                    "[build-verify] BUILD_FAILED → repatch: re-opening planning "
-                    f"(round {patch_verify_rounds_used}/{patch_verify_rounds_max}) "
-                    f"with {len(new_errors)} build errors and "
-                    f"{len(deterministic_errors)} deterministic finding(s).",
+                    "[build-verify] running direct compile repair "
+                    f"round {patch_verify_rounds_used}/{patch_verify_rounds_max}; "
+                    "closure and patch-planner are bypassed.",
                     flush=True,
                 )
                 memory.record_action(
-                    phase="build-verify",
-                    outcome=(
-                        f"repatch:round={patch_verify_rounds_used}/"
-                        f"{patch_verify_rounds_max}:"
-                        f"{len(new_errors)}_errors+"
-                        f"{len(deterministic_errors)}_deterministic"
-                    ),
+                    phase="compile-repair", outcome="direct_repair",
                 )
-                assert is_valid_transition(state, PipelineState.CLOSED)
-                state = PipelineState.CLOSED
+                try:
+                    repaired = await _run_patch_generator_async(memory, repo_dir, output_dir)
+                except PatchGeneratorInfraError as exc:
+                    build_verify_log[-1]["outcome"] = "MODEL_INFRA_FAILURE"
+                    build_verify_log[-1]["infra_failure"] = str(exc)
+                    patch_outcome = "MODEL_INFRA_FAILURE"
+                    print(f"[patch-generator] infrastructure failure: {exc}", flush=True)
+                    assert is_valid_transition(state, PipelineState.PATCH_FAILED)
+                    state = PipelineState.PATCH_FAILED
+                    continue
+                if not repaired:
+                    build_verify_log[-1]["outcome"] = "FAILED_AFTER_REPAIR"
+                    patch_outcome = "BUILD_FAILED_AFTER_REPAIR"
+                    assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                    state = PipelineState.PATCH_SUCCESS
+                    continue
+                # Re-enter mechanical verification once; the consumed boolean
+                # prevents any further model repair.
+                continue
             else:
                 print(
-                    "[build-verify] BUILD_FAILED and repatch budget exhausted; "
-                    "terminating as PATCH_FAILED.",
+                    "[build-verify] compile still fails after direct repair "
+                    f"budget {patch_verify_rounds_used}/{patch_verify_rounds_max}; "
+                    "continuing without a usable Stage2 artifact.",
                     flush=True,
                 )
-                memory.record_action(
-                    phase="build-verify", outcome="BUILD_FAILED_terminal"
-                )
-                patch_outcome = "BUILD_FAILED"
-                assert is_valid_transition(state, PipelineState.PATCH_FAILED)
-                state = PipelineState.PATCH_FAILED
+                memory.record_action(phase="build-verify", outcome="failed_after_repair")
+                build_verify_log[-1]["outcome"] = "FAILED_AFTER_REPAIR"
+                patch_outcome = "BUILD_FAILED_AFTER_REPAIR"
+                assert is_valid_transition(state, PipelineState.PATCH_SUCCESS)
+                state = PipelineState.PATCH_SUCCESS
 
     # ── Step 4: Post-pipeline finalization ─────────────────────────────
     print(f"[orchestrator] Pipeline finished: {state.value}", flush=True)
@@ -2953,14 +4583,55 @@ async def _run_state_machine(
             plan_path.write_text(wm.patch_plan.model_dump_json(indent=2), encoding="utf-8")
             print(f"[orchestrator] Patch plan saved -> {plan_path}", flush=True)
 
+    if stop_after_closure:
+        # A failed analysis stage is diagnostic-only. Never leave empty or
+        # stale patch artifacts that a later collector could mistake for a
+        # generated submission; main.py will reject the missing CLOSED
+        # checkpoint and return a non-zero stage result.
+        for stale_name in (
+            "analysis_stage.json", "patch.diff", "prediction.json",
+            "patch_plan.json", "patch_outcome.json", "artifact_verification.json",
+        ):
+            stale_path = output_dir / stale_name
+            if stale_path.exists():
+                stale_path.unlink()
+        if state == PipelineState.CLOSURE_FORCED_FAIL and wm is not None:
+            _save_checkpoint(
+                output_dir,
+                state,
+                wm,
+                _pack_counters(
+                    budget,
+                    rework_rounds_used,
+                    patch_verify_rounds_used,
+                    plan_coverage_rounds_used,
+                    per_req_unchecked_count,
+                    closure_failure_streak,
+                    rework_rounds_by_req,
+                ),
+                ltm_query=ltm_query,
+                custom_route_query=custom_route_query,
+                aggregate_patch_plan=aggregate_patch_plan,
+            )
+            print(
+                "[orchestrator] saved terminal ClosureForcedFail checkpoint "
+                "with preserved budget counters.",
+                flush=True,
+            )
+        print(
+            "[orchestrator] analysis-only failure finalized without patch artifacts.",
+            flush=True,
+        )
+        return evidence_path
+
     # Persist per-round build verification diagnostics.
     if build_verify_log:
-        bv_path = output_dir / "build_verification.json"
+        bv_path = output_dir / "compile_check.json"
         bv_path.write_text(
             json.dumps(build_verify_log, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        print(f"[orchestrator] Build verification log saved -> {bv_path}", flush=True)
+        print(f"[orchestrator] Compile check log saved -> {bv_path}", flush=True)
 
     # Collect git diff \u2014 pass planned files so newly-created files are
     # promoted from untracked to intent-to-add and surface in the diff.
@@ -2969,23 +4640,30 @@ async def _run_state_machine(
     # file the first round created.  The narrower coverage check below uses the
     # final plan only, to avoid false downgrades from first-round files that
     # turned out unnecessary.
+    final_verification_plan = _merge_patch_plans(aggregate_patch_plan, wm.patch_plan)
     final_plan_files: list[str] = []
-    if wm.patch_plan is not None:
-        final_plan_files = [edit.filepath for edit in wm.patch_plan.edits]
+    if final_verification_plan is not None:
+        final_plan_files = [
+            edit.filepath for edit in final_verification_plan.edits
+            if not edit.reference_only
+        ]
     diff_planned_files = sorted(all_planned_files | set(final_plan_files))
     diff_text = _collect_git_diff(repo_dir, planned_files=diff_planned_files)
     if diff_text.startswith("\ufeff"):
         diff_text = diff_text.lstrip("\ufeff")
 
-    final_artifact_result = verify_patch_artifacts(repo_dir, wm.patch_plan, diff_text)
+    final_artifact_result = verify_patch_artifacts(
+        repo_dir,
+        final_verification_plan,
+        diff_text,
+    )
     artifact_verify_log.append({"round": "final", **final_artifact_result.to_log()})
-    if not final_artifact_result.ok:
-        if final_artifact_result.empty_patch:
-            patch_outcome = "NO_EFFECT_PATCH"
-            closure_approved = False
-        elif patch_outcome in (None, "PATCH_SUCCESS", "PATCH_FAILED"):
-            patch_outcome = "PATCH_INCOMPLETE"
-            closure_approved = False
+    patch_outcome, closure_approved = _reconcile_final_patch_outcome(
+        patch_outcome,
+        closure_approved,
+        artifact_ok=final_artifact_result.ok,
+        artifact_empty_patch=final_artifact_result.empty_patch,
+    )
     if artifact_verify_log:
         av_path = output_dir / "artifact_verification.json"
         av_path.write_text(
@@ -3041,6 +4719,8 @@ def run_orchestrator(
     artifact_text: str,
     output_dir: str | Path,
     problem_statement: str = "",
+    *,
+    stop_after_closure: bool = False,
 ) -> Path:
     """Synchronous entry-point. Returns the path to evidence.json."""
     return asyncio.run(
@@ -3050,5 +4730,6 @@ def run_orchestrator(
             artifact_text=artifact_text,
             output_dir=output_dir,
             problem_statement=problem_statement,
+            stop_after_closure=stop_after_closure,
         )
     )

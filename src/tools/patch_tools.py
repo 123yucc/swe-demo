@@ -46,6 +46,32 @@ _APPLY_SEARCH_REPLACE_SCHEMA = {
     },
 }
 
+_CREATE_FILE_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Create a new file in the target repository with exact full content. "
+        "Use only for PatchPlan entries marked as creating a new file."
+    ),
+    "required": ["filepath", "content"],
+    "properties": {
+        "filepath": {
+            "type": "string",
+            "description": "Path to the new file, relative to repo root.",
+        },
+        "content": {
+            "type": "string",
+            "description": "Complete file content to write.",
+        },
+        "overwrite": {
+            "type": "boolean",
+            "description": (
+                "Whether to overwrite an existing file. Defaults to false; "
+                "patch generation should normally not overwrite."
+            ),
+        },
+    },
+}
+
 
 _SEARCH_SEP = "<<<<<<SEARCH"
 _SPLIT_SEP = "======SPLIT"
@@ -113,7 +139,7 @@ def _validate_syntax(path: Path, repo_dir: Path) -> str:
             return ""
         if returncode != 0:
             return output.strip() or f"py_compile exited with code {returncode}"
-    elif suffix in (".js", ".mjs", ".cjs", ".ts"):
+    elif suffix in (".js", ".mjs", ".cjs"):
         returncode, output, _ = run_repo_command(
             ["node", "--check", rel_path],
             repo_dir=repo_dir,
@@ -123,6 +149,11 @@ def _validate_syntax(path: Path, repo_dir: Path) -> str:
             return ""
         if returncode != 0:
             return output.strip() or f"node --check exited with code {returncode}"
+    # `node --check` cannot parse TypeScript and reports
+    # ERR_UNKNOWN_FILE_EXTENSION for otherwise valid .ts/.tsx files. Project
+    # TypeScript configurations also cannot be reproduced reliably by invoking
+    # `tsc` on one file in isolation, so defer these files to the later
+    # repository-aware build/static verification stage.
     return ""
 
 
@@ -257,6 +288,117 @@ async def apply_search_replace(args: dict[str, Any]) -> dict[str, Any]:
                     f"Successfully applied {len(blocks)} SEARCH/REPLACE "
                     f"block(s) to {raw_filepath}."
                 ),
+            }
+        ]
+    }
+
+
+@tool(
+    "create_file",
+    (
+        "Create a new file in the target repository with exact full content. "
+        "The Patch Generator calls this tool only for planned new-file edits."
+    ),
+    _CREATE_FILE_SCHEMA,
+)
+async def create_file(args: dict[str, Any]) -> dict[str, Any]:
+    """Create a planned new file and run syntax validation when possible."""
+    from src.tools.ingestion_tools import _repo_root as repo_root_str
+
+    wm = get_working_memory()
+    if wm is None:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "ERROR: No working memory initialized.",
+                }
+            ]
+        }
+
+    raw_filepath = _normalize_path(args["filepath"])
+    content = str(args.get("content") or "")
+    overwrite = bool(args.get("overwrite") or False)
+
+    if repo_root_str:
+        repo_dir = Path(repo_root_str.rstrip("/"))
+        abs_path = repo_dir / raw_filepath
+    else:
+        abs_path = Path(raw_filepath)
+        repo_dir = abs_path.parent
+
+    try:
+        abs_path.relative_to(repo_dir)
+    except ValueError:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"ERROR: Refusing to create file outside repo: {raw_filepath}",
+                }
+            ]
+        }
+
+    if abs_path.exists() and not overwrite:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"ERROR: File already exists: {raw_filepath}",
+                }
+            ]
+        }
+
+    if not content:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"ERROR: Refusing to create empty file: {raw_filepath}",
+                }
+            ]
+        }
+
+    original_content: str | None = None
+    if abs_path.exists():
+        original_content = abs_path.read_text(encoding="utf-8", errors="replace")
+
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(content, encoding="utf-8")
+
+    syntax_error = _validate_syntax(abs_path, repo_dir)
+    if syntax_error:
+        if original_content is None:
+            try:
+                abs_path.unlink()
+            except OSError:
+                pass
+        else:
+            abs_path.write_text(original_content, encoding="utf-8")
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"ERROR: Syntax validation failed after creating "
+                        f"{raw_filepath}. File has been rolled back.\n"
+                        f"Syntax error: {syntax_error}"
+                    ),
+                }
+            ]
+        }
+
+    wm.record_action(
+        phase="patch-generation",
+        subagent="create_file",
+        outcome=f"file_created:{raw_filepath}",
+    )
+
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": f"Successfully created file {raw_filepath}.",
             }
         ]
     }

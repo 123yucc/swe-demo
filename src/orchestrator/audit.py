@@ -29,6 +29,19 @@ def _has_prescriptive(findings: str) -> bool:
     - Observational: "code does X instead of Y" (describing current behavior)
     - Prescriptive: "must use X instead of Y" (proposing a fix)
     """
+    lowered = (findings or "").lower()
+    descriptive_contexts = (
+        "audit concern that",
+        "audit concern:",
+        "requirement says",
+        "requirement states",
+        "problem statement says",
+        "spec says",
+        "requested interface",
+    )
+    if any(ctx in lowered for ctx in descriptive_contexts):
+        return False
+
     # Pattern 1: Modal verbs (must/should/need to) + action verbs
     # Matches: "must be changed", "should use X", "need to replace", "must return"
     pattern1 = r'\b(must|should|need to|correct is|the right)\b.{0,50}\b(be|use|change|replace|add|remove|fix|return)\b'

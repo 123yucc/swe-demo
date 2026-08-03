@@ -23,10 +23,12 @@ if [ ! -f .env ]; then
   exit 2
 fi
 
-log_path="$repo_root/${run_name}.log"
-pid_path="$repo_root/${run_name}.pid"
-status_path="$repo_root/${run_name}.status"
-state_path="$repo_root/workdir/${run_name}.state.json"
+run_dir="$repo_root/logs/runs/$run_name"
+mkdir -p "$run_dir"
+log_path="$run_dir/runner.log"
+pid_path="$run_dir/runner.pid"
+status_path="$run_dir/runner.status"
+state_path="$run_dir/runner.state.json"
 run_id=$(date -u +%Y%m%dT%H%M%SZ)-$$
 
 if [ -f "$pid_path" ]; then
@@ -37,8 +39,12 @@ if [ -f "$pid_path" ]; then
   fi
 fi
 
+if [ -e "$log_path" ] || [ -e "$status_path" ] || [ -e "$state_path" ]; then
+  echo "REFUSING_TO_OVERWRITE run=$run_name directory=$run_dir" >&2
+  exit 3
+fi
+
 : > "$log_path"
-rm -f "$status_path"
 : > "$state_path"
 
 cmd=(
@@ -57,7 +63,7 @@ for arg in "${cmd[@]}"; do
 done
 quoted_cmd=${quoted_cmd# }
 
-launcher="cd $(printf '%q' "$repo_root") && set -a && . ./.env && set +a && export HTTP_PROXY=\${HTTP_PROXY:-http://127.0.0.1:7897} HTTPS_PROXY=\${HTTPS_PROXY:-http://127.0.0.1:7897} http_proxy=\${http_proxy:-\$HTTP_PROXY} https_proxy=\${https_proxy:-\$HTTPS_PROXY} NO_PROXY=\${NO_PROXY:-127.0.0.1,localhost} no_proxy=\${no_proxy:-127.0.0.1,localhost}; sg docker -c $(printf '%q' "$quoted_cmd") >> $(printf '%q' "$log_path") 2>&1; rc=\$?; echo \$rc > $(printf '%q' "$status_path")"
+launcher="cd $(printf '%q' "$repo_root") && set -a && . ./.env && set +a && export OPENAI_CA_CERT_PATH=/home/user/demo/runtime/caddy_ca.ip.pem HTTP_PROXY=\${HTTP_PROXY:-http://127.0.0.1:7897} HTTPS_PROXY=\${HTTPS_PROXY:-http://127.0.0.1:7897} http_proxy=\${http_proxy:-\$HTTP_PROXY} https_proxy=\${https_proxy:-\$HTTPS_PROXY} NO_PROXY=\${NO_PROXY:+\$NO_PROXY,}127.0.0.1,localhost,165.154.193.90,claude.buzz7.top no_proxy=\${no_proxy:+\$no_proxy,}127.0.0.1,localhost,165.154.193.90,claude.buzz7.top; sg docker -c $(printf '%q' "$quoted_cmd") >> $(printf '%q' "$log_path") 2>&1; rc=\$?; echo \$rc > $(printf '%q' "$status_path")"
 
 setsid /bin/bash -lc "$launcher" >/dev/null 2>&1 < /dev/null &
 runner_pid=$!

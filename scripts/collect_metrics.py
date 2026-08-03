@@ -36,6 +36,20 @@ def load_json(path: Path) -> dict | list | None:
         return None
 
 
+def load_model_calls(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict):
+                rows.append(item)
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
 def count_action_events(action_history: list[dict], **filters) -> int:
     """Count events in action_history matching all provided filters."""
     count = 0
@@ -51,15 +65,6 @@ def get_deep_search_rounds(action_history: list[dict]) -> int:
 
 def get_rework_rounds(action_history: list[dict]) -> int:
     return count_action_events(action_history, outcome="rework")
-
-
-def get_repatch_rounds(action_history: list[dict]) -> int:
-    # repatch outcomes include "BUILD_FAILED_repatch" style entries
-    return sum(
-        1 for evt in action_history
-        if "repatch" in str(evt.get("outcome", "")).lower()
-        or (evt.get("phase", "") == "patch-planning" and evt.get("outcome", "") == "REPATCH")
-    )
 
 
 def get_llm_invocations(action_history: list[dict]) -> int:
@@ -103,11 +108,8 @@ def count_evidence_items(evidence_cards: dict) -> dict[str, int]:
 def get_build_gate_info(build_verification: list | dict | None) -> dict:
     if not build_verification:
         return {
-            "build_rounds": 0,
-            "build_gate_passed": None,
-            "build_gate_outcome": "NO_BUILD_LOG",
+            "compile_outcome": "NO_COMPILE_LOG",
             "build_system": "unknown",
-            "build_error_count": 0,
         }
     # build_verification.json is a list of round dicts
     if isinstance(build_verification, list):
@@ -115,41 +117,11 @@ def get_build_gate_info(build_verification: list | dict | None) -> dict:
     else:
         rounds = build_verification.get("rounds", [])
     build_system = rounds[0].get("system", "unknown") if rounds else "unknown"
-    # Gate passed = final round has no new build or deterministic errors.
     last = rounds[-1] if rounds else {}
-    error_fields = (
-        "new_errors",
-        "rename_residues",
-        "undefined_config_symbols",
-        "contract_drift",
-        "parallel_impl",
-        "removed_symbol_test_refs",
-        "go_unexport",
-        "config_entry_shape",
-        "heuristic_findings",
-    )
-    error_count = sum(len(last.get(name, []) or []) for name in error_fields)
-    passed = (bool(last.get("ok")) and error_count == 0) if rounds else None
-    if not rounds:
-        outcome = "NO_BUILD_LOG"
-    elif last.get("skipped"):
-        outcome = "SKIPPED"
-    elif last.get("timed_out"):
-        outcome = "TIMED_OUT"
-    elif last.get("unverifiable") and last.get("toolchain_missing"):
-        outcome = "UNVERIFIABLE_TOOLCHAIN_MISSING"
-    elif last.get("unverifiable"):
-        outcome = "UNVERIFIABLE_FAILURE"
-    elif passed:
-        outcome = "PASSED"
-    else:
-        outcome = "FAILED"
+    outcome = str(last.get("outcome") or "LEGACY_UNKNOWN")
     return {
-        "build_rounds": len(rounds),
-        "build_gate_passed": passed,
-        "build_gate_outcome": outcome,
+        "compile_outcome": outcome,
         "build_system": build_system,
-        "build_error_count": error_count,
     }
 
 
@@ -163,7 +135,79 @@ def load_runner_task(outputs: Path) -> dict:
     return task if isinstance(task, dict) else {}
 
 
-def failure_reason_for(outputs: Path, resolved: bool | None, patch_outcome: str, runner_task: dict) -> str:
+def load_analysis_stage(outputs: Path) -> dict:
+    stage = load_json(outputs / "analysis_stage.json")
+    return stage if isinstance(stage, dict) else {}
+
+
+def is_model_infra_failure(patch_outcome: str, runner_task: dict) -> bool:
+    return (
+        patch_outcome == "MODEL_INFRA_FAILURE"
+        or runner_task.get("failure_kind") == "model_infra"
+        or (
+            runner_task.get("status") == "infra_failed"
+            and not runner_task.get("failure_kind")
+            and patch_outcome == "MODEL_INFRA_FAILURE"
+        )
+    )
+
+
+def is_docker_infra_failure(patch_outcome: str, runner_task: dict) -> bool:
+    return (
+        patch_outcome == "DOCKER_INFRA_FAILURE"
+        or runner_task.get("failure_kind") == "docker_infra"
+    )
+
+
+def _sum_metric_dicts(parts: list[dict]) -> dict:
+    merged: dict = {}
+    if not parts:
+        return merged
+    preferred = parts[-1]
+    for key, value in preferred.items():
+        merged[key] = value
+    for key in (
+        "total_cost_usd",
+        "estimated_cost_usd",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "wall_clock_seconds",
+    ):
+        merged[key] = sum(float(p.get(key, 0) or 0) for p in parts)
+    return merged
+
+
+def load_run_metrics(outputs: Path) -> tuple[dict, str, dict, dict]:
+    analysis = load_json(outputs / "run_metrics.analysis.json")
+    generate = load_json(outputs / "run_metrics.json")
+    analysis = analysis if isinstance(analysis, dict) else {}
+    generate = generate if isinstance(generate, dict) else {}
+
+    parts = [p for p in (analysis, generate) if p]
+    if not parts:
+        return {}, "", {}, {}
+    if analysis and generate:
+        return _sum_metric_dicts(parts), "run_metrics.analysis.json+run_metrics.json", analysis, generate
+    if generate:
+        return generate, "run_metrics.json", analysis, generate
+    return analysis, "run_metrics.analysis.json", analysis, generate
+
+
+def failure_reason_for(
+    outputs: Path,
+    resolved: bool | None,
+    patch_outcome: str,
+    runner_task: dict,
+    analysis_stage: dict,
+) -> str:
+    if is_model_infra_failure(patch_outcome, runner_task):
+        return f"model_infra_failure; patch_outcome={patch_outcome}"
+    if is_docker_infra_failure(patch_outcome, runner_task):
+        return f"docker_infra_failure; patch_outcome={patch_outcome}"
+    if analysis_stage.get("status") == "analysis_complete":
+        return ""
     status = runner_task.get("status")
     if status == "failed":
         return str(runner_task.get("error") or "runner_task failed")
@@ -211,10 +255,18 @@ def collect_case(issue_dir: Path, eval_results: dict | None, output_subdir: str)
     verdict_dist = get_verdict_distribution(requirements)
 
     # Run metrics (timing + cost, only available for cases run with new code)
-    run_metrics = load_json(outputs / "run_metrics.json") or {}
+    run_metrics, metrics_file, analysis_metrics, generate_metrics = load_run_metrics(outputs)
+    model_calls = load_model_calls(outputs / "model_calls.jsonl")
+    actual_calls = [row for row in model_calls if "wall_clock_ms" in row]
+    analysis_stage = load_analysis_stage(outputs)
 
     # Build verification
-    build_info = get_build_gate_info(load_json(outputs / "build_verification.json"))
+    compile_log = load_json(outputs / "compile_check.json")
+    if compile_log is None:
+        compile_log = load_json(outputs / "build_verification.json")
+    build_info = get_build_gate_info(compile_log)
+    dynamic = load_json(outputs / "dynamic_closure.json") or {}
+    dynamic_counts = dynamic.get("counts", {}) if isinstance(dynamic, dict) else {}
 
     # Eval result (pass/fail)
     resolved = None
@@ -228,6 +280,17 @@ def collect_case(issue_dir: Path, eval_results: dict | None, output_subdir: str)
     passed_expected = expected_tests & passed_tests
     missing_expected = expected_tests - passed_tests
     runner_task = load_runner_task(outputs)
+    runner_status_raw = runner_task.get("status")
+    runner_status_effective = (
+        runner_status_raw
+        if runner_status_raw == "infra_failed"
+        else "success"
+        if analysis_stage.get("status") == "analysis_complete"
+        else runner_status_raw
+    )
+    model_infra_failure = is_model_infra_failure(patch_outcome, runner_task)
+    docker_infra_failure = is_docker_infra_failure(patch_outcome, runner_task)
+    infra_failure = model_infra_failure or docker_infra_failure
 
     # Gold patch complexity
     gold_patch = meta.get("patch", "")
@@ -259,6 +322,7 @@ def collect_case(issue_dir: Path, eval_results: dict | None, output_subdir: str)
         "has_evidence": (outputs / "evidence.json").exists(),
         "has_prediction": (outputs / "prediction.json").exists(),
         "has_eval_summary": bool(eval_summary),
+        "has_analysis_stage": bool(analysis_stage),
         # Process data
         "requirements_total": len(requirements),
         "verdict_AS_IS_VIOLATED": verdict_dist.get("AS_IS_VIOLATED", 0),
@@ -268,22 +332,66 @@ def collect_case(issue_dir: Path, eval_results: dict | None, output_subdir: str)
         "verdict_UNCHECKED": verdict_dist.get("UNCHECKED", 0),
         "deep_search_rounds": get_deep_search_rounds(action_history),
         "rework_rounds": get_rework_rounds(action_history),
-        "repatch_rounds": get_repatch_rounds(action_history),
         "llm_invocations": get_llm_invocations(action_history),
         "closure_forced_fail": get_closure_forced_fail(action_history),
         **build_info,
-        # Timing + cost (from run_metrics.json, may be empty for older cases)
+        "dynamic_closure_passed": dynamic_counts.get("PASS", 0),
+        "dynamic_closure_failed": dynamic_counts.get("FAIL", 0),
+        "dynamic_closure_unverifiable": (
+            dynamic_counts.get("UNVERIFIABLE", 0)
+            + dynamic_counts.get("FLAKY_UNVERIFIABLE", 0)
+        ),
+        "dynamic_closure_seconds": dynamic.get("wall_clock_seconds"),
+        "dynamic_closure_input_tokens": dynamic.get("input_tokens"),
+        "dynamic_closure_output_tokens": dynamic.get("output_tokens"),
+        "dynamic_closure_cache_read_tokens": dynamic.get("cache_read_input_tokens"),
+        "dynamic_closure_estimated_cost_usd": dynamic.get("estimated_cost_usd"),
+        # Timing + cost. When both stage1/analysis and stage2/generate metrics
+        # exist, we sum them so experiment totals reflect the full pipeline.
+        "run_metrics_file": metrics_file,
         "wall_clock_seconds": run_metrics.get("wall_clock_seconds"),
         "model": run_metrics.get("model"),
         "total_cost_usd": run_metrics.get("total_cost_usd"),
+        "estimated_cost_usd": run_metrics.get("estimated_cost_usd"),
+        "end_to_end_estimated_cost_usd": (
+            float(run_metrics.get("estimated_cost_usd", 0) or 0)
+            + float(dynamic.get("estimated_cost_usd", 0) or 0)
+        ),
         "input_tokens": run_metrics.get("input_tokens"),
         "output_tokens": run_metrics.get("output_tokens"),
         "cache_read_tokens": run_metrics.get("cache_read_input_tokens"),
         "cache_create_tokens": run_metrics.get("cache_creation_input_tokens"),
+        "analysis_cost_usd": analysis_metrics.get("total_cost_usd"),
+        "generate_cost_usd": generate_metrics.get("total_cost_usd"),
+        "analysis_estimated_cost_usd": analysis_metrics.get("estimated_cost_usd"),
+        "generate_estimated_cost_usd": generate_metrics.get("estimated_cost_usd"),
+        "analysis_wall_clock_seconds": analysis_metrics.get("wall_clock_seconds"),
+        "generate_wall_clock_seconds": generate_metrics.get("wall_clock_seconds"),
+        "analysis_status": analysis_stage.get("status"),
+        "analysis_handoff_version": analysis_stage.get("handoff_version"),
+        "analysis_handoff_ready": analysis_stage.get("handoff_ready"),
+        "model_call_count": len(actual_calls),
+        "model_turns": sum(int(row.get("model_turns", 0) or 0) for row in actual_calls),
+        "tool_calls": sum(int(row.get("tool_calls", 0) or 0) for row in actual_calls),
+        "prompt_chars": sum(int(row.get("prompt_chars", 0) or 0) for row in actual_calls),
+        "reflection_calls": sum(row.get("call_reason") == "reflection" for row in actual_calls),
+        "structured_retries": sum(int(row.get("retry_count", 0) or 0) for row in actual_calls),
+        "timeout_calls": sum("timeout" in str(row.get("exception", "")).lower() for row in actual_calls),
+        "closure_conflict_edges": sum(
+            len(row.get("conflicts", []) or []) for row in model_calls
+            if row.get("component") == "closure-conflicts"
+        ),
         # Gold patch complexity
         "gold_files_count": gold_files_count,
-        "runner_status": runner_task.get("status"),
-        "failure_reason": failure_reason_for(outputs, resolved, patch_outcome, runner_task),
+        "runner_status_raw": runner_status_raw,
+        "runner_status": runner_status_effective,
+        "infra_failure": infra_failure,
+        "model_infra_failure": model_infra_failure,
+        "docker_infra_failure": docker_infra_failure,
+        "harness_quality_failure": bool(runner_status_raw == "failed" and not infra_failure),
+        "failure_reason": failure_reason_for(
+            outputs, resolved, patch_outcome, runner_task, analysis_stage
+        ),
         "patch_path": str(outputs / "patch.diff"),
         "eval_summary_path": str(outputs / "eval_result" / "eval_summary.json"),
         "logs_dir": str(outputs / "logs"),
@@ -379,6 +487,7 @@ def main() -> None:
     total = len(rows)
     evaled = [r for r in rows if r.get("resolved") is not None]
     resolved = [r for r in evaled if r.get("resolved")]
+    infra_failures = [r for r in rows if r.get("infra_failure")]
     patch_outcomes = {}
     for r in rows:
         k = r.get("patch_outcome", "N/A")
@@ -388,7 +497,7 @@ def main() -> None:
     for r in rows:
         k = r.get("runner_status") or "missing"
         runner_statuses[k] = runner_statuses.get(k, 0) + 1
-        b = r.get("build_gate_outcome") or "unknown"
+        b = r.get("compile_outcome") or "unknown"
         build_gate_outcomes[b] = build_gate_outcomes.get(b, 0) + 1
 
     by_lang: dict[str, dict] = {}
@@ -404,13 +513,14 @@ def main() -> None:
     print(f"Total cases: {total}")
     print(f"Evaluated:   {len(evaled)}")
     print(f"Resolved:    {len(resolved)} ({100*len(resolved)/len(evaled):.1f}% of evaled)" if evaled else "Resolved: N/A")
+    print(f"Model infra failures: {len(infra_failures)}")
     print(f"\nPatch outcome distribution:")
     for k, v in sorted(patch_outcomes.items()):
         print(f"  {k}: {v}")
     print(f"\nRunner status distribution:")
     for k, v in sorted(runner_statuses.items()):
         print(f"  {k}: {v}")
-    print(f"\nBuild gate outcome distribution:")
+    print(f"\nCompile outcome distribution:")
     for k, v in sorted(build_gate_outcomes.items()):
         print(f"  {k}: {v}")
     print(f"\nResolved rate by language:")
@@ -428,6 +538,7 @@ def main() -> None:
         {"metric": "swebench_resolved_rate_pct", "value": round(100*len(resolved)/len(evaled), 2) if evaled else 0},
         {"metric": "resolved_cases", "value": len(resolved)},
         {"metric": "resolved_rate_pct", "value": round(100*len(resolved)/len(evaled), 2) if evaled else 0},
+        {"metric": "model_infra_failures", "value": len(infra_failures)},
     ]
     for k, v in sorted(patch_outcomes.items()):
         summary_rows.append({"metric": f"harness_patch_outcome_{k}", "value": v})
@@ -435,7 +546,7 @@ def main() -> None:
     for k, v in sorted(runner_statuses.items()):
         summary_rows.append({"metric": f"runner_status_{k}", "value": v})
     for k, v in sorted(build_gate_outcomes.items()):
-        summary_rows.append({"metric": f"build_gate_outcome_{k}", "value": v})
+        summary_rows.append({"metric": f"compile_outcome_{k}", "value": v})
     for lang, stats in sorted(by_lang.items()):
         summary_rows.append({"metric": f"resolved_{lang}", "value": f"{stats['resolved']}/{stats['total']}"})
 

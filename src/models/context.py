@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.models.evidence import (
     ConstraintCard,
@@ -12,7 +12,7 @@ from src.models.evidence import (
 )
 
 
-SchemaVersion = Literal["v2"]
+SchemaVersion = Literal["v2", "v3"]
 
 
 class EvidenceCards(BaseModel):
@@ -54,12 +54,26 @@ class EvidenceCards(BaseModel):
         ),
     )
     schema_version: SchemaVersion = Field(
-        default="v2",
+        default="v3",
         description=(
-            "Evidence-cards schema version. v2 introduced RequirementItem[] "
-            "and removed the AS-IS/TO-BE prefix convention."
+            "Evidence-cards schema version. v3 adds lossless contract metadata."
         ),
     )
+
+    @model_validator(mode="after")
+    def migrate_v2_in_memory(self) -> "EvidenceCards":
+        """Accept legacy checkpoints while exposing a v3 object to new code.
+
+        Existing ids, verdicts, evidence and action history are untouched. Old
+        items simply lack source spans because a checkpoint does not contain
+        enough information to reconstruct offsets safely.
+        """
+        if self.schema_version == "v2":
+            for item in [*self.requirements, *self.requirement_status]:
+                if not item.parent_contract_id:
+                    item.parent_contract_id = f"contract-{item.id.removeprefix('req-')}"
+            self.schema_version = "v3"
+        return self
 
 
 class SessionContext(BaseModel):

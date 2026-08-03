@@ -20,6 +20,15 @@ ActiveVerdict = Literal[
 ]
 
 RequirementOrigin = Literal["problem_statement", "requirements", "new_interfaces"]
+ContractKind = Literal["behavior", "interface", "problem_statement"]
+
+
+class SourceSpan(BaseModel):
+    """Lossless location of a requirement/contract in the input artifact."""
+
+    start: int = Field(default=0, ge=0, description="Inclusive character offset.")
+    end: int = Field(default=0, ge=0, description="Exclusive character offset.")
+    text: str = Field(default="", description="Verbatim source block.")
 
 
 class RequirementStatus(BaseModel):
@@ -50,6 +59,12 @@ class RequirementStatus(BaseModel):
         default_factory=list,
         description="Verified code locations supporting the compliant status.",
     )
+    source_span: SourceSpan | None = None
+    parent_contract_id: str = ""
+    contract_kind: ContractKind = "behavior"
+    explicit_paths: list[str] = Field(default_factory=list)
+    explicit_symbols: list[str] = Field(default_factory=list)
+    source_block_hash: str = ""
 
 
 class SymptomCard(BaseModel):
@@ -280,4 +295,18 @@ class RequirementItem(BaseModel):
             "from the previous verdict. Cleared automatically after the next "
             "deep-search verdict is persisted."
         ),
+    )
+    source_span: SourceSpan | None = Field(
+        default=None,
+        description="Verbatim source span; required for parser-produced v3 items.",
+    )
+    parent_contract_id: str = Field(
+        default="",
+        description="Stable contract id shared by sub-requirements and interface fields.",
+    )
+    contract_kind: ContractKind = Field(default="behavior")
+    explicit_paths: list[str] = Field(default_factory=list)
+    explicit_symbols: list[str] = Field(default_factory=list)
+    source_block_hash: str = Field(
+        default="", description="SHA-256 of the unmodified source block."
     )

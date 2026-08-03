@@ -14,6 +14,25 @@ from pydantic import BaseModel, Field
 from src.models.audit import AuditResult, DimensionFinding
 
 
+class ClosureConflict(BaseModel):
+    """One mechanically verifiable edge in the closure conflict graph."""
+
+    left_requirement_id: str
+    right_requirement_id: str
+    conflicting_field: str
+    shared_evidence: list[str] = Field(default_factory=list)
+    explanation: str
+    recommended_recheck_side: Literal["left", "right", "both"]
+
+
+class SharedFactGap(BaseModel):
+    """A single missing fact consumed by several requirements."""
+
+    fact: str
+    requirement_ids: list[str] = Field(default_factory=list)
+    suggested_anchor: str = ""
+
+
 class ClosureVerdict(BaseModel):
     """Verdict returned by the closure-checker subagent.
 
@@ -76,4 +95,12 @@ class ClosureVerdict(BaseModel):
             "When verdict is EVIDENCE_MISSING: requirement ids that need a "
             "deep-search rework. Empty for CLOSURE_APPROVED."
         ),
+    )
+    conflicts: list[ClosureConflict] = Field(
+        default_factory=list,
+        description="Structured and evidence-backed consistency conflict edges.",
+    )
+    shared_fact_gaps: list[SharedFactGap] = Field(
+        default_factory=list,
+        description="Deduplicated missing facts shared by multiple requirements.",
     )

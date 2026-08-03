@@ -3,7 +3,12 @@ $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PidPath = Join-Path $Root "tmp\remote_proxy_tunnel.pid"
 $RemoteHost = "user@172.28.8.77"
+$ProxyHelper = (Join-Path $Root "scripts\http_connect_proxy.py").Replace("\", "/")
+$ProxyCommand = "ProxyCommand=python $ProxyHelper %h %p --proxy-port 7897"
 $SshArgs = @(
+    # Start-Process flattens ArgumentList to one command line, so preserve the
+    # ProxyCommand (which contains spaces) as one quoted OpenSSH argument.
+    "-o", ('"' + $ProxyCommand + '"'),
     "-o", "ExitOnForwardFailure=yes",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",
@@ -19,7 +24,7 @@ if (-not (Get-NetTCPConnection -LocalPort 7897 -State Listen -ErrorAction Silent
 }
 
 function Test-RemoteTunnel {
-    & ssh.exe $RemoteHost "sh -lc 'ss -ltn | grep -q ""127.0.0.1:7897""'" | Out-Null
+    & ssh.exe "-o" $ProxyCommand $RemoteHost "sh -lc 'ss -ltn | grep -q ""127.0.0.1:7897""'" | Out-Null
     return $LASTEXITCODE -eq 0
 }
 

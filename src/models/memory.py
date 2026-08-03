@@ -8,6 +8,8 @@ implicit in the SDK — each subagent session is its own local memory.
 
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, Field
 
 from src.models.context import EvidenceCards
@@ -174,7 +176,11 @@ class SharedWorkingMemory(BaseModel):
         history_section = ""
         if self.action_history:
             lines: list[str] = []
-            for i, evt in enumerate(self.action_history):
+            recent_history = self.action_history[-20:]
+            omitted = len(self.action_history) - len(recent_history)
+            if omitted:
+                lines.append(f"  ... {omitted} earlier events persisted on disk ...")
+            for i, evt in enumerate(recent_history):
                 parts = [f"phase={evt.phase}"]
                 if evt.subagent:
                     parts.append(f"subagent={evt.subagent}")
@@ -239,6 +245,30 @@ class SharedWorkingMemory(BaseModel):
             "═══ END WORKING MEMORY ═══"
         )
 
+    def format_for_deep_search(self, requirement: RequirementItem) -> str:
+        """Render narrow non-evidence context for one investigation."""
+        sections: list[str] = []
+        if self.ltm_search_summaries:
+            sections.append("## Relevant LTM summaries\n" + "\n".join(
+                f"- {item}" for item in self.ltm_search_summaries
+            ))
+        if self.ltm_reference_block:
+            sections.append(self.ltm_reference_block)
+        if self.custom_repair_block:
+            sections.append("## Custom repair rules\n" + self.custom_repair_block)
+        if self.build_error_feedback:
+            sections.append("## Relevant build feedback\n" + self.build_error_feedback)
+        related = [
+            event for event in self.action_history
+            if not event.requirement_id or event.requirement_id == requirement.id
+        ][-12:]
+        if related:
+            sections.append("## Recent action summary\n" + "\n".join(
+                f"- {e.phase}|{e.subagent or '-'}|{e.requirement_id or '-'}|{e.outcome}"
+                for e in related
+            ))
+        return "\n\n".join(sections)
+
     def _render_evidence_section(self) -> str:
         """Render the evidence-cards block, full or sliced.
 
@@ -255,9 +285,42 @@ class SharedWorkingMemory(BaseModel):
         symptom card is small and always kept.
         """
         if not self.evidence_focus_files:
+            full_json = self.evidence_cards.model_dump_json(
+                indent=2,
+                exclude={"requirement_status"},
+            )
+            mode = os.environ.get("EVIDENCE_PROMPT_COMPACTION", "auto").strip().lower()
+            if mode not in {"auto", "always", "off"}:
+                mode = "auto"
+            try:
+                min_chars = max(
+                    0,
+                    int(os.environ.get("EVIDENCE_PROMPT_COMPACTION_MIN_CHARS", "50000")),
+                )
+            except ValueError:
+                min_chars = 50000
+
+            compact = mode == "always" or (mode == "auto" and len(full_json) >= min_chars)
+            if compact:
+                # Aggregate cards are rebuilt from these per-requirement slices,
+                # so retaining both representations doubles large planner prompts.
+                full_json = self.evidence_cards.model_dump_json(
+                    indent=2,
+                    exclude={
+                        "requirement_status": True,
+                        "requirements": {"__all__": {"scoped_evidence"}},
+                    },
+                )
+                note = (
+                    "Nested requirement scoped_evidence is omitted because it is "
+                    "duplicated by the aggregate cards above. Requirement text, "
+                    "verdicts, findings, and evidence locations are preserved.\n"
+                )
+            else:
+                note = ""
             return (
                 "## Evidence Cards (active repair context)\n"
-                f"```json\n{self.evidence_cards.model_dump_json(indent=2, exclude={'requirement_status'})}\n```\n\n"
+                f"{note}```json\n{full_json}\n```\n\n"
             )
 
         focus = [f.replace("\\", "/").strip().lstrip("./")

@@ -20,7 +20,9 @@ modules: syntax compilation plus import smoke checks with the repository's
 source roots on ``PYTHONPATH``.
 
 Language coverage:
-  * go      鈫?``go build ./...`` + ``go vet ./...`` (vet also compiles _test.go)
+  * go      鈫?``go build`` on changed packages + ``go test -c`` on the same
+              packages (compile evaluator-owned package tests without running
+              them)
   * python  -> compile/import changed production modules only
   * node    鈫?skipped (plain JS has no compile step; observed failures are all
               Go/Python 鈥?do not block, just log)
@@ -261,6 +263,7 @@ def run_build_check(
     system: BuildSystem | None = None,
     timeout: int = 1200,
     python_targets: list[str] | None = None,
+    go_targets: list[str] | None = None,
 ) -> BuildCheckResult:
     """Compile / collect the patched tree and return structured errors.
 
@@ -272,7 +275,7 @@ def run_build_check(
         system = detect_build_system(repo_dir)
 
     if system == "go":
-        return _run_go(repo_dir, timeout)
+        return _run_go(repo_dir, timeout, go_targets=go_targets)
     if system == "python":
         return _run_python(repo_dir, timeout, python_targets=python_targets)
 
@@ -285,9 +288,57 @@ def run_build_check(
     )
 
 
-def _run_go(repo_dir: Path, timeout: int) -> BuildCheckResult:
-    """``go build ./...`` then ``go vet ./...``; merge parsed errors."""
-    commands = [["go", "build", "./..."], ["go", "vet", "./..."]]
+def changed_go_packages(repo_dir: Path) -> list[str]:
+    """Return package directory selectors for changed production Go files."""
+    # The host worktree is canonical. Asking the Docker executor to discover
+    # changed paths is circular: run_repo_command first syncs the patch and a
+    # sync/reset anomaly can make the discovery command report an empty diff,
+    # which silently skips compile. Only the actual toolchain command belongs
+    # in the executor.
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "diff", "--name-only",
+             "--diff-filter=ACMRT", "HEAD", "--", "*.go"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    packages: set[str] = set()
+    for raw in proc.stdout.splitlines():
+        rel = raw.strip().replace("\\", "/")
+        if not rel or rel.endswith("_test.go"):
+            continue
+        parent = str(Path(rel).parent).replace("\\", "/")
+        packages.add("." if parent in {"", "."} else f"./{parent}")
+    return sorted(packages)
+
+
+def _run_go(
+    repo_dir: Path,
+    timeout: int,
+    go_targets: list[str] | None = None,
+) -> BuildCheckResult:
+    """Compile affected Go packages plus package-local tests without running them."""
+    targets = list(go_targets) if go_targets is not None else changed_go_packages(repo_dir)
+    if not targets and not (Path(repo_dir) / ".git").exists() and any(Path(repo_dir).glob("*.go")):
+        targets = ["."]
+    if not targets:
+        return BuildCheckResult(
+            system="go",
+            ok=True,
+            skipped=True,
+            command="(skipped: no changed production Go packages)",
+        )
+    commands = [["go", "build", *targets]]
+    for idx, target in enumerate(targets, start=1):
+        commands.append([
+            "go", "test", "-c",
+            "-o", f"/tmp/build-verify-{idx}.test",
+            target,
+        ])
     all_errors: list[BuildError] = []
     raw_parts: list[str] = []
     ok = True
@@ -335,14 +386,21 @@ def changed_python_production_files(repo_dir: Path) -> list[str]:
     repo_dir = Path(repo_dir)
     paths: set[str] = set()
     commands = (
-        ["git", "diff", "--name-only", "--diff-filter=ACMRT", "--", "*.py"],
-        ["git", "ls-files", "--others", "--exclude-standard", "--", "*.py"],
+        ["diff", "--name-only", "--diff-filter=ACMRT", "HEAD", "--", "*.py"],
+        ["ls-files", "--others", "--exclude-standard", "--", "*.py"],
     )
     for cmd in commands:
-        rc, out, _ = _run(cmd, repo_dir, timeout=30)
-        if rc != 0:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_dir), *cmd],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30, check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             continue
-        for raw in out.splitlines():
+        if proc.returncode != 0:
+            continue
+        for raw in proc.stdout.splitlines():
             rel = raw.strip().replace("\\", "/")
             if rel and _is_python_production_file(rel):
                 paths.add(rel)
@@ -398,6 +456,11 @@ def _last_python_exception(text: str) -> str:
     return "python import/compile failed"
 
 
+def _last_python_line(text: str) -> int | None:
+    matches = re.findall(r'File "[^"]+", line (\d+)', text)
+    return int(matches[-1]) if matches else None
+
+
 def _run_python(
     repo_dir: Path,
     timeout: int,
@@ -431,24 +494,39 @@ def _run_python(
         timed_out = timed_out or t_out
         toolchain_missing = toolchain_missing or rc == _RC_TOOLCHAIN_MISSING
         if rc != 0:
-            errors.append(BuildError(file=rel, line=None, message=_last_python_exception(out), raw=out))
+            errors.append(BuildError(file=rel, line=_last_python_line(out), message=_last_python_exception(out), raw=out))
             continue
 
         module = _module_name_for_path(rel)
         if not module:
             continue
-        import_cmd = [
-            "python",
-            "-c",
-            "import importlib, sys; importlib.import_module(sys.argv[1])",
-            module,
-        ]
+        if rel.replace("\\", "/").startswith("scripts/"):
+            import_cmd = [
+                "python",
+                "-c",
+                (
+                    "import importlib.util, pathlib, sys; "
+                    "p=pathlib.Path(sys.argv[1]).resolve(); "
+                    "sys.path.insert(0, str(p.parent)); "
+                    "spec=importlib.util.spec_from_file_location('__harness_script__', p); "
+                    "m=importlib.util.module_from_spec(spec); "
+                    "spec.loader.exec_module(m)"
+                ),
+                rel,
+            ]
+        else:
+            import_cmd = [
+                "python",
+                "-c",
+                "import importlib, sys; importlib.import_module(sys.argv[1])",
+                module,
+            ]
         rc, out, t_out = _run(import_cmd, repo_dir, timeout, env=env)
         raw_parts.append(f"$ {' '.join(import_cmd)} (rc={rc})\n{out}")
         timed_out = timed_out or t_out
         toolchain_missing = toolchain_missing or rc == _RC_TOOLCHAIN_MISSING
         if rc != 0:
-            errors.append(BuildError(file=rel, line=None, message=_last_python_exception(out), raw=out))
+            errors.append(BuildError(file=rel, line=_last_python_line(out), message=_last_python_exception(out), raw=out))
 
     ok = not errors and not toolchain_missing and not timed_out
     unverifiable = toolchain_missing and not timed_out

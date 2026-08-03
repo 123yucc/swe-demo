@@ -62,6 +62,12 @@ def _docker_exec(
     env: dict[str, str] | None = None,
 ) -> tuple[int, str, bool]:
     cmd = ["docker", "exec"]
+    if input_text is not None:
+        # docker exec closes container stdin unless -i is explicit. Without
+        # this, `git apply -` receives an empty stream even though
+        # subprocess.run(input=...) was populated, producing the misleading
+        # "No valid patches in input" sync failure.
+        cmd.append("-i")
     for key, value in sorted((env or {}).items()):
         if value is not None:
             cmd.extend(["-e", f"{key}={value}"])
@@ -201,7 +207,9 @@ def run_repo_command(
 
     rc_sync, out_sync = sync_to_executor(repo_dir, timeout=max(120, min(timeout, 600)))
     if rc_sync != 0:
-        return rc_sync, out_sync, False
+        # Keep executor plumbing failures distinct from compiler diagnostics.
+        # Callers must never feed this text to a model as a code error.
+        return rc_sync, "[repo-executor-sync] " + out_sync, False
     return _docker_exec(
         container,
         cmd,

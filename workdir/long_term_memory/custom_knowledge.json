@@ -47,7 +47,7 @@
         "rename"
       ]
     }
-  }, 
+  },
   "custom-go-unexport-methods-lowercase": {
     "id": "custom-go-unexport-methods-lowercase",
     "title": "In Go, unexporting a type does NOT unexport its methods — 'make the methods non-public' literally means lowercasing each method identifier",
@@ -184,6 +184,332 @@
       "change_shape": [
         "config",
         "add-field"
+      ]
+    }
+  },
+  "custom-layered-option-propagation-closure": {
+    "id": "custom-layered-option-propagation-closure",
+    "title": "Layered options must be traced from public input to the final behavior gate",
+    "symptom": "The requirement adds or changes a control flag, request field, decorator option, or module parameter that must flow through several wrapper layers before it affects behavior. The bug is often that an explicit caller choice is lost, defaulted too early, overwritten by ambient state, or not serialized into an intermediate request object.",
+    "guidance": "When a fix introduces or repairs a control option that crosses layers, deep-search and patch planning must prove the entire propagation chain, not just the leaf function.\n\n1. Identify the public entrypoints where the option can be provided: CLI/module arguments, request structs, decorators, plugin options, config keys, or public helper functions. Record the exact existing default behavior at each entrypoint.\n\n2. Walk every wrapper and transport boundary until the option reaches the code that makes the behavioral decision. Include request/response structs, JSON/YAML tags, client methods, server handlers, helper functions, and fallback branches. A missing field at any intermediate boundary is a repair target, even if the leaf function already has the right behavior.\n\n3. For each layer, distinguish three states when the language permits it: caller explicitly disabled/enabled the option, caller omitted it, and the old default path. Do not collapse omission and explicit false/empty unless the requirement says they are equivalent.\n\n4. Evidence is sufficient only when it names the concrete gate that must branch on the option and the concrete callers that must forward it. Generic phrases such as 'pass through lower layers' are not actionable enough for patch generation.\n\nOperational rule: an option propagation fix is complete only when the patcher can edit a continuous chain from public input to final branch without inventing an intermediate field, default, or registration point.",
+    "tags": {
+      "repo_type": null,
+      "task_type": [
+        "api-contract",
+        "auth-and-session",
+        "config-and-flags",
+        "infra-integration"
+      ],
+      "change_shape": [
+        "add-field",
+        "add-method",
+        "config",
+        "behavior-correction"
+      ]
+    }
+  },
+  "custom-extracted-module-adoption-map": {
+    "id": "custom-extracted-module-adoption-map",
+    "title": "Extracted modules need an adoption map, not just a new home",
+    "symptom": "The requirement asks to move, extract, centralize, split out, or create a dedicated module for utilities, shared state, configuration loaders, or helper functions. The existing implementation is spread across one or more older modules, while the new module path is named or strongly implied by the problem statement.",
+    "guidance": "For module extraction and centralization tasks, evidence must describe both source ownership and adoption ownership.\n\n1. Build a symbol migration table: old symbol or global state, old location, new module/path, whether the old location should become an import shim, and every caller category that must switch to the new access point.\n\n2. Search for all current producers and consumers of the shared state or helper logic. Include scripts, plugins, background jobs, tests present at base commit, and modules that compute equivalent values independently. These independent copies are often the real cyclic-import or consistency problem. Tests are compatibility evidence for the existing public surface, not normal patch edit targets.\n\n3. Identify package initialization and re-export conventions before prescribing a new file. If sibling modules are exposed via __init__, index files, registration tables, generated schemas, or explicit imports, the new module must follow the same convention.\n\n4. Treat similar behavior in an old module as a source to move or wrap, not as compliance with an interface required at a new path. If the required public API is at a new module path, the adoption plan must make that exact path canonical. Do not weaken an explicit interface path or symbol into a sibling, alias, or 'similarly named' target.\n\n5. Choose one migration strategy before closure. Either rewrite every visible production/script caller to import from the new canonical module, or make the new module own implementation/shared state while the old module becomes a thin compatibility shim, delegate, or re-export surface. Do not leave patch planning with an unresolved alternative such as 'update imports or add a shim'.\n\nOperational rule: closure should approve an extraction only when it can name the old owner, new owner, chosen shim-vs-rewrite strategy, caller adoption set, shared-state propagation path, and any required re-export/registration path.",
+    "tags": {
+      "repo_type": null,
+      "task_type": [
+        "api-contract",
+        "data-access",
+        "infra-integration",
+        "business-logic"
+      ],
+      "change_shape": [
+        "move-or-extract",
+        "restructure"
+      ]
+    }
+  },
+  "custom-configured-sink-pipeline-localization": {
+    "id": "custom-configured-sink-pipeline-localization",
+    "title": "Config-driven sink pipelines require four anchors: schema, construction, emission, and shutdown",
+    "symptom": "The requirement adds a configurable sink/exporter/listener pipeline for cross-cutting concerns such as audit logs, telemetry, metrics, tracing, notifications, or background processing. It usually names config keys, a pluggable sink interface, batching or buffering behavior, event emission points, and resource shutdown/flush semantics.",
+    "guidance": "For configurable cross-cutting pipelines, do not localize the change to only the new sink package or only the startup file. Evidence and patch plans need four connected anchors.\n\n1. Config/schema anchor: the config struct, defaulting hook, validation hook, example/default config file, and schema file if the repo has one. Defaults and validation ranges belong here.\n\n2. Construction/registration anchor: the startup path that reads config, constructs enabled sinks/exporters/processors, wires batching options, and stores shutdown callbacks. This is usually separate from the config loader.\n\n3. Emission anchor: the interceptor, middleware, handler wrapper, hook, or domain service that observes successful operations and creates events with the required metadata. Listing only the exporter cannot satisfy requirements about when events are produced.\n\n4. Shutdown/error anchor: the path that flushes buffered events, closes sinks, aggregates per-sink errors without aborting other sinks, and avoids logging secrets.\n\nOperational rule: a sink-pipeline handoff is actionable only when all four anchors are present or explicitly marked not needed by the actual repo design. Missing one anchor is a true localization gap, not a closure nuisance.",
+    "tags": {
+      "repo_type": [
+        "web-app",
+        "service-platform"
+      ],
+      "task_type": [
+        "config-and-flags",
+        "infra-integration"
+      ],
+      "change_shape": [
+        "config",
+        "restructure"
+      ]
+    }
+  },
+  "custom-stacked-registration-decorator-side-effects": {
+    "id": "custom-stacked-registration-decorator-side-effects",
+    "title": "Stacked registration decorators must account for bottom-up side effects",
+    "symptom": "A Python task changes a decorator that conditionally enables jobs, routes, plugins, commands, or other registrations. The decorator is stacked above an existing registration decorator (for example scheduler, router, CLI, plugin, or signal registration), so the lower decorator may already have performed registration before the conditional decorator runs. A patch that merely returns the original function when disabled leaves the already-registered side effect in place.",
+    "guidance": "When editing conditional registration decorators, first inspect real decorator order at call sites. Python applies decorators bottom-up: the decorator nearest the function runs first. If the conditional decorator is outermost and an inner decorator already registers the function, the disabled path must undo that side effect (remove/unregister the job, route, handler, plugin, or command) or the decorator stack must be refactored so filtering occurs before registration. Do not assume 'return func unchanged' means 'not registered'. Add or preserve tests for both allowed and disallowed cases, including the actual stacked decorator order used in the repository.",
+    "tags": {
+      "repo_type": [
+        "web-app",
+        "service-platform",
+        "library"
+      ],
+      "task_type": [
+        "infra-integration",
+        "business-logic",
+        "test-and-tooling"
+      ],
+      "change_shape": [
+        "behavior-correction",
+        "restructure",
+        "add-method"
+      ]
+    }
+  },
+  "custom-go-module-import-path-discipline": {
+    "id": "custom-go-module-import-path-discipline",
+    "title": "Go imports must follow module path and package directory, not file names or relative internal paths",
+    "symptom": "A Go patch adds new files, packages, middleware, exporters, or helpers and then references them from other packages. The generated code compiles in isolated files or looks structurally plausible, but build errors report imports such as 'package internal/... is not in std' or 'no required module provides package .../subpackage'.",
+    "guidance": "Before finalizing any Go import introduced by the patch, verify three facts from the base repository: the module path in go.mod, the directory that contains the target package, and the package declaration inside that directory. Import paths are module-path plus directory; they are not file names. A file named attributes.go inside package otel is imported as the otel package directory, not as /otel/attributes unless there is a real subdirectory with package attributes. Never use bare relative imports like 'internal/foo' in module code; use the module-qualified path. After adding a new package, grep all new imports and run a focused compile on every package that imports it.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "api-contract",
+        "infra-integration",
+        "business-logic"
+      ],
+      "change_shape": [
+        "add-method",
+        "add-field",
+        "move-or-extract",
+        "restructure"
+      ]
+    }
+  },
+  "custom-optional-collaborator-nil-safe-new-branches": {
+    "id": "custom-optional-collaborator-nil-safe-new-branches",
+    "title": "New error/logging branches must not make optional collaborators mandatory",
+    "symptom": "A patch extends an existing parser, mapper, scheduler, or business function with a new non-fatal branch such as warning, skip, fallback, or partial-success handling. The new branch calls a receiver logger, sink, client, cache, tracer, or callback that was optional or nil in existing tests and construction paths, causing nil-pointer or None dereference failures only on the newly exercised branch.",
+    "guidance": "When adding a non-fatal branch to an existing function, treat receiver collaborators as optional unless the base constructor and all tests prove otherwise. Do not introduce a mandatory dereference of logger/sink/client/tracer/cache just to report the new branch. Either guard it (if logger != nil / if callback is not None), use an existing nil-safe helper, or record the warning/result in the existing return value/state without requiring the collaborator. Also inspect base tests that instantiate the receiver with zero values; the new branch must remain safe for those construction paths unless the requirement explicitly changes construction invariants.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "business-logic",
+        "data-access",
+        "infra-integration"
+      ],
+      "change_shape": [
+        "behavior-correction",
+        "fix-validation",
+        "fix-state-handling"
+      ]
+    }
+  },
+  "custom-go-value-ok-accessor-discipline": {
+    "id": "custom-go-value-ok-accessor-discipline",
+    "title": "Go value/ok accessors use the boolean result, not nil checks on value types",
+    "symptom": "A Go patch adds or consumes context/helper accessors such as From(ctx), GetX(), or lookup functions. The accessor returns (value, ok), where value is a struct/string/int or other non-pointer type. Generated code compares the value to nil or ignores the ok boolean, producing compile errors like 'mismatched types T and untyped nil' or incorrect zero-value behavior.",
+    "guidance": "Before using any Go accessor, Read its exact signature. If it returns (value, ok), branch on ok; do not compare the returned value to nil unless the value type is actually a pointer, map, slice, chan, func, or interface. For struct and scalar values, nil is invalid and the zero value may be a legitimate fallback. When propagating context values, preserve the repository's existing accessor style and add tests/compile checks for the packages that consume the accessor.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "web-app",
+        "library"
+      ],
+      "task_type": [
+        "api-contract",
+        "auth-and-session",
+        "business-logic"
+      ],
+      "change_shape": [
+        "add-field",
+        "add-method",
+        "behavior-correction"
+      ]
+    }
+  },
+  "custom-tests-are-compatibility-contracts-not-edit-targets": {
+    "id": "custom-tests-are-compatibility-contracts-not-edit-targets",
+    "title": "Base/evaluator tests are compatibility contracts, not patch targets",
+    "symptom": "A refactor, extraction, or module move makes existing tests import or reference an old production symbol. The patch-generator tries to update test files or deletes the old production symbol because the new location is now canonical. Build/static gates then report removed symbols still referenced by tests, or the official eval fails during collection/import.",
+    "guidance": "Do not edit tests to make a production refactor pass; evaluator-owned tests are read-only contracts. If a base test imports or references a symbol that the requirement did not explicitly remove, preserve that production symbol as a compatibility shim, alias, wrapper, or re-export while moving the implementation underneath it. A successful extraction keeps both the new canonical API and any old API still used by base tests/callers. Grep tests and callers before deleting any production symbol, and prefer a thin shim over test edits.",
+    "tags": {
+      "repo_type": [
+        "web-app",
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "api-contract",
+        "data-access",
+        "test-and-tooling",
+        "business-logic"
+      ],
+      "change_shape": [
+        "move-or-extract",
+        "restructure",
+        "rename",
+        "struct-shape-change"
+      ]
+    }
+  },
+  "custom-go-language-version-discipline": {
+    "id": "custom-go-language-version-discipline",
+    "title": "Go patches must respect the module language version",
+    "symptom": "A Go repository declares an older go version in go.mod, but a patch introduces newer language features or standard-library APIs such as any, generics, slices/maps helpers, errors.Join, or comparable constraints. The code may look idiomatic for modern Go, but focused compile fails with messages like 'requires go1.18 or later' or hidden evaluator builders use the older language mode.",
+    "guidance": "Before writing Go code, read go.mod and treat its go directive as a hard compatibility boundary. Do not use predeclared any, type parameters, generic helpers, or newer standard-library APIs unless the module's declared version supports them. Prefer interface{} over any for Go 1.17 and earlier; use explicit loops instead of generic library helpers when needed. If compile feedback says a construct requires a newer Go version, repair by rewriting to the older equivalent rather than changing go.mod unless the requirement explicitly asks for a version bump.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "api-contract",
+        "business-logic",
+        "infra-integration",
+        "test-and-tooling"
+      ],
+      "change_shape": [
+        "add-field",
+        "add-method",
+        "behavior-correction",
+        "restructure"
+      ]
+    }
+  },
+  "custom-go-exported-symbol-and-import-alias-verification": {
+    "id": "custom-go-exported-symbol-and-import-alias-verification",
+    "title": "Go patches must verify exported names and avoid import shadowing",
+    "symptom": "A Go patch wires middleware, instrumentation, protobuf, metadata, or auth helpers across packages. The generated code imports plausible packages and calls plausible exported constants, functions, or methods, but focused compile fails with undefined names, unused imports, or errors where a local variable shadows an imported package name.",
+    "guidance": "Before using a Go symbol from another package, read the defining package's files and copy the exact exported identifier that exists there; do not invent names by analogy. If compile feedback reports undefined: pkg.Name, grep the package for exported const/type/func/var names and either use the real name or add the missing symbol in the correct package when the requirement truly calls for it. Keep import aliases distinct from local variables; if a file already has a local variable named metadata, do not also refer to an imported package through metadata in that scope. For protobuf or OpenTelemetry APIs, verify the actual dependency version and package API in go.mod/go.sum or existing call sites before choosing a helper type or attribute key.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "api-contract",
+        "auth-and-session",
+        "infra-integration",
+        "business-logic"
+      ],
+      "change_shape": [
+        "add-field",
+        "add-method",
+        "move-or-extract",
+        "restructure",
+        "behavior-correction"
+      ]
+    }
+  },
+  "custom-go-same-package-private-api-compatibility": {
+    "id": "custom-go-same-package-private-api-compatibility",
+    "title": "Go same-package tests make unexported fields and methods compatibility-sensitive",
+    "symptom": "A Go patch refactors or renames unexported fields, methods, helper types, or struct literal fields inside a package. Focused production compile passes, but same-package tests or evaluator tests fail because they can legally access unexported names such as receiver helper methods or lowercase struct fields.",
+    "guidance": "In Go, tests declared in the same package can access unexported identifiers, so lowercase fields and methods are still compatibility contracts when base or evaluator tests compile in that package. Before renaming or exporting a private field/method/helper type, grep same-package *_test.go files and preserve the old unexported name as a wrapper, alias, or duplicate field path unless the requirement explicitly demands removing it. If a new exported API is useful, add it without breaking the old private API used by same-package tests. Focused compile must include test compilation when possible, but patch planning should not rely on hidden tests to reveal this.",
+    "tags": {
+      "repo_type": [
+        "service-platform",
+        "library",
+        "cli-tool"
+      ],
+      "task_type": [
+        "api-contract",
+        "test-and-tooling",
+        "business-logic"
+      ],
+      "change_shape": [
+        "rename",
+        "restructure",
+        "struct-shape-change",
+        "behavior-correction"
+      ]
+    }
+  },
+  "custom-test-patch-contract-closure": {
+    "id": "custom-test-patch-contract-closure",
+    "title": "Evaluator test patches expose production compatibility contracts",
+    "symptom": "The task input includes detailed natural-language requirements plus interface blocks or evaluator-style test changes that rename methods, fields, constants, function signatures, or call sites. The interface block may name only a small subset of the required production API, while the requirements/test changes imply additional compatibility obligations. A common failure is to implement only the explicit interface block and one localized behavior path, producing a patch that compiles under a focused package check but fails when evaluator tests compile against the full expected API shape.",
+    "guidance": "Treat requirements, interface blocks, and evaluator-style test changes as one contract ledger, not competing sources.\\n\\n1. During deep-search, extract every production API obligation implied by test-like input: renamed methods, changed field visibility/case, new constants, function signature changes, middleware ordering, context propagation, and call-site signature updates. These obligations are not optional just because they appear in a test patch or compatibility fixture rather than the interface block.\\n\\n2. Build a reverse-reference and call-site closure for each implied API change before closure approval. If a test-like change calls a new method/field/constant or passes an added parameter, the patch plan must identify the production definition and all production call sites that must be updated.\\n\\n3. Do not let focused compile success substitute for contract coverage. A narrow compile target can miss evaluator-injected same-package tests and callers. Closure should fail sufficiency/localization when the ledger has unimplemented requirements or test-implied API obligations.\\n\\n4. Patch planning must keep interface-block additions and prose/test-implied obligations together. Implementing the named interface helpers while omitting adjacent constants, middleware ordering, event filtering, or signature propagation is a partial patch, even if the helpers compile.\\n\\nOperational rule: if evaluator-style input shows code that expects a production symbol or signature, that symbol/signature is part of the required compatibility contract and must be traced to a concrete production implementation site.",
+    "tags": {
+      "repo_type": [
+        "web-app",
+        "service-platform",
+        "library"
+      ],
+      "task_type": [
+        "api-contract",
+        "auth-and-session",
+        "test-and-tooling",
+        "business-logic"
+      ],
+      "change_shape": [
+        "add-field",
+        "add-method",
+        "rename",
+        "restructure",
+        "struct-shape-change",
+        "behavior-correction"
+      ]
+    }
+  },
+  "custom-extracted-utility-module-shim-strategy": {
+    "id": "custom-extracted-utility-module-shim-strategy",
+    "title": "Extracted utility modules need an explicit canonical-vs-shim migration strategy",
+    "symptom": "A Python task asks to move, extract, centralize, or split shared helper functions, configuration loading, mutable module state, or public utility APIs into a new dedicated module. Existing production code, scripts, or tests import those helpers from the old module, while the new requirement/interface block names the new module path. Closure often loops because evidence lists many old import sites but never states whether callers should be rewritten to the new module or whether the old module remains as a compatibility shim.",
+    "guidance": "When introducing a new canonical utility module, deep-search and patch planning must make one explicit migration decision before closure: either (A) rewrite every visible production/script caller to import from the new module, or (B) put the real implementation and shared mutable state in the new module and keep the old module as a thin compatibility re-export/delegating shim. Do not leave this as an implicit patch-generator choice.\n\nIf the requirement/interface block names an exact new path or symbol, that path/symbol is the canonical target. Do not weaken an explicit path into 'a similar module' or 'or similarly named'. Tests may be cited as compatibility evidence, but do not make tests the required edit surface; prefer production/script import changes or old-location shim/delegation according to the selected strategy.\n\nFor broad refactors, prefer strategy B when many existing callers import from the old module and the requirement mainly names a new public access point: the new module owns implementation/state, and the old module imports/re-exports or delegates so existing call sites keep working unless the spec explicitly requires changing them. This avoids split module-global state and minimizes call-site churn.\n\nEvidence closure must record the strategy concretely in writable fields: exact_code_regions for the old definitions and representative import/call sites; must_co_edit_relations describing canonical implementation plus shim/re-export obligations; dependency_propagation explaining shared config/state flow and why both old and new paths must reference the same backing state. If choosing caller rewrites instead, enumerate every visible production/script import/call site as a co-edit obligation. A generic note like 'update imports or add a shim' is insufficient; choose one strategy and state the steady-state import graph.",
+    "tags": {
+      "repo_type": null,
+      "task_type": [
+        "api-contract",
+        "config-and-flags",
+        "business-logic",
+        "test-and-tooling"
+      ],
+      "change_shape": [
+        "move-or-extract",
+        "restructure",
+        "config",
+        "add-method"
+      ]
+    }
+  },
+  "custom-extracted-utility-runtime-api-semantics": {
+    "id": "custom-extracted-utility-runtime-api-semantics",
+    "title": "Extracted utility modules must preserve runtime state semantics and helper APIs",
+    "symptom": "A Python task asks to move, extract, centralize, or split out shared utility logic that reads runtime configuration, caches module-level state, or delegates retry/error handling to an existing helper. The patch creates a new canonical utility module or shim and the focused compile/import gate passes, but evaluator tests fail because the extracted function reads a subtly different config object/key shape, changes missing-key defaults, or calls an existing retry/helper API with invented constructor arguments.",
+    "guidance": "When extracting shared utilities or moving logic behind a new canonical owner, treat runtime state and helper APIs as behavioral contracts, not implementation details:\n\n1. Before moving code, inspect every existing state source used by the old logic: module globals, config objects, lazy-load guards, default values, and missing-key behavior. Preserve those semantics exactly unless the requirement explicitly changes them. If the requirement says retrieval must be reliable, resilient, safe when unavailable, or work with missing/incomplete configuration, that is an explicit behavior change: do not preserve old KeyError/attribute-error behavior for missing config sections; choose a repo-consistent safe default or fallback.\n\n2. For compatibility shims, choose one concrete strategy and verify it mechanically: either callers are rewritten to the canonical owner, or the old import surface re-exports wrappers that preserve old behavior. Do not leave this as \"update imports or add shim\".\n\n3. Never invent keyword arguments or call signatures for an existing retry, error-handling, serialization, or transport helper. Read the helper definition and at least one existing call site, then call it using only parameters that actually exist. If a helper class exposes behavior through positional constructor args, attributes, callbacks, or wrapper methods rather than the keyword you want, adapt to the real API. If no existing helper matches the old semantics, keep/copy the minimal old behavior in the new canonical module instead of forcing it through an incompatible abstraction.\n\n4. Avoid top-level reverse imports from the new canonical utility module back into the old owner module or high-level caller graph. That recreates the circular dependency the extraction is supposed to remove. If the new owner must delegate to old behavior temporarily, use a local import inside the narrow function or move the minimal shared implementation into the new owner; keep old-location compatibility shims pointing toward the new owner, not the reverse.\n\n5. Moving a public class/dataclass/function is not a license to redesign its public surface. Preserve constructor parameters, field names and types, operator methods, return shapes, serialization format, and mutation semantics unless the requirement explicitly changes them. If a new canonical module owns the implementation, copy the old public contract first, then make only the requested behavior change. A shim that re-exports a redesigned object is still a breaking change.\n\n6. Module globals are also compatibility surface. If the old module exposed mutable cached state, direct assignments to the old global may be used by scripts or tests. Do not leave stale duplicate globals in the old module while re-exported functions read only the new module's globals. Either keep the old module as the state owner and have the new module delegate through a narrow local import, or ensure every preserved old function observes the same backing state that old callers can still set.\n\n7. Existing tests and scripts are compatibility evidence, not edit targets. If a script-style module relies on its own directory or startup hook for imports, preserve that invocation/import surface when changing shared utilities.\n\n8. Do not assume a package root re-exports a helper that is defined in a submodule. When importing an existing helper class or function, preserve the actual definition module or an already working call-site import path. Only import from a package root after verifying its __init__/export surface really exposes that symbol.",
+    "tags": {
+      "repo_type": [
+        "library",
+        "web-app",
+        "data-pipeline"
+      ],
+      "task_type": [
+        "api-contract",
+        "config-and-flags",
+        "infra-integration"
+      ],
+      "change_shape": [
+        "move-or-extract",
+        "config",
+        "fix-state-handling",
+        "restructure"
       ]
     }
   }

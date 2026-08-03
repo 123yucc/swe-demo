@@ -55,5 +55,9 @@ def test_run_repo_command_docker_wraps_with_sync(tmp_path: Path, monkeypatch) ->
     assert rc == 0
     assert timed_out is False
     assert out == "wrapped\n"
-    assert any(call[:4] == ["docker", "exec", "sandbox", "git"] for call in calls)
+    assert any(
+        call[:5] == ["docker", "exec", "-i", "-w", "/app"]
+        and call[-5:] == ["git", "apply", "--whitespace=nowarn", "--binary", "-"]
+        for call in calls
+    )
     assert calls[-1] == ["docker", "exec", "-w", "/app", "sandbox", "go", "version"]

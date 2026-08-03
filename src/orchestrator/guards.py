@@ -219,10 +219,21 @@ class DeepSearchBudget:
 
     def is_exhausted(self) -> bool:
         """Return True if the iteration budget has been reached."""
-        return self.iteration >= self.max_iterations
+        return self._budget_exhausted or self.iteration >= self.max_iterations
 
     def mark_budget_exhausted(self) -> None:
         """Mark that the budget was exhausted (for logging/outcome tracking)."""
+        self._budget_exhausted = True
+
+    def force_exhausted(self) -> None:
+        """Exhaust the budget immediately and mark the forced-closure path.
+
+        This is used when the state machine cannot select any requirement even
+        though unchecked evidence remains (for example, the only unchecked
+        requirements are frozen after repeated stalls).  Keep ``iteration`` at
+        its real value so checkpoint metrics do not report searches that never
+        ran; ``is_exhausted`` also honors this explicit marker.
+        """
         self._budget_exhausted = True
 
     @property

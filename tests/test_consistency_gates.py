@@ -30,6 +30,10 @@ from src.orchestrator.consistency_checks import (
     check_contract_drift,
     check_go_unexport_consistency,
     check_parallel_impl_consistency,
+    check_python_config_subscript_fallback,
+    check_python_helper_api_usage,
+    check_python_moved_class_dunder_methods,
+    check_python_noniterable_class_loop,
     check_removed_symbol_test_refs,
     is_test_file,
     revert_test_file_edits,
@@ -186,6 +190,7 @@ def test_removed_field_referenced_by_test_flagged(tmp_path: Path):
     findings = check_removed_symbol_test_refs(tmp_path)
     msgs = " ".join(f.message for f in findings)
     assert "clientCredentials" in msgs
+    assert "surface/member named 'clientCredentials'" in msgs
     assert any("forwarder_test.go" in f.message for f in findings)
 
 
@@ -212,7 +217,101 @@ def test_removed_field_no_test_ref_not_flagged(tmp_path: Path):
     assert all("unusedField" not in f.message for f in findings)
 
 
+def test_removed_python_global_statement_not_treated_as_symbol(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "pkg/mod.py",
+        "def f():\n"
+        "    global data_provider\n"
+        "    data_provider = 1\n",
+    )
+    _write(
+        tmp_path,
+        "pkg/test_mod.py",
+        "from pkg import mod\n\n"
+        "def test_global_word():\n"
+        "    assert 'global'\n",
+    )
+    _commit(tmp_path)
+    _write(tmp_path, "pkg/mod.py", "def f():\n    data_provider = 1\n")
+
+    findings = check_removed_symbol_test_refs(tmp_path)
+
+    assert all("surface/member named 'global'" not in f.message for f in findings)
+
+
+def test_removed_python_class_reexport_alias_satisfies_test_import(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "pkg/mod.py",
+        "class OldAPI:\n"
+        "    pass\n",
+    )
+    _write(
+        tmp_path,
+        "pkg/new_mod.py",
+        "class OldAPI:\n"
+        "    pass\n",
+    )
+    _write(
+        tmp_path,
+        "pkg/test_mod.py",
+        "from pkg.mod import OldAPI\n\n"
+        "def test_api():\n"
+        "    assert OldAPI\n",
+    )
+    _commit(tmp_path)
+    _write(
+        tmp_path,
+        "pkg/mod.py",
+        "from pkg import new_mod as _new_mod\n\n"
+        "OldAPI = _new_mod.OldAPI\n",
+    )
+
+    findings = check_removed_symbol_test_refs(tmp_path)
+
+    assert all("OldAPI" not in f.message for f in findings)
+
+
 # ── Gate D: Go unexport consistency ─────────────────────────────────────────
+
+def test_removed_exported_field_case_flip_to_unexported_not_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "events/sse.go",
+        "package events\n\n"
+        "type message struct {\n"
+        "\tEvent string\n"
+        "\tData string\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "events/sse_test.go",
+        "package events\n\n"
+        "import \"testing\"\n\n"
+        "func TestMessage(t *testing.T) {\n"
+        "\t_ = message{Event: \"x\", Data: \"y\"}\n"
+        "}\n",
+    )
+    _commit(tmp_path)
+    _write(
+        tmp_path,
+        "events/sse.go",
+        "package events\n\n"
+        "type message struct {\n"
+        "\tevent string\n"
+        "\tdata string\n"
+        "}\n",
+    )
+
+    findings = check_removed_symbol_test_refs(tmp_path)
+
+    assert findings == []
+
 
 def test_go_unexport_leftover_method_flagged(tmp_path: Path):
     _init(tmp_path)
@@ -449,3 +548,454 @@ def test_enrich_go_errors_ignores_non_signature_errors():
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
+
+def test_removed_python_class_from_import_reexport_satisfies_test_import(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "pkg/mod.py",
+        "class OldAPI:\n"
+        "    pass\n",
+    )
+    _write(
+        tmp_path,
+        "pkg/new_mod.py",
+        "class OldAPI:\n"
+        "    pass\n",
+    )
+    _write(
+        tmp_path,
+        "pkg/test_mod.py",
+        "from pkg.mod import OldAPI\n\n"
+        "def test_api():\n"
+        "    assert OldAPI\n",
+    )
+    _commit(tmp_path)
+    _write(
+        tmp_path,
+        "pkg/mod.py",
+        "from pkg.new_mod import OldAPI\n",
+    )
+
+    findings = check_removed_symbol_test_refs(tmp_path)
+
+    assert all("OldAPI" not in f.message for f in findings)
+
+
+def test_python_noniterable_class_loop_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy()(fn)\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    for _ in RetryStrategy():\n"
+        "        return fn()\n",
+    )
+
+    errors = check_python_noniterable_class_loop(tmp_path)
+    assert len(errors) == 1
+    assert "RetryStrategy" in errors[0].message
+
+
+def test_python_iterable_class_loop_allowed(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class Attempts:\n"
+        "    def __iter__(self):\n"
+        "        return iter(range(3))\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import Attempts\n\n"
+        "def run(fn):\n"
+        "    return fn()\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import Attempts\n\n"
+        "def run(fn):\n"
+        "    for _ in Attempts():\n"
+        "        fn()\n",
+    )
+
+    assert check_python_noniterable_class_loop(tmp_path) == []
+
+
+def test_python_helper_api_unsupported_keyword_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    def __init__(self, exceptions, max_retries=3, delay=1):\n"
+        "        pass\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy([Exception])(fn)\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy(retry_exceptions=(Exception,), max_retries=5)(fn)\n",
+    )
+
+    errors = check_python_helper_api_usage(tmp_path)
+    assert len(errors) == 1
+    assert "retry_exceptions" in errors[0].message
+
+
+def test_python_helper_api_nested_call_keywords_not_attributed_to_constructor(
+    tmp_path: Path,
+):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RenderError(Exception):\n"
+        "    def __init__(self, message):\n"
+        "        super().__init__(message)\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RenderError\n\n"
+        "def render(data):\n"
+        "    return data\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RenderError\n\n"
+        "def render(data):\n"
+        "    raise RenderError(yaml.dump(data, Dumper=SafeDumper, indent=2))\n",
+    )
+
+    assert check_python_helper_api_usage(tmp_path) == []
+
+
+def test_python_helper_api_missing_inline_method_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    def __init__(self, exceptions, max_retries=3, delay=1):\n"
+        "        pass\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy([Exception])(fn)\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy([Exception]).run(fn)\n",
+    )
+
+    errors = check_python_helper_api_usage(tmp_path)
+    assert len(errors) == 1
+    assert ".run" in errors[0].message
+
+
+def test_python_helper_api_missing_required_constructor_arg_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    def __init__(self, exceptions, max_retries=3, delay=1):\n"
+        "        pass\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_helper.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy(max_retries=5)(fn)\n",
+    )
+
+    errors = check_python_helper_api_usage(tmp_path)
+    assert len(errors) == 1
+    assert "required constructor" in errors[0].message
+    assert "exceptions" in errors[0].message
+
+
+def test_python_helper_api_missing_class_attribute_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    retry_count = 0\n"
+        "    def __init__(self, exceptions):\n"
+        "        pass\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n"
+        "\n"
+        "class MaxRetriesExceeded(Exception):\n"
+        "    pass\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_helper.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    try:\n"
+        "        return RetryStrategy([Exception])(fn)\n"
+        "    except RetryStrategy.MaxRetriesExceeded:\n"
+        "        return None\n",
+    )
+
+    errors = check_python_helper_api_usage(tmp_path)
+    assert len(errors) == 1
+    assert "RetryStrategy.MaxRetriesExceeded" in errors[0].message
+
+
+def test_python_helper_api_untracked_multiline_new_file_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class RetryStrategy:\n"
+        "    def __init__(self, exceptions, max_retries=3, delay=1):\n"
+        "        pass\n"
+        "    def __call__(self, func):\n"
+        "        return func()\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_helper.py",
+        "from helpers import RetryStrategy\n\n"
+        "def run(fn):\n"
+        "    return RetryStrategy(\n"
+        "        retry_exceptions=(Exception,),\n"
+        "        max_retries=5,\n"
+        "    ).run(fn)\n",
+    )
+
+    errors = check_python_helper_api_usage(tmp_path)
+    messages = "\n".join(err.message for err in errors)
+    assert "retry_exceptions" in messages
+    assert ".run" in messages
+
+
+def test_python_helper_api_real_keyword_and_method_allowed(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "helpers.py",
+        "class Runner:\n"
+        "    def __init__(self, exceptions, max_retries=3):\n"
+        "        pass\n"
+        "    def run(self, func):\n"
+        "        return func()\n",
+    )
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import Runner\n\n"
+        "def run(fn):\n"
+        "    return fn()\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "worker.py",
+        "from helpers import Runner\n\n"
+        "def run(fn):\n"
+        "    return Runner(exceptions=(Exception,), max_retries=5).run(fn)\n",
+    )
+
+    assert check_python_helper_api_usage(tmp_path) == []
+
+
+def test_python_config_subscript_fallback_direct_index_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "from openlibrary import config\n\n"
+        "def get_url():\n"
+        "    return (config.runtime_config or {}).get('search', {}).get('url')\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "from openlibrary import config\n\n"
+        "def get_url():\n"
+        "    return config.runtime_config['search'].get('url')\n",
+    )
+
+    errors = check_python_config_subscript_fallback(tmp_path)
+    assert len(errors) == 1
+    assert "search" in errors[0].message
+
+
+def test_python_config_subscript_fallback_get_allowed(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "from openlibrary import config\n\n"
+        "def get_url():\n"
+        "    return None\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "from openlibrary import config\n\n"
+        "def get_url():\n"
+        "    section = (config.runtime_config or {}).get('search', {})\n"
+        "    return section.get('url')\n",
+    )
+
+    assert check_python_config_subscript_fallback(tmp_path) == []
+
+
+def test_python_config_subscript_fallback_untracked_new_file_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(tmp_path, "README.md", "base\n")
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_settings_helper.py",
+        "from openlibrary import config\n\n"
+        "def enabled():\n"
+        "    return config['feature_flags'].get('enabled', False)\n",
+    )
+
+    errors = check_python_config_subscript_fallback(tmp_path)
+    assert len(errors) == 1
+    assert "feature_flags" in errors[0].message
+
+
+def test_python_config_subscript_fallback_explicit_keyerror_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "def get_url():\n"
+        "    return None\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "settings_helper.py",
+        "def get_url():\n"
+        "    raise KeyError('feature_flags.url is not configured')\n",
+    )
+
+    errors = check_python_config_subscript_fallback(tmp_path)
+    assert len(errors) == 1
+    assert "explicitly raises KeyError" in errors[0].message
+
+
+def test_python_moved_class_dunder_methods_flagged(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "old_owner.py",
+        "class Accumulator:\n"
+        "    def __init__(self):\n"
+        "        self.items = []\n"
+        "    def __add__(self, other):\n"
+        "        merged = Accumulator()\n"
+        "        merged.items = self.items + other.items\n"
+        "        return merged\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_owner.py",
+        "class Accumulator:\n"
+        "    def __init__(self):\n"
+        "        self.items = []\n"
+        "    def merge(self, other):\n"
+        "        self.items.extend(other.items)\n",
+    )
+
+    errors = check_python_moved_class_dunder_methods(tmp_path)
+    assert len(errors) == 1
+    assert "__add__" in errors[0].message
+
+
+def test_python_moved_class_dunder_methods_preserved_allowed(tmp_path: Path):
+    _init(tmp_path)
+    _write(
+        tmp_path,
+        "old_owner.py",
+        "class Accumulator:\n"
+        "    def __add__(self, other):\n"
+        "        return self\n",
+    )
+    _commit(tmp_path)
+
+    _write(
+        tmp_path,
+        "new_owner.py",
+        "class Accumulator:\n"
+        "    def __add__(self, other):\n"
+        "        return self\n",
+    )
+
+    assert check_python_moved_class_dunder_methods(tmp_path) == []

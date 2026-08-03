@@ -13,7 +13,7 @@ if [ -f "$script_dir/.env" ] && [ -d "$script_dir/eval" ]; then
 else
   repo_root=$(cd "$script_dir/.." && pwd)
 fi
-pid_path="$repo_root/${run_name}.pid"
+pid_path="$repo_root/logs/runs/$run_name/runner.pid"
 
 if [ ! -f "$pid_path" ]; then
   echo "PID_MISSING"

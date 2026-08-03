@@ -272,6 +272,19 @@ def _introduced_symbol(line: str) -> str | None:
     Returns the introduced identifier, or None when none can be resolved (soft
     pass — no opinion).
     """
+    # v3 contract/interface blocks use ``Type: Function Name: fetch_events``.
+    # In that form ``Function`` describes the contract kind; it is not the
+    # symbol being introduced.  Prefer the explicit Name field before the
+    # legacy ``Function: New(...)`` form below.
+    structured_name = re.search(
+        r"\bType\s*:\s*[A-Za-z_][A-Za-z0-9_]*\s+Name\s*:\s*"
+        r"`?\s*([A-Za-z_][A-Za-z0-9_]*)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if structured_name:
+        return structured_name.group(1)
+
     label = re.search(
         r"\b(?:Type|Struct|Interface|Class|Function|Method|Func|Const|Var|Field)\s*:\s*"
         r"`?\s*([A-Za-z_][A-Za-z0-9_]*)",
@@ -284,6 +297,18 @@ def _introduced_symbol(line: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+def _structured_interface_path(line: str) -> str | None:
+    """Return a v3 interface block's explicit Path field, when present."""
+    match = re.search(
+        r"\bPath\s*:\s*([^\s]+)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).strip().strip("`'\".,;()") or None
 
 
 def ground_missing_elements(
@@ -310,14 +335,24 @@ def ground_missing_elements(
         # Only ground clean identifiers — expressions/signatures are noisy.
         if snippet is None or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", snippet):
             continue
-        for content in code_files:
+        target_path = _structured_interface_path(line)
+        if target_path:
+            target_content = _read_file(repo_dir, target_path)
+            # A missing target file definitively cannot contain the interface.
+            search_contents = [] if target_content is None else [target_content]
+        else:
+            # Legacy free-form entries have no path and retain repo-wide
+            # grounding for backwards compatibility.
+            search_contents = code_files
+        for content in search_contents:
             if _symbol_present(content, snippet):
                 failures.append(GroundingFailure(
                     requirement_id="<global>",
                     kind="missing_element_present",
                     detail=(
                         f"missing_element `{snippet}` is declared absent but "
-                        f"a definition/reference exists in the repository"
+                        f"a definition/reference exists"
+                        + (f" in `{target_path}`" if target_path else " in the repository")
                     ),
                 ))
                 break

@@ -10,6 +10,7 @@ from pathlib import Path
 from src.agents._structured import run_structured_query
 from src.models.memory import SharedWorkingMemory
 from src.models.patch import FileEditPlan, PatchPlan
+from src.orchestrator.consistency_checks import is_test_file
 
 # Prescriptive patterns that indicate boundary constraints to preserve.
 _PRESCRIPTIVE_PATTERNS = (
@@ -60,6 +61,9 @@ _COEDIT_ACTION_VERBS = (
     # cross-edit direction ("X -> Y must ...") is expressed as an arrow.
     "->",
 )
+
+_MAX_TARGET_FUNCTIONS_PER_EDIT = 3
+_MAX_PRESERVED_FINDINGS_PER_EDIT = 12
 
 
 def _is_new_file_edit(edit: FileEditPlan, memory: SharedWorkingMemory) -> bool:
@@ -120,6 +124,166 @@ def _extract_prescriptive_snippets(findings: str) -> list[str]:
             if line and line not in snippets:
                 snippets.append(line)
     return snippets
+
+
+def _target_aliases(target: str) -> list[str]:
+    text = (target or "").strip()
+    if not text:
+        return []
+    aliases = {text}
+    last = text.rsplit(".", 1)[-1]
+    aliases.add(last)
+    simple = re.sub(r"\(.*?\)", "", last).strip()
+    if simple:
+        aliases.add(simple)
+    return [alias for alias in aliases if alias and alias != "(file-wide pass)"]
+
+
+def _chunk_preserved_findings(findings: list[str], limit: int) -> list[list[str]]:
+    """Partition findings into stable chunks bounded by *limit*."""
+    if not findings:
+        return [[]]
+    return [
+        findings[start : start + limit]
+        for start in range(0, len(findings), limit)
+    ]
+
+
+def _split_heavy_edits(plan: PatchPlan) -> None:
+    """Split oversized same-file edits into smaller themed edits.
+
+    This is a post-LLM structural repair only. It preserves all constraints
+    but prevents a single FileEditPlan from carrying too many target functions
+    or preserved findings, which bloats patch-generator prompts and burns
+    retry budget.
+    """
+    rewritten: list[FileEditPlan] = []
+    split_count = 0
+
+    for edit in plan.edits:
+        n_targets = len(edit.target_functions)
+        n_findings = len(edit.preserved_findings)
+        if edit.creates_new_file or (
+            n_targets <= _MAX_TARGET_FUNCTIONS_PER_EDIT
+            and n_findings <= _MAX_PRESERVED_FINDINGS_PER_EDIT
+        ):
+            rewritten.append(edit)
+            continue
+
+        if not edit.target_functions:
+            for start in range(0, n_findings, _MAX_PRESERVED_FINDINGS_PER_EDIT):
+                chunk_findings = edit.preserved_findings[start : start + _MAX_PRESERVED_FINDINGS_PER_EDIT]
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "preserved_findings": chunk_findings,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: file-wide constraint chunk]"
+                            ),
+                        }
+                    )
+                )
+                split_count += 1
+            continue
+
+        target_buckets: dict[str, list[str]] = {target: [] for target in edit.target_functions}
+        unassigned: list[str] = []
+        for finding in edit.preserved_findings:
+            lowered = finding.lower()
+            matched = False
+            for target in edit.target_functions:
+                aliases = _target_aliases(target)
+                if aliases and any(alias.lower() in lowered for alias in aliases):
+                    target_buckets[target].append(finding)
+                    matched = True
+            if not matched:
+                unassigned.append(finding)
+
+        chunk_size = _MAX_TARGET_FUNCTIONS_PER_EDIT
+        target_chunks: list[tuple[list[str], list[str]]] = []
+        for start in range(0, len(edit.target_functions), chunk_size):
+            chunk_targets = edit.target_functions[start : start + chunk_size]
+            chunk_findings: list[str] = []
+            for target in chunk_targets:
+                for finding in target_buckets.get(target, []):
+                    if finding not in chunk_findings:
+                        chunk_findings.append(finding)
+            target_chunks.append((chunk_targets, chunk_findings))
+
+        if unassigned and target_chunks:
+            # Generic same-file constraints still belong with a concrete edit
+            # whenever possible; standalone file-wide passes are the main source
+            # of oversized prompts on large files.
+            for idx, finding in enumerate(unassigned):
+                chunk_targets, chunk_findings = target_chunks[idx % len(target_chunks)]
+                if finding not in chunk_findings:
+                    chunk_findings.append(finding)
+                target_chunks[idx % len(target_chunks)] = (chunk_targets, chunk_findings)
+            unassigned = []
+
+        for chunk_targets, chunk_findings in target_chunks:
+            expected_symbols = [
+                symbol
+                for symbol in edit.expected_symbols
+                if any(
+                    symbol in _target_aliases(target)
+                    for target in chunk_targets
+                )
+            ] or edit.expected_symbols
+            for sub_idx, finding_chunk in enumerate(
+                _chunk_preserved_findings(
+                    chunk_findings,
+                    _MAX_PRESERVED_FINDINGS_PER_EDIT,
+                ),
+                1,
+            ):
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "target_functions": chunk_targets,
+                            "preserved_findings": finding_chunk,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: focused target subset "
+                                + ", ".join(chunk_targets)
+                                + (
+                                    f" / finding chunk {sub_idx}"
+                                    if len(chunk_findings) > _MAX_PRESERVED_FINDINGS_PER_EDIT
+                                    else ""
+                                )
+                                + "]"
+                            ),
+                            "expected_symbols": expected_symbols,
+                        }
+                    )
+                )
+                split_count += 1
+
+        if unassigned:
+            for start in range(0, len(unassigned), _MAX_PRESERVED_FINDINGS_PER_EDIT):
+                chunk_findings = unassigned[start : start + _MAX_PRESERVED_FINDINGS_PER_EDIT]
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "target_functions": [],
+                            "preserved_findings": chunk_findings,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: file-wide constraint pass]"
+                            ),
+                            "expected_symbols": edit.expected_symbols,
+                        }
+                    )
+                )
+                split_count += 1
+
+    if split_count:
+        plan.edits = rewritten
+        print(
+            f"[patch-planner] auto-split oversized edits into {split_count} focused plan chunk(s)",
+            flush=True,
+        )
 
 
 PATCH_PLANNER_SYSTEM_PROMPT = """\
@@ -279,6 +443,8 @@ def _backfill_declared_coedit_files(
 
     for path, sentence in _extract_coedit_targets(memory):
         if path in existing_paths or path in seen_new:
+            continue
+        if is_test_file(path):
             continue
         if repo_dir is not None and not (repo_dir / path).is_file():
             # Path mentioned in evidence but absent from disk — almost
@@ -593,10 +759,10 @@ def _enforce_cross_edit_symbol_contract(plan: PatchPlan) -> None:
 
 def _clean_expected_symbol(symbol: str) -> str:
     symbol = symbol.strip()
-    if not symbol or symbol.startswith("("):
-        return ""
     if ")." in symbol:
         symbol = symbol.rsplit(").", 1)[-1]
+    if not symbol or symbol.startswith("("):
+        return ""
     if "." in symbol and not symbol.endswith(".py"):
         symbol = symbol.rsplit(".", 1)[-1]
     return symbol.strip()
@@ -616,6 +782,15 @@ def _annotate_artifact_expectations(
         path = edit.filepath.replace("\\", "/").strip().lstrip("./")
         edit.filepath = path
         edit.expected_diff_required = not edit.reference_only
+        cleaned_symbols = [
+            cleaned
+            for cleaned in (
+                _clean_expected_symbol(symbol)
+                for symbol in (edit.expected_symbols or [])
+            )
+            if cleaned
+        ]
+        edit.expected_symbols = list(dict.fromkeys(cleaned_symbols))
         if repo_dir is not None and not (repo_dir / path).exists():
             edit.creates_new_file = True
         elif path not in cached_paths:
@@ -698,6 +873,7 @@ async def _run_patch_planner_async(
     # the same file. Remove the shared (broadcast) ones from secondary plans
     # so each plan stays focused and patch-generator prompts stay small.
     _deduplicate_shared_findings(plan)
+    _split_heavy_edits(plan)
 
     # ── Cross-edit symbol contract ──
     # When a CamelCase symbol is shared between a config/data file and a code
@@ -715,6 +891,7 @@ async def _run_patch_planner_async(
     # everything" backfill — that was a broadcast that only fired when the
     # whole list was empty, leaving partial coverage silently broken.
     _enforce_preserved_findings_coverage(plan, memory)
+    _split_heavy_edits(plan)
 
     _annotate_artifact_expectations(plan, memory, repo_dir)
 

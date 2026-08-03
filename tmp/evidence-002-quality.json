@@ -1,0 +1,518 @@
+{
+  "symptom": {
+    "observable_failures": [
+      "The functionality has been moved but tests need to be updated to reflect the new module organization."
+    ],
+    "repair_targets": [
+      "Qt warning filtering should work identically after the code reorganization, with the same filtering patterns and behavior as before the move."
+    ],
+    "regression_expectations": []
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "Current implementation only filters logging records emitted on the specified logger; it does not intercept arbitrary Python warnings or non-logger Qt output paths.",
+      "Current match rule is prefix-based after stripping leading/trailing whitespace; it does not perform substring or regex matching despite the docstring saying 'regex'.",
+      "Current code in repo handles temporary scoped suppression only while inside the context manager block.",
+      "Current suppression only handles warnings whose trimmed message starts with the provided pattern.",
+      "Current suppression ignores occurrences of the pattern in the middle or end of the warning text.",
+      "Leading/trailing whitespace is ignored before prefix comparison due to `strip()`.",
+      "Non-matching warnings are allowed through without modification."
+    ],
+    "behavioral_constraints": [
+      "hide_qt_warning attaches a temporary logging.Filter to a specific logger name via logging.getLogger(logger), then removes the same filter in a finally block after the context exits.",
+      "Suppression is logger-specific: only records emitted through the selected logger are filtered.",
+      "QtWarningFilter evaluates record.msg.strip().startswith(self._pattern), so whitespace is ignored only at the record boundaries, not inside the pattern or message body.",
+      "`hide_qt_warning` must add the filter to the target logger before the wrapped operation and must always remove it in `finally` afterwards.",
+      "Filtering is logger-local: the context manager attaches a `QtWarningFilter` to `logging.getLogger(logger)` rather than changing global warning handling.",
+      "For unmatched records, the filter returns `True`, so normal logging flow, including original warning severity/content, is preserved."
+    ],
+    "backward_compatibility": [
+      "Existing callers currently import and invoke log.hide_qt_warning, so removing or changing that API without updating callers would break qtnetworkdownloads and existing tests.",
+      "The context manager contract is add filter before yield and always remove it in finally; callers rely on temporary suppression scoped to the with-block.",
+      "Filtering semantics currently suppress only messages whose record.msg.strip().startswith(pattern) is true; exact-match, prefix-match, and leading/trailing-whitespace behavior are covered by tests and should not regress.",
+      "`hide_qt_warning(pattern, logger='qt')` is a context manager API used at call sites via `with log.hide_qt_warning(...):`; its signature and temporary add/remove-filter behavior are relied on by callers.",
+      "The filter acts on `logging` records and currently leaves non-filtered warnings unchanged, preserving their original logger/severity/message; callers and tests rely on that pass-through behavior for unmatched records."
+    ],
+    "similar_implementation_patterns": [
+      "qutebrowser/utils/qtlog.py:48-68 provides another Qt-related context manager, disable_qt_msghandler, with the same try/finally restore pattern expected for temporary logging-state changes.",
+      "qutebrowser/utils/log.py:225-235 py_warning_filter uses a similar context-manager pattern for temporary warning filtering, restoring state after yield.",
+      "qutebrowser/utils/log.py:226-235 `py_warning_filter` is another temporary warning/log filtering context manager that scopes behavior with `try/finally`-style restoration.",
+      "qutebrowser/utils/log.py:433-493 `LogFilter.filter` is another logging filter implementation in the same module that returns `True` for pass-through and `False` for suppression based on explicit matching logic."
+    ],
+    "missing_elements_to_implement": [
+      "Type: Function\nName: hide_qt_warning\nPath: qutebrowser/utils/qtlog.py\nInput: pattern: str, logger: str = 'qt'\nOutput: context manager (Iterator[None])\nDescription: Temporarily suppresses Qt log warnings whose message starts with the given pattern for the specified logger.",
+      "Type: Class\nName: QtWarningFilter\nPath: qutebrowser/utils/qtlog.py\nPublic API: logging.Filter subclass with constructor (pattern: str) and filter(record: logging.LogRecord) -> bool\nDescription: Logging filter used to hide Qt warnings matching a given prefix."
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "qutebrowser/utils/log.py:hide_qt_warning",
+      "qutebrowser/utils/log.py:QtWarningFilter",
+      "qutebrowser/utils/qtlog.py",
+      "qutebrowser/browser/qtnetworkdownloads.py:_die",
+      "tests/unit/utils/test_log.py:TestHideQtWarning",
+      "qutebrowser/utils/log.py:QtWarningFilter.filter",
+      "qutebrowser/browser/qtnetworkdownloads.py:_do_die"
+    ],
+    "exact_code_regions": [
+      "qutebrowser/utils/log.py:362-371",
+      "qutebrowser/utils/log.py:404-419",
+      "qutebrowser/utils/qtlog.py:30-69",
+      "tests/unit/utils/test_log.py:343-369",
+      "qutebrowser/browser/qtnetworkdownloads.py:124-128",
+      "qutebrowser/utils/log.py:363-371",
+      "tests/unit/utils/test_log.py:351-369"
+    ],
+    "call_chain_context": [
+      "qutebrowser/browser/qtnetworkdownloads.py:_die -> log.hide_qt_warning -> QtWarningFilter.filter",
+      "tests/unit/utils/test_log.py:test_filtered/test_unfiltered -> log.hide_qt_warning -> QtWarningFilter.filter",
+      "qutebrowser/browser/qtnetworkdownloads.py:_do_die -> qutebrowser/utils/log.py:hide_qt_warning -> qutebrowser/utils/log.py:QtWarningFilter.filter",
+      "tests/unit/utils/test_log.py:test_unfiltered/test_filtered -> qutebrowser/utils/log.py:hide_qt_warning -> qutebrowser/utils/log.py:QtWarningFilter.filter"
+    ],
+    "dataflow_relevant_uses": [
+      "qutebrowser/utils/log.py:363-367 defines pattern/logger inputs, constructs QtWarningFilter(pattern), and attaches it to logging.getLogger(logger).",
+      "qutebrowser/utils/log.py:416-419 uses self._pattern against record.msg.strip().startswith(...) to decide suppression.",
+      "tests/unit/utils/test_log.py:360-369 passes messages 'Hello', 'Hello World', and '  Hello World  ' to verify prefix/whitespace suppression behavior driven by QtWarningFilter.filter.",
+      "qutebrowser/utils/log.py:363-367 defines `pattern`, constructs `QtWarningFilter(pattern)`, and attaches it to the selected logger.",
+      "qutebrowser/utils/log.py:412-418 stores the constructor argument in `self._pattern` and uses it in `record.msg.strip().startswith(self._pattern)` to decide suppression.",
+      "qutebrowser/browser/qtnetworkdownloads.py:124-128 passes the literal Qt warning text into `hide_qt_warning(...)` before calling `self._reply.abort()`, so emitted warning records are checked against that stored pattern."
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "If hide_qt_warning is relocated from qutebrowser.utils.log -> qutebrowser.utils.qtlog, all imports/callers such as qtnetworkdownloads and same-package tests must be updated together.",
+      "If filtering semantics in QtWarningFilter.filter change -> hide_qt_warning behavior and its tests in tests/unit/utils/test_log.py must stay aligned.",
+      "If `QtWarningFilter.filter` matching semantics change -> `tests/unit/utils/test_log.py:351-369` must also change to reflect the new containment behavior.",
+      "If `hide_qt_warning` changes how it wires filters to loggers -> call sites such as `qutebrowser/browser/qtnetworkdownloads.py:124-128` must remain compatible with the context-manager contract."
+    ],
+    "dependency_propagation": [
+      "qutebrowser/utils/log.py imports qutebrowser.utils.qtlog at line 34, but hide_qt_warning has not been moved into qtlog, so the intended module split is incomplete.",
+      "Production use in qutebrowser/browser/qtnetworkdownloads.py still depends on the symbol being exported from qutebrowser.utils.log.",
+      "Unit coverage for hide_qt_warning remains in tests/unit/utils/test_log.py rather than tests/unit/utils/test_qtlog.py, matching the symbol's current location.",
+      "`QtWarningFilter` behavior controls all call sites using `hide_qt_warning`, including download abort handling in `qutebrowser/browser/qtnetworkdownloads.py`.",
+      "Unit expectations in `tests/unit/utils/test_log.py` are coupled to the current prefix-based suppression semantics."
+    ],
+    "consistency_anchors": [
+      "qutebrowser/utils/log.py:hide_qt_warning <-> tests/unit/utils/test_log.py:352-366",
+      "qutebrowser/utils/log.py:hide_qt_warning <-> qutebrowser/browser/qtnetworkdownloads.py:124-128"
+    ]
+  },
+  "requirements": [
+    {
+      "id": "req-001",
+      "text": "- The hide_qt_warning context manager should continue to operate with identical filtering behavior after the function relocation from the log module to the qtlog module, ensuring no regression in warning suppression capabilities.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/utils/log.py:362-371",
+        "qutebrowser/utils/log.py:404-419",
+        "qutebrowser/utils/qtlog.py:1-69",
+        "tests/unit/utils/test_log.py:343-369",
+        "qutebrowser/browser/qtnetworkdownloads.py:124-128"
+      ],
+      "findings": "The current codebase has not completed the relocation of hide_qt_warning from the log module to the qtlog module. The context manager still exists only in qutebrowser.utils.log and still uses the same filtering behavior there by creating a QtWarningFilter and suppressing records whose stripped message starts with the given pattern. Existing callers and tests also continue to reference log.hide_qt_warning, and qutebrowser.utils.qtlog contains no hide_qt_warning implementation. Because the requirement explicitly says behavior should remain identical after relocation to qtlog, the relocation aspect is violated in the current code even though the old filtering behavior itself remains intact in log.py.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "qutebrowser/utils/log.py:hide_qt_warning",
+            "qutebrowser/utils/log.py:QtWarningFilter",
+            "qutebrowser/utils/qtlog.py",
+            "qutebrowser/browser/qtnetworkdownloads.py:_die",
+            "tests/unit/utils/test_log.py:TestHideQtWarning"
+          ],
+          "exact_code_regions": [
+            "qutebrowser/utils/log.py:362-371",
+            "qutebrowser/utils/log.py:404-419",
+            "qutebrowser/utils/qtlog.py:30-69",
+            "tests/unit/utils/test_log.py:343-369",
+            "qutebrowser/browser/qtnetworkdownloads.py:124-128"
+          ],
+          "call_chain_context": [
+            "qutebrowser/browser/qtnetworkdownloads.py:_die -> log.hide_qt_warning -> QtWarningFilter.filter",
+            "tests/unit/utils/test_log.py:test_filtered/test_unfiltered -> log.hide_qt_warning -> QtWarningFilter.filter"
+          ],
+          "dataflow_relevant_uses": [
+            "qutebrowser/utils/log.py:363-367 defines pattern/logger inputs, constructs QtWarningFilter(pattern), and attaches it to logging.getLogger(logger).",
+            "qutebrowser/utils/log.py:416-419 uses self._pattern against record.msg.strip().startswith(...) to decide suppression.",
+            "tests/unit/utils/test_log.py:360-369 passes messages 'Hello', 'Hello World', and '  Hello World  ' to verify prefix/whitespace suppression behavior driven by QtWarningFilter.filter."
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If hide_qt_warning is relocated from qutebrowser.utils.log -> qutebrowser.utils.qtlog, all imports/callers such as qtnetworkdownloads and same-package tests must be updated together.",
+            "If filtering semantics in QtWarningFilter.filter change -> hide_qt_warning behavior and its tests in tests/unit/utils/test_log.py must stay aligned."
+          ],
+          "dependency_propagation": [
+            "qutebrowser/utils/log.py imports qutebrowser.utils.qtlog at line 34, but hide_qt_warning has not been moved into qtlog, so the intended module split is incomplete.",
+            "Production use in qutebrowser/browser/qtnetworkdownloads.py still depends on the symbol being exported from qutebrowser.utils.log.",
+            "Unit coverage for hide_qt_warning remains in tests/unit/utils/test_log.py rather than tests/unit/utils/test_qtlog.py, matching the symbol's current location."
+          ],
+          "consistency_anchors": [
+            "qutebrowser/utils/log.py:hide_qt_warning <-> tests/unit/utils/test_log.py:352-366",
+            "qutebrowser/utils/log.py:hide_qt_warning <-> qutebrowser/browser/qtnetworkdownloads.py:124-128"
+          ]
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Current implementation only filters logging records emitted on the specified logger; it does not intercept arbitrary Python warnings or non-logger Qt output paths.",
+            "Current match rule is prefix-based after stripping leading/trailing whitespace; it does not perform substring or regex matching despite the docstring saying 'regex'.",
+            "Current code in repo handles temporary scoped suppression only while inside the context manager block."
+          ],
+          "behavioral_constraints": [
+            "hide_qt_warning attaches a temporary logging.Filter to a specific logger name via logging.getLogger(logger), then removes the same filter in a finally block after the context exits.",
+            "Suppression is logger-specific: only records emitted through the selected logger are filtered.",
+            "QtWarningFilter evaluates record.msg.strip().startswith(self._pattern), so whitespace is ignored only at the record boundaries, not inside the pattern or message body."
+          ],
+          "backward_compatibility": [
+            "Existing callers currently import and invoke log.hide_qt_warning, so removing or changing that API without updating callers would break qtnetworkdownloads and existing tests.",
+            "The context manager contract is add filter before yield and always remove it in finally; callers rely on temporary suppression scoped to the with-block.",
+            "Filtering semantics currently suppress only messages whose record.msg.strip().startswith(pattern) is true; exact-match, prefix-match, and leading/trailing-whitespace behavior are covered by tests and should not regress."
+          ],
+          "similar_implementation_patterns": [
+            "qutebrowser/utils/qtlog.py:48-68 provides another Qt-related context manager, disable_qt_msghandler, with the same try/finally restore pattern expected for temporary logging-state changes.",
+            "qutebrowser/utils/log.py:225-235 py_warning_filter uses a similar context-manager pattern for temporary warning filtering, restoring state after yield."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 878,
+        "end": 1107,
+        "text": "- The hide_qt_warning context manager should continue to operate with identical filtering behavior after the function relocation from the log module to the qtlog module, ensuring no regression in warning suppression capabilities."
+      },
+      "parent_contract_id": "contract-001",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "36d7a1915880f7f5ac7b8942406fc0faa12c6c51997efeca57705d5d1fb9ff43"
+    },
+    {
+      "id": "req-002",
+      "text": "- Warning messages that do not contain the specified filter pattern anywhere in their text should pass through the logging system unmodified and appear in the console output with their original severity level and content.",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "qutebrowser/utils/log.py:363-371",
+        "qutebrowser/utils/log.py:404-419",
+        "tests/unit/utils/test_log.py:351-369"
+      ],
+      "findings": "The warning-suppression path filters by prefix, not by containment. `hide_qt_warning(pattern)` installs `QtWarningFilter`, and `QtWarningFilter.filter()` suppresses a record only when `record.msg.strip().startswith(self._pattern)` is false-negated, i.e. prefix matches are filtered and non-prefix matches are logged. The current unit tests verify this exact behavior: with pattern `World`, `Hello World` is logged unchanged; with pattern `Hello`, `Hello`, `Hello World`, and `  Hello World  ` are all suppressed. This means occurrences of the pattern later in the warning text are not treated as matches for suppression, so the current implementation does not satisfy a requirement for whole-message containment matching.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "qutebrowser/utils/log.py:hide_qt_warning",
+            "qutebrowser/utils/log.py:QtWarningFilter.filter",
+            "qutebrowser/browser/qtnetworkdownloads.py:_do_die",
+            "tests/unit/utils/test_log.py:TestHideQtWarning"
+          ],
+          "exact_code_regions": [
+            "qutebrowser/utils/log.py:363-371",
+            "qutebrowser/utils/log.py:404-419",
+            "qutebrowser/browser/qtnetworkdownloads.py:124-128",
+            "tests/unit/utils/test_log.py:351-369"
+          ],
+          "call_chain_context": [
+            "qutebrowser/browser/qtnetworkdownloads.py:_do_die -> qutebrowser/utils/log.py:hide_qt_warning -> qutebrowser/utils/log.py:QtWarningFilter.filter",
+            "tests/unit/utils/test_log.py:test_unfiltered/test_filtered -> qutebrowser/utils/log.py:hide_qt_warning -> qutebrowser/utils/log.py:QtWarningFilter.filter"
+          ],
+          "dataflow_relevant_uses": [
+            "qutebrowser/utils/log.py:363-367 defines `pattern`, constructs `QtWarningFilter(pattern)`, and attaches it to the selected logger.",
+            "qutebrowser/utils/log.py:412-418 stores the constructor argument in `self._pattern` and uses it in `record.msg.strip().startswith(self._pattern)` to decide suppression.",
+            "qutebrowser/browser/qtnetworkdownloads.py:124-128 passes the literal Qt warning text into `hide_qt_warning(...)` before calling `self._reply.abort()`, so emitted warning records are checked against that stored pattern."
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If `QtWarningFilter.filter` matching semantics change -> `tests/unit/utils/test_log.py:351-369` must also change to reflect the new containment behavior.",
+            "If `hide_qt_warning` changes how it wires filters to loggers -> call sites such as `qutebrowser/browser/qtnetworkdownloads.py:124-128` must remain compatible with the context-manager contract."
+          ],
+          "dependency_propagation": [
+            "`QtWarningFilter` behavior controls all call sites using `hide_qt_warning`, including download abort handling in `qutebrowser/browser/qtnetworkdownloads.py`.",
+            "Unit expectations in `tests/unit/utils/test_log.py` are coupled to the current prefix-based suppression semantics."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Current suppression only handles warnings whose trimmed message starts with the provided pattern.",
+            "Current suppression ignores occurrences of the pattern in the middle or end of the warning text.",
+            "Leading/trailing whitespace is ignored before prefix comparison due to `strip()`.",
+            "Non-matching warnings are allowed through without modification."
+          ],
+          "behavioral_constraints": [
+            "`hide_qt_warning` must add the filter to the target logger before the wrapped operation and must always remove it in `finally` afterwards.",
+            "Filtering is logger-local: the context manager attaches a `QtWarningFilter` to `logging.getLogger(logger)` rather than changing global warning handling.",
+            "For unmatched records, the filter returns `True`, so normal logging flow, including original warning severity/content, is preserved."
+          ],
+          "backward_compatibility": [
+            "`hide_qt_warning(pattern, logger='qt')` is a context manager API used at call sites via `with log.hide_qt_warning(...):`; its signature and temporary add/remove-filter behavior are relied on by callers.",
+            "The filter acts on `logging` records and currently leaves non-filtered warnings unchanged, preserving their original logger/severity/message; callers and tests rely on that pass-through behavior for unmatched records."
+          ],
+          "similar_implementation_patterns": [
+            "qutebrowser/utils/log.py:226-235 `py_warning_filter` is another temporary warning/log filtering context manager that scopes behavior with `try/finally`-style restoration.",
+            "qutebrowser/utils/log.py:433-493 `LogFilter.filter` is another logging filter implementation in the same module that returns `True` for pass-through and `False` for suppression based on explicit matching logic."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1109,
+        "end": 1330,
+        "text": "- Warning messages that do not contain the specified filter pattern anywhere in their text should pass through the logging system unmodified and appear in the console output with their original severity level and content."
+      },
+      "parent_contract_id": "contract-002",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "ffcc97df1031c6eb34d446eec56d4244b3afad7cef9670fd876a153f5263f59d"
+    },
+    {
+      "id": "req-003",
+      "text": "- Log entries that exactly match the provided filter string should be completely suppressed from appearing in any log output, with the filtering mechanism preventing these messages from reaching the configured log handlers.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1332,
+        "end": 1555,
+        "text": "- Log entries that exactly match the provided filter string should be completely suppressed from appearing in any log output, with the filtering mechanism preventing these messages from reaching the configured log handlers."
+      },
+      "parent_contract_id": "contract-003",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "21d1ae0478ba4c305e3ea66534ed224fe6e3ff94fb6a68282667d583d04f8089"
+    },
+    {
+      "id": "req-004",
+      "text": "- Messages containing the filter pattern at the beginning of their text content should be blocked from logging, regardless of any additional characters, words, or formatting that appear after the matched portion.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1557,
+        "end": 1769,
+        "text": "- Messages containing the filter pattern at the beginning of their text content should be blocked from logging, regardless of any additional characters, words, or formatting that appear after the matched portion."
+      },
+      "parent_contract_id": "contract-004",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "2f6c4489ed1074590afbf2d10136b8f06344fe9817a2fadb7a75100c4798225f"
+    },
+    {
+      "id": "req-005",
+      "text": "- Filter pattern matching should properly handle warning messages that include leading whitespace characters or trailing spaces by applying the pattern comparison logic against the trimmed message content.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1771,
+        "end": 1976,
+        "text": "- Filter pattern matching should properly handle warning messages that include leading whitespace characters or trailing spaces by applying the pattern comparison logic against the trimmed message content."
+      },
+      "parent_contract_id": "contract-005",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "85583b8e9fff521f93f0190fa2520586d1ca5951b48d99cd6164ffd34a814d84"
+    },
+    {
+      "id": "req-006",
+      "text": "- The context manager should maintain consistent suppression behavior when applied to different Qt logger instances within the same test execution, ensuring that filter rules apply uniformly across various logging scenarios and message sources.",
+      "origin": "requirements",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1978,
+        "end": 2222,
+        "text": "- The context manager should maintain consistent suppression behavior when applied to different Qt logger instances within the same test execution, ensuring that filter rules apply uniformly across various logging scenarios and message sources."
+      },
+      "parent_contract_id": "contract-006",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "c47d1f65af93059bc2f17cd760ed22be23bd2e48f31ca0f6cce8048549ea6008"
+    },
+    {
+      "id": "req-007",
+      "text": "Type: Function\nName: hide_qt_warning\nPath: qutebrowser/utils/qtlog.py\nInput: pattern: str, logger: str = 'qt'\nOutput: context manager (Iterator[None])\nDescription: Temporarily suppresses Qt log warnings whose message starts with the given pattern for the specified logger.",
+      "origin": "new_interfaces",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 2252,
+        "end": 2524,
+        "text": "Type: Function\nName: hide_qt_warning\nPath: qutebrowser/utils/qtlog.py\nInput: pattern: str, logger: str = 'qt'\nOutput: context manager (Iterator[None])\nDescription: Temporarily suppresses Qt log warnings whose message starts with the given pattern for the specified logger."
+      },
+      "parent_contract_id": "contract-007",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "qutebrowser/utils/qtlog.py"
+      ],
+      "explicit_symbols": [
+        "Function",
+        "hide_qt_warning"
+      ],
+      "source_block_hash": "eb91af8457394a81852bf40724fb8dbaeafef9b397ad27a464e32a627df517f8"
+    },
+    {
+      "id": "req-008",
+      "text": "Type: Class\nName: QtWarningFilter\nPath: qutebrowser/utils/qtlog.py\nPublic API: logging.Filter subclass with constructor (pattern: str) and filter(record: logging.LogRecord) -> bool\nDescription: Logging filter used to hide Qt warnings matching a given prefix.",
+      "origin": "new_interfaces",
+      "verdict": "UNCHECKED",
+      "evidence_locations": [],
+      "findings": "",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [],
+          "exact_code_regions": [],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": []
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 2526,
+        "end": 2784,
+        "text": "Type: Class\nName: QtWarningFilter\nPath: qutebrowser/utils/qtlog.py\nPublic API: logging.Filter subclass with constructor (pattern: str) and filter(record: logging.LogRecord) -> bool\nDescription: Logging filter used to hide Qt warnings matching a given prefix."
+      },
+      "parent_contract_id": "contract-008",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "qutebrowser/utils/qtlog.py"
+      ],
+      "explicit_symbols": [
+        "Class",
+        "QtWarningFilter"
+      ],
+      "source_block_hash": "5cea1467cb2bea882a30773cc6a6dd9ceb5a82834ce827d9b6f41891c6db9615"
+    }
+  ],
+  "requirement_status": [],
+  "schema_version": "v3"
+}

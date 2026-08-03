@@ -1,0 +1,1632 @@
+{
+  "symptom": {
+    "observable_failures": [],
+    "repair_targets": [
+      "Move all Solr utility functions, configuration loaders, and shared state (such as `solr_base_url`, `solr_next`, and related helpers) from main update modules to a new `solr/utils.py` file. Update imports across the codebase to use this new module and simplify the main update logic."
+    ],
+    "regression_expectations": []
+  },
+  "constraint": {
+    "semantic_boundaries": [
+      "`get_solr_base_url()` and `get_solr_next()` are lazy and call `load_config()` themselves; values come from `config.runtime_config['plugin_worksearch']` (openlibrary/solr/update_work.py:55-86).",
+      "`load_configs()` normalizes host (strip `http://` and trailing `/`), sets query host, calls `load_config()`, and initializes `data_provider` only if it is currently `None` (openlibrary/solr/update_work.py:1515-1535).",
+      "`solr_insert_documents()` uses `httpx.AsyncClient` and POSTs JSON to `{solr_base_url}/update`; `skip_id_check` maps to `overwrite=false` (openlibrary/solr/update_work.py:922-944).",
+      "`solr_update()` uses sync `httpx.post`, `update.chain=tolerant-chain`, and has special handling for `status_code == 400` with per-error logging; retries via `RetryStrategy` (openlibrary/solr/update_work.py:1010-1075).",
+      "update_work.get_solr_base_url unconditionally indexes config.runtime_config['plugin_worksearch']['solr_base_url'] if solr_base_url is falsy, so missing config section/key triggers KeyError (openlibrary/solr/update_work.py:63-67).",
+      "update_work.get_solr_next assumes config.runtime_config['plugin_worksearch'] exists; missing section triggers KeyError before defaulting to False (openlibrary/solr/update_work.py:82-85).",
+      "openlibrary.utils.solr.Solr.get/get_many/select call .json() directly on responses and do not catch request/network/JSON errors (openlibrary/utils/solr.py:45-52, 62-70, 115-119).",
+      "`solr_update` only performs JSON-body error-shape inspection on HTTP 400; other statuses rely on `raise_for_status()` and exception-driven retry (openlibrary/solr/update_work.py:1037-1054,1055-1073).",
+      "`solr_insert_documents` performs no retry/backoff and no 400-body inspection; it always raises on any non-2xx via `resp.raise_for_status()` (openlibrary/solr/update_work.py:935-944).",
+      "Subject browsing/search uses query utilities (query_dict_to_str) but subject *indexing* uses update_work directly; no intermediate module boundary exists for indexing helpers (scripts/solr_builder/solr_builder/index_subjects.py:8-54).",
+      "Worksearch `get_solr()` is effectively one-time configured per process: once `_ACTIVE_SOLR` is set, later changes to `config.plugin_worksearch['solr_base_url']` do not take effect (openlibrary/plugins/worksearch/search.py:9-14).",
+      "Updater `get_solr_base_url()` caches `solr_base_url` once populated from `config.runtime_config` and will not re-read config unless the global is cleared (openlibrary/solr/update_work.py:55-68).",
+      "Updater `get_solr_next()` caches `solr_next` once populated from `config.runtime_config` and will not re-read config unless the global is reset (openlibrary/solr/update_work.py:76-87).",
+      "`has_changes()` only considers `adds`/`deletes` (not `keys`/`commit`) when deciding whether there are changes to apply.",
+      "`to_solr_requests_json()` emits a handcrafted JSON-ish string with repeated \"add\" keys for each doc (intended for Solr update semantics), not a single JSON array structure.",
+      "If `solr_next` is `None`, `get_solr_next()` calls `load_config()` and reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)`; otherwise it returns the cached `solr_next` without re-reading config.",
+      "`set_solr_next` simply sets the module global without validation (openlibrary/solr/update_work.py:89-91).",
+      "`get_solr_next` lazy-loads from config only when `solr_next is None`; otherwise returns the cached/overridden value (openlibrary/solr/update_work.py:82-86).",
+      "Treats HTTP 400 specially: only retries if no per-document errors and no global error are present; otherwise it logs errors and does not raise for 400 (openlibrary/solr/update_work.py:1037-1053).",
+      "Hard-coded POST timeout of 300 seconds; max_retries=5, delay=8 for HTTPStatusError/TimeoutException/HTTPError (openlibrary/solr/update_work.py:1030-1035,1065-1069).",
+      "If MaxRetriesExceeded occurs, it only logs and does not re-raise (openlibrary/solr/update_work.py:1073-1075).",
+      "`skip_id_check` only affects request param `overwrite=false`; no other validation is performed on the documents list.",
+      "Uses `content=json.dumps(documents)` and sets `Content-Type: application/json`; assumes `documents` is JSON-serializable.",
+      "Timeout is fixed at 30 seconds; no retry/backoff logic is present.",
+      "`has_changes` only considers `adds` and `deletes`; it intentionally ignores `keys` and `commit` flags (openlibrary/solr/update_work.py:1274-1275).",
+      "`to_solr_requests_json` emits a JSON object with possibly repeated \"add\" keys (one per doc), rather than a JSON array; deletes are rendered as a JSON list; commit renders as an empty object.",
+      "`indent` is passed through to `json.dumps` for both deletes and add-doc payloads; `sep` is used as a raw string delimiter and then trimmed if trailing.",
+      "`clear_requests` clears only `adds` and `deletes`; it does not clear `keys` or change `commit` (openlibrary/solr/update_work.py:1291-1294)."
+    ],
+    "behavioral_constraints": [
+      "Global mutable state: `solr_base_url`, `solr_next`, and `data_provider` are module-level globals; callers may override via setters and scripts expect these overrides to affect subsequent operations (openlibrary/solr/update_work.py:48-92; scripts/solr_updater.py:279-288).",
+      "Caller-driven overrides: `scripts/solr_updater.py` sets query host and optionally overrides solr URL, and sets solr_next before loading config and starting updates (scripts/solr_updater.py:279-291).",
+      "Cache lifecycle: `scripts/solr_updater.py` directly calls `update_work.data_provider.clear_cache()` between batches, implying global reachability of the shared data_provider (scripts/solr_updater.py:234-235).",
+      "Tests rely on mutating global `update_work.data_provider` to stub behavior (openlibrary/tests/solr/test_update_work.py:127-132 and other assignments).",
+      "update_work.py caches solr_base_url/solr_next in module-level globals; once set, subsequent calls reuse cached values (openlibrary/solr/update_work.py:51-68, 76-86).",
+      "worksearch/search.py caches the Solr client instance in a module-level global _ACTIVE_SOLR (openlibrary/plugins/worksearch/search.py:6-14).",
+      "`solr_update` posts with `update.chain=tolerant-chain` and logs individual errors without failing the whole batch when `responseHeader.errors` is present (openlibrary/solr/update_work.py:1018-1044).",
+      "`solr_update` retries up to 5 times with delay=8 for `HTTPStatusError`/`TimeoutException`/`HTTPError` exceptions (openlibrary/solr/update_work.py:1065-1074).",
+      "Solr base URL and schema/version behavior is centralized in openlibrary.solr.update_work (e.g., get_solr_next and config loading), and other modules rely on these globals/functions by importing from update_work (openlibrary/solr/update_edition.py:194).",
+      "`execute_solr_query` returns `None` on `requests.HTTPError` and logs; callers must tolerate the `None` path (openlibrary/plugins/worksearch/code.py:108-126).",
+      "`__add__` merges lists by concatenation and `commit` by boolean OR; callers rely on `+=` accumulating updates without mutating RHS.",
+      "`clear_requests()` clears only `adds` and `deletes` (leaves `keys` and `commit` intact).",
+      "`get_solr_next()` caches into module-global `solr_next`; callers will not observe runtime config changes unless `solr_next` is reset (e.g., via `set_solr_next`).",
+      "Calling `set_solr_next` overrides the cached value used by `get_solr_next` for the lifetime of the process (openlibrary/solr/update_work.py:82-91).",
+      "Always sends param update.chain='tolerant-chain' for batch updates; sets overwrite=false when skip_id_check=True (openlibrary/solr/update_work.py:1018-1024).",
+      "Always raises on non-2xx responses via `resp.raise_for_status()`; no internal exception handling/suppression.",
+      "Creates a new `httpx.AsyncClient` per call (connection pooling lifetime is per-call).",
+      "`update_keys` relies on `has_changes()` to decide whether to emit/perform a Solr update; when it returns False, no update is sent/written (openlibrary/solr/update_work.py:1479-1486).",
+      "`solr_update` always posts the serialized content with header `Content-Type: application/json` and expects `to_solr_requests_json()` to produce the complete request body.",
+      "`update_keys` printing modes rely on `sep='/n'` and optional indentation for human-readable output.",
+      "Clearing is done in-place by mutating existing lists (`list.clear()`), so any external references to `self.adds`/`self.deletes` observe the cleared state rather than list replacement (openlibrary/solr/update_work.py:1291-1294)."
+    ],
+    "backward_compatibility": [
+      "In-repo callers currently import from `openlibrary.solr.update_work` (e.g., `load_configs`, `update_keys`, `build_subject_doc`, `solr_insert_documents`, `get_solr_next`) and also import the module itself (`from openlibrary.solr import update_work`) (scripts/solr_updater.py, scripts/solr_builder/..., openlibrary/solr/update_edition.py, openlibrary/tests/solr/test_update_work.py). Any refactor to a dedicated canonical module must update these existing import sites so they continue to resolve the needed APIs in-repo.",
+      "Worksearch code expects get_solr() to return an openlibrary.utils.solr.Solr instance (openlibrary/plugins/worksearch/search.py:9-14).",
+      "update_work.py expects get_solr_base_url()/get_solr_next() to be callable without args and to consult config via load_config() (openlibrary/solr/update_work.py:55-86, 1509-1513).",
+      "`solr_update(update_request, skip_id_check=False, solr_base_url=None) -> None` is directly exercised by tests; its current retry/no-retry behavior for the tested scenarios is part of the existing contract (openlibrary/tests/solr/test_update_work.py:823-889; openlibrary/solr/update_work.py:1010-1075).",
+      "`solr_insert_documents(documents, solr_base_url=None, skip_id_check=False)` is awaited by the subject indexing script; current behavior is to raise exceptions on non-2xx (scripts/solr_builder/solr_builder/index_subjects.py:49-53; openlibrary/solr/update_work.py:922-944).",
+      "These functions are currently imported as public module-level symbols: build_subject_doc/solr_insert_documents from openlibrary.solr.update_work are used by scripts/solr_builder/solr_builder/index_subjects.py:8-54; changing/removing them would break that script.",
+      "`openlibrary.plugins.worksearch.search.get_solr()` currently returns a cached singleton `Solr`; callers may rely on repeated calls being cheap and returning the same instance (openlibrary/plugins/worksearch/search.py:6-14).",
+      "`execute_solr_query` currently suppresses `requests.HTTPError` and returns `None`; changing it to raise would alter observable behavior (openlibrary/plugins/worksearch/code.py:108-126).",
+      "Existing imports/tests currently import `SolrUpdateState` from `openlibrary.solr.update_work` (e.g., test suite). Relocating without a compatible re-export would break these call sites.",
+      "Current in-repo callers import `get_solr_next` from `openlibrary.solr.update_work` (e.g., `update_edition.py`); removing/renaming that symbol or changing its behavior would break those imports.",
+      "Existing code imports/uses `get_solr_next` from `openlibrary.solr.update_work` (openlibrary/solr/update_edition.py:194) and calls `set_solr_next` on `openlibrary.solr.update_work` (scripts/solr_updater.py:287; openlibrary/solr/update_work.py:1574).",
+      "Existing code/tests import solr_update from openlibrary.solr.update_work, not from openlibrary.solr.utils (openlibrary/tests/solr/test_update_work.py:10-17).",
+      "Callers currently import `solr_insert_documents` from `openlibrary.solr.update_work`; changing/removing that symbol or moving it without a shim/re-export would break `scripts/solr_builder/solr_builder/index_subjects.py` and any similar callers.",
+      "Existing code calls `update_state.has_changes()` as a method on `SolrUpdateState` (openlibrary/solr/update_work.py:1479), so any refactor must preserve this callable interface or update all call sites accordingly.",
+      "Existing callers invoke `SolrUpdateState.to_solr_requests_json()` from `openlibrary/solr/update_work.py` (same module) and expect the current signature `(indent: str|None = None, sep=',') -> str` and behavior to remain usable.",
+      "`SolrUpdateState` is used across the codebase/tests (e.g., `openlibrary/tests/solr/test_update_work.py` references it), so existing imports/callers currently expect it to live in `openlibrary/solr/update_work.py` unless a compatibility shim is added elsewhere."
+    ],
+    "similar_implementation_patterns": [
+      "Worksearch layer provides a defensive pattern for HTTP-level failures: execute_solr_query catches requests.HTTPError after raise_for_status and returns None (openlibrary/plugins/worksearch/code.py:117-123); SearchResponse.from_solr_result maps None/error to docs=[] (openlibrary/plugins/worksearch/code.py:255-263).",
+      "Dataclass-based state container with operator overloading used as an accumulator across an async multi-updater pipeline (openlibrary/solr/update_work.py:1249-1270, 1447-1487)",
+      "Sync POST wrapped by RetryStrategy around an inner make_request() closure (openlibrary/solr/update_work.py:1025-1073)",
+      "HTTP 400 parsing of Solr JSON for per-document errors (`responseHeader.errors`) and global error (`error`) (openlibrary/solr/update_work.py:1037-1053)",
+      "Existing separation for query utilities: openlibrary/solr/query_utils.py is imported by openlibrary/plugins/worksearch/subjects.py:14-15",
+      "`SolrUpdateState` in openlibrary/solr/update_work.py is the in-repo implementation pattern for an update-state accumulator/merger/serializer.",
+      "Existing lazy-load pattern: `openlibrary/solr/update_work.py:load_config` guards on `if not config.runtime_config:` (openlibrary/solr/update_work.py:1509-1513).",
+      "Dual loader pattern: `openlibrary/config.py:load` populates `runtime_config`, while `openlibrary/config.py:load_config` loads infogami/global config and updates server config (openlibrary/config.py:13-43).",
+      "openlibrary/solr/update_work.py:55-68 implements `get_solr_base_url()` via config load + read of `config.runtime_config['plugin_worksearch']['solr_base_url']`",
+      "openlibrary/plugins/worksearch/search.py:9-14 reads `config.plugin_worksearch.get('solr_base_url')` to construct a Solr client",
+      "openlibrary/plugins/worksearch/code.py:50-53 builds `solr_select_url` from `config.plugin_worksearch.get('solr_base_url', 'localhost')`",
+      "openlibrary/solr/update_work.py:55-68 get_solr_base_url() implements lazy config loading + module-level cache",
+      "openlibrary/solr/update_work.py:71-73 set_solr_base_url(solr_url: str) is a simple module-global setter",
+      "openlibrary/solr/update_work.py defines paired getter/setter globals: get_solr_base_url()/set_solr_base_url() and get_solr_next()/set_solr_next() (same module-level caching pattern)",
+      "openlibrary/solr/update_work.py:71-74 paired setter for module-level solr option (set_solr_base_url)",
+      "openlibrary/solr/update_work.py:76-92 paired getter/setter pattern for a module-level option (get_solr_next/set_solr_next)",
+      "RetryStrategy wrapper with nested make_request() and httpx.post + error-specific logging (openlibrary/solr/update_work.py:1025-1075)",
+      "openlibrary/solr/update_work.py:922-944 implements async Solr update posting via httpx.AsyncClient.post + resp.raise_for_status",
+      "SolrUpdateState.to_solr_requests_json uses the same `adds`/`deletes` state to emit requests JSON; it conditionally includes delete/add operations based on whether these lists are non-empty (openlibrary/solr/update_work.py:1277-1285).",
+      "openlibrary/solr/update_work.py:1277-1289 constructs a Solr update JSON request body by concatenating optional \"delete\", repeated \"add\" operations, and optional \"commit\" into a single JSON object string, trimming a trailing separator.",
+      "SolrUpdateState.has_changes() checks for pending add/delete operations via `bool(self.adds or self.deletes)` (openlibrary/solr/update_work.py:1274-1275), consistent with `clear_requests` operating on `adds`/`deletes`."
+    ],
+    "missing_elements_to_implement": [
+      "Type: New File \n\nName: utils.py\n\nPath: openlibrary/solr/utils.py\n\nDescription: Centralizes Solr utility logic, configuration management, state handling, and helper functions for Solr operations in the Open Library backend.",
+      "Type: New Public Class \n\nName: SolrUpdateState\n\nPath: openlibrary/solr/utils.py\n\nDescription: Dataclass that manages Solr update operations including keys, documents to add, records to delete, and commit status; provides methods for merging, clearing, and serializing update states.",
+      "Type: New Public Function\n\nName: load_config\n\nPath: openlibrary/solr/utils.py\n\nInput: c_config='conf/openlibrary.yml'\n\nOutput: None\n\nDescription: Loads the Open Library runtime configuration if it has not been loaded yet.",
+      "Type: New Public Function\n\nName: get_solr_base_url\n\nPath: openlibrary/solr/utils.py\n\nInput: None\n\nOutput: str\n\nDescription: Returns the Solr base URL from the loaded configuration.",
+      "Type: New Public Function\n\nName: set_solr_base_url\n\nPath: openlibrary/solr/utils.py\n\nInput: solr_url: str\n\nOutput: None\n\nDescription: Sets the Solr base URL in the module's internal state.",
+      "Type: New Public Function\n\nName: get_solr_next\n\nPath: openlibrary/solr/utils.py\n\nInput: None\n\nOutput: bool\n\nDescription: Returns whether the application should use the next Solr schema version, based on configuration.",
+      "Type: New Public Function\n\nName: set_solr_next\n\nPath: openlibrary/solr/utils.py\n\nInput: val: bool\n\nOutput: None\n\nDescription: Sets the internal state to indicate whether to use the next Solr schema version.",
+      "Type: New Public Function\n\nName: solr_update\n\nPath: openlibrary/solr/utils.py\n\nInput: update_request: SolrUpdateState, skip_id_check=False, solr_base_url: Optional[str]=None\n\nOutput: None\n\nDescription: Sends a batch update request to Solr, handling retries and various Solr response scenarios.",
+      "Type: New Public Function\n\nName: solr_insert_documents\n\nPath: openlibrary/solr/utils.py\n\nInput: documents: list[dict], solr_base_url: Optional[str]=None, skip_id_check=False\n\nOutput: None (async)\n\nDescription: Asynchronously inserts a list of documents into Solr with optional parameters and error handling.",
+      "Type: New Public Function\n\nName: has_changes\n\nParent class: SolrUpdateState\n\nPath: openlibrary/solr/utils.py\n\nInput: self\n\nOutput: bool\n\nDescription: Returns True if the SolrUpdateState contains any add or delete operations.",
+      "Type: New Public Function\n\nName: to_solr_requests_json\n\nParent class: SolrUpdateState\n\nPath: openlibrary/solr/utils.py\n\nInput: self, indent: Optional[str] = None, sep=','\n\nOutput: str\n\nDescription: Serializes the SolrUpdateState to a JSON string for Solr requests.",
+      "Type: New Public Function\n\nName: clear_requests\n\nParent class: SolrUpdateState\n\nPath: openlibrary/solr/utils.py\n\nInput: self\n\nOutput: None\n\nDescription: Clears the add and delete operations from the SolrUpdateState."
+    ]
+  },
+  "localization": {
+    "suspect_entities": [
+      "openlibrary/solr/update_work.py (module globals: data_provider, solr_base_url, solr_next; functions: get_solr_base_url/get_solr_next/set_solr_base_url/set_solr_next/load_config/load_configs/solr_insert_documents/solr_update/build_subject_doc/update_keys)",
+      "openlibrary/solr/update_edition.py:build_edition_data (imports get_solr_next from update_work)",
+      "scripts/solr_updater.py (calls update_work config/state helpers, uses update_work.data_provider.clear_cache)",
+      "scripts/solr_builder/solr_builder/solr_builder.py (imports load_configs, update_keys; imports module update_work)",
+      "scripts/solr_builder/solr_builder/index_subjects.py (imports build_subject_doc, solr_insert_documents)",
+      "openlibrary/tests/solr/test_update_work.py (imports module update_work; mutates update_work.data_provider; imports many names from update_work)",
+      "openlibrary/solr/update_work.py:get_solr_base_url",
+      "openlibrary/solr/update_work.py:get_solr_next",
+      "openlibrary/solr/update_work.py:set_solr_base_url",
+      "openlibrary/solr/update_work.py:set_solr_next",
+      "openlibrary/solr/update_work.py:load_config",
+      "openlibrary/plugins/worksearch/search.py:get_solr",
+      "openlibrary/plugins/worksearch/code.py:execute_solr_query",
+      "openlibrary/plugins/worksearch/code.py:SearchResponse.from_solr_result",
+      "openlibrary/utils/solr.py:Solr.__init__",
+      "openlibrary/utils/solr.py:Solr.get",
+      "openlibrary/utils/solr.py:Solr.get_many",
+      "openlibrary/utils/solr.py:Solr.select",
+      "openlibrary/solr/update_work.py:SolrUpdateState",
+      "openlibrary/solr/update_work.py:update_keys",
+      "openlibrary/tests/solr/test_update_work.py",
+      "openlibrary/solr/update_work.py:solr_insert_documents",
+      "openlibrary/solr/update_work.py:solr_update",
+      "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects",
+      "openlibrary/solr/update_work.py:build_subject_doc",
+      "openlibrary/solr/update_edition.py (import of get_solr_next)",
+      "openlibrary/plugins/worksearch/search.py:_ACTIVE_SOLR",
+      "openlibrary/config.py:runtime_config",
+      "openlibrary/config.py:load",
+      "openlibrary/solr/update_work.py:SolrUpdateState (dataclass)",
+      "openlibrary/solr/update_work.py:update_keys (uses/returns SolrUpdateState)",
+      "openlibrary/solr/update_work.py:load_configs",
+      "scripts/solr_updater.py:update_keys",
+      "scripts/solr_updater.py:main",
+      "openlibrary/solr/update_edition.py:build_edition_data",
+      "openlibrary/config.py:load_config",
+      "openlibrary/solr/update_work.py:solr_base_url",
+      "infogami.config.runtime_config (referenced via `from infogami import config`)",
+      "scripts/solr_updater.py (calls update_work.set_solr_base_url)",
+      "scripts/solr_builder/solr_builder/solr_builder.py (calls update_work.set_solr_base_url)",
+      "openlibrary/solr/update_work.py:solr_next (module global)",
+      "openlibrary/solr/update_work.py:def set_solr_next",
+      "openlibrary/solr/update_work.py:def get_solr_next",
+      "openlibrary/solr/update_work.py:solr_next (module-level global)",
+      "scripts/solr_builder/solr_builder/index_subjects.py (import/call site)",
+      "openlibrary/solr/update_work.py",
+      "SolrUpdateState",
+      "SolrUpdateState.has_changes",
+      "openlibrary/solr/update_work.py:SolrUpdateState.to_solr_requests_json",
+      "openlibrary/solr/update_work.py:SolrUpdateState.clear_requests"
+    ],
+    "exact_code_regions": [
+      "openlibrary/solr/update_work.py:48-92",
+      "openlibrary/solr/update_work.py:922-944",
+      "openlibrary/solr/update_work.py:1010-1075",
+      "openlibrary/solr/update_work.py:1135-1147",
+      "openlibrary/solr/update_work.py:1509-1535",
+      "openlibrary/solr/update_edition.py:186-214",
+      "scripts/solr_updater.py:213-240",
+      "scripts/solr_updater.py:279-288",
+      "scripts/solr_builder/solr_builder/solr_builder.py:15-20",
+      "scripts/solr_builder/solr_builder/index_subjects.py:8-11",
+      "openlibrary/tests/solr/test_update_work.py:8-20",
+      "openlibrary/tests/solr/test_update_work.py:127-132",
+      "openlibrary/solr/update_work.py:51-92",
+      "openlibrary/solr/update_work.py:1509-1513",
+      "openlibrary/plugins/worksearch/search.py:1-14",
+      "openlibrary/plugins/worksearch/code.py:50-56",
+      "openlibrary/plugins/worksearch/code.py:108-126",
+      "openlibrary/plugins/worksearch/code.py:232-236",
+      "openlibrary/plugins/worksearch/code.py:249-280",
+      "openlibrary/utils/solr.py:20-25",
+      "openlibrary/utils/solr.py:37-52",
+      "openlibrary/utils/solr.py:53-70",
+      "openlibrary/utils/solr.py:115-144",
+      "openlibrary/solr/update_work.py:1249-1294",
+      "openlibrary/solr/update_work.py:1415-1489",
+      "openlibrary/tests/solr/test_update_work.py:8-19",
+      "openlibrary/solr/__init__.py:1-1",
+      "scripts/solr_builder/solr_builder/index_subjects.py:1-54",
+      "openlibrary/tests/solr/test_update_work.py:751-889",
+      "scripts/solr_builder/solr_builder/index_subjects.py:1-64",
+      "openlibrary/solr/update_edition.py:190-200",
+      "openlibrary/plugins/worksearch/subjects.py:12-16",
+      "openlibrary/plugins/worksearch/subjects.py:209-244",
+      "openlibrary/plugins/worksearch/search.py:6-14",
+      "openlibrary/config.py:10-40",
+      "conf/openlibrary.yml:50-54",
+      "openlibrary/solr/update_work.py:1249-1295",
+      "openlibrary/solr/update_work.py:1415-1490",
+      "openlibrary/solr/update_work.py:55-92",
+      "scripts/solr_updater.py:213-236",
+      "scripts/solr_updater.py:243-291",
+      "openlibrary/config.py:10-43",
+      "openlibrary/solr/update_work.py:55-68",
+      "openlibrary/solr/update_work.py:51-74",
+      "scripts/solr_builder/solr_builder/solr_builder.py:409-411",
+      "openlibrary/solr/update_work.py:1568-1574",
+      "openlibrary/solr/update_work.py:60-92",
+      "openlibrary/solr/update_work.py:76-92",
+      "openlibrary/solr/update_work.py:1571-1576",
+      "scripts/solr_builder/solr_builder/index_subjects.py:8-53",
+      "openlibrary/solr/update_work.py:1249-1276",
+      "openlibrary/solr/update_work.py:1479-1486",
+      "openlibrary/solr/update_work.py:1010-1016",
+      "openlibrary/solr/update_work.py:1249-1290",
+      "openlibrary/solr/update_work.py:1433-1440"
+    ],
+    "call_chain_context": [
+      "scripts/solr_updater.py:update_keys -> openlibrary.solr.update_work.load_configs -> openlibrary.solr.update_work.load_config -> openlibrary.config.load/config.load_config",
+      "scripts/solr_updater.py:main -> update_work.set_query_host/set_solr_base_url/set_solr_next -> openlibrary.solr.update_work module globals",
+      "openlibrary/solr/update_edition.py:build_edition_data -> (local import) openlibrary.solr.update_work.get_solr_next",
+      "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects -> openlibrary.solr.update_work.build_subject_doc/solr_insert_documents",
+      "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> infogami.config.load/config.load_config",
+      "openlibrary/plugins/worksearch/code.py:run_solr_query -> execute_solr_query -> get_solr (openlibrary/plugins/worksearch/search.py) -> Solr.raw_request (openlibrary/utils/solr.py)",
+      "update_keys -> (per updater) updater.update_key -> returns SolrUpdateState -> update_state += ... -> net_update += update_state -> return net_update",
+      "openlibrary/tests/solr/test_update_work.py imports SolrUpdateState from openlibrary.solr.update_work",
+      "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects -> openlibrary.solr.update_work:solr_insert_documents",
+      "scripts.solr_builder.solr_builder.index_subjects.index_subjects -> openlibrary.solr.update_work.build_subject_doc",
+      "scripts.solr_builder.solr_builder.index_subjects.index_subjects -> openlibrary.solr.update_work.solr_insert_documents",
+      "openlibrary.plugins.worksearch.subjects.SubjectEngine.get_subject -> openlibrary.plugins.worksearch.code.run_solr_query -> (solr query pipeline)",
+      "openlibrary/plugins/worksearch/code.py:execute_solr_query -> openlibrary/plugins/worksearch/search.py:get_solr -> openlibrary/utils/solr.py:Solr.raw_request",
+      "openlibrary/solr/update_work.py:get_solr_base_url/get_solr_next -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config",
+      "update_keys -> updater.update_key -> (returns SolrUpdateState) -> update_state += ... -> _solr_update(update_state) using to_solr_requests_json/solr_update",
+      "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config",
+      "openlibrary/solr/update_work.py:get_solr_next -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config",
+      "scripts/solr_updater.py:update_keys -> openlibrary.solr.update_work.load_configs -> openlibrary.solr.update_work.load_config",
+      "scripts/solr_updater.py:main -> openlibrary.config.load_config (direct call)",
+      "openlibrary/solr/update_edition.py:build_edition_data -> (local import) openlibrary.solr.update_work.get_solr_next -> openlibrary/solr/update_work.py:load_config",
+      "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> infogami.config.load / infogami.config.load_config",
+      "scripts/solr_updater.py:main -> openlibrary.solr.update_work.set_solr_base_url",
+      "scripts/solr_builder/solr_builder/solr_builder.py:index -> openlibrary.solr.update_work.set_solr_base_url",
+      "openlibrary/solr/update_work.py:main -> set_solr_base_url",
+      "openlibrary.solr.update_edition.build_edition_data -> openlibrary.solr.update_work.get_solr_next",
+      "scripts/solr_updater.py -> openlibrary.solr.update_work.set_solr_next",
+      "openlibrary/solr/update_work.py:main -> set_solr_next",
+      "openlibrary/solr/update_edition.py:build_edition_data -> openlibrary.solr.update_work.get_solr_next",
+      "update_keys._solr_update -> solr_update (openlibrary/solr/update_work.py:1433-1436 -> 1010)",
+      "scripts/solr_builder/solr_builder/index_subjects.index_subjects -> openlibrary.solr.update_work.solr_insert_documents",
+      "update_keys -> SolrUpdateState.has_changes",
+      "update_keys._solr_update -> solr_update -> SolrUpdateState.to_solr_requests_json",
+      "solr_update -> SolrUpdateState.to_solr_requests_json"
+    ],
+    "dataflow_relevant_uses": [
+      "openlibrary/solr/update_work.py:51-68 defines/reads global solr_base_url; sourced from config.runtime_config['plugin_worksearch']['solr_base_url']",
+      "openlibrary/solr/update_work.py:76-86 defines/reads global solr_next; sourced from config.runtime_config['plugin_worksearch'].get('solr_next', False)",
+      "openlibrary/solr/update_work.py:1509-1513 load_config populates config.runtime_config using config.load and config.load_config",
+      "openlibrary/solr/update_work.py:1527-1535 load_configs defines/sets global data_provider once (if currently None), based on c_data_provider/host",
+      "openlibrary/solr/update_work.py:63-67 sets solr_base_url from config.runtime_config['plugin_worksearch']['solr_base_url'] when cache unset",
+      "openlibrary/solr/update_work.py:82-85 sets solr_next from config.runtime_config['plugin_worksearch'].get('solr_next', False) when cache unset",
+      "openlibrary/plugins/worksearch/search.py:11-13 reads config.plugin_worksearch.get('solr_base_url') to construct cached _ACTIVE_SOLR",
+      "openlibrary/plugins/worksearch/code.py:51-55 computes solr_select_url from config.plugin_worksearch.get('solr_base_url', 'localhost')",
+      "SolrUpdateState.__add__: returns new SolrUpdateState with adds/deletes/keys concatenated and commit OR-ed (openlibrary/solr/update_work.py:1263-1270)",
+      "update_keys: net_update and update_state are accumulated with '+=' (openlibrary/solr/update_work.py:1447-1487)",
+      "SolrUpdateState.to_solr_requests_json: emits JSON-ish payload for deletes/adds/commit (openlibrary/solr/update_work.py:1277-1289)",
+      "SolrUpdateState.clear_requests: clears adds/deletes lists in-place (openlibrary/solr/update_work.py:1291-1293)",
+      "openlibrary/solr/update_work.py:1015 content=update_request.to_solr_requests_json() -> httpx.post(..., content=content) (openlibrary/solr/update_work.py:1028-1035)",
+      "openlibrary/solr/update_work.py:923 documents -> json.dumps(documents) -> AsyncClient.post(..., content=...) (openlibrary/solr/update_work.py:936-942)",
+      "SubjectEngine.get_subject builds query via openlibrary.solr.query_utils.query_dict_to_str -> passed as params['q'] into run_solr_query (openlibrary/plugins/worksearch/subjects.py:231-244)",
+      "conf/openlibrary.yml:50-54 plugin_worksearch.solr_base_url -> infogami.config.plugin_worksearch (consumed in openlibrary/plugins/worksearch/search.py:12-13 and openlibrary/plugins/worksearch/code.py:51-53)",
+      "conf/openlibrary.yml:50-54 plugin_worksearch.solr_base_url/solr_next -> openlibrary.config.runtime_config['plugin_worksearch'] (consumed in openlibrary/solr/update_work.py:66-67 and 84-85)",
+      "openlibrary/plugins/worksearch/search.py:11-14 caches Solr(base_url) into _ACTIVE_SOLR and reuses it for subsequent calls",
+      "SolrUpdateState(keys/adds/deletes/commit) constructed in update_keys and updater.update_key; merged via __add__ and += in update_keys; serialized via to_solr_requests_json in update_keys (print/pprint modes)",
+      "openlibrary/solr/update_work.py:1509-1513 `load_config` populates `openlibrary.config.runtime_config` via `config.load(c_config)` and global infogami config via `config.load_config(c_config)` once `runtime_config` is empty",
+      "openlibrary/solr/update_work.py:63-67 `get_solr_base_url` reads `config.runtime_config['plugin_worksearch']['solr_base_url']` after invoking `load_config()`",
+      "openlibrary/solr/update_work.py:82-85 `get_solr_next` reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)` after invoking `load_config()`",
+      "scripts/solr_updater.py:289-291 calls `load_config(ol_config)` (imported from `openlibrary.config`)",
+      "openlibrary/solr/update_work.py:51 defines module-global `solr_base_url` -> openlibrary/solr/update_work.py:65-68 initializes it from `config.runtime_config['plugin_worksearch']['solr_base_url']` -> openlibrary/solr/update_work.py:68 returns it",
+      "openlibrary/solr/update_work.py:1509-1513 `load_config()` populates `config.runtime_config` by calling `config.load()` and `config.load_config()` when empty",
+      "openlibrary/solr/update_work.py:71-73 set_solr_base_url(solr_url) assigns module global solr_base_url",
+      "openlibrary/solr/update_work.py:55-68 get_solr_base_url() reads solr_base_url and loads from config if unset",
+      "scripts/solr_updater.py:284-285 passes solr_url -> update_work.set_solr_base_url(solr_url)",
+      "scripts/solr_builder/solr_builder/solr_builder.py:409-410 passes solr -> update_work.set_solr_base_url(solr)",
+      "openlibrary/solr/update_work.py:1571-1572 main() passes solr_base -> set_solr_base_url(solr_base)",
+      "config.runtime_config['plugin_worksearch'].get('solr_next', False) -> solr_next (module-global cache) -> return value of get_solr_next()",
+      "openlibrary/solr/update_work.py:82-85 initializes solr_next from config when None; openlibrary/solr/update_work.py:89-91 assigns solr_next = val; openlibrary/solr/update_edition.py:212 branches on get_solr_next()",
+      "solr_update: update_request.to_solr_requests_json() -> `content` used as httpx.post(..., content=content) (openlibrary/solr/update_work.py:1015,1028-1035)",
+      "solr_update: solr_base_url param -> defaulted via get_solr_base_url() -> used in request URL (openlibrary/solr/update_work.py:1017,1029)",
+      "solr_update: skip_id_check -> params['overwrite']='false' (openlibrary/solr/update_work.py:1022-1024)",
+      "documents (param) -> json.dumps(documents) -> httpx.AsyncClient.post(..., content=...) (openlibrary/solr/update_work.py:936-942)",
+      "solr_base_url (param/defaulted) -> f\"{solr_base_url}/update\" (openlibrary/solr/update_work.py:930-938)",
+      "skip_id_check -> params['overwrite']='false' -> httpx post params (openlibrary/solr/update_work.py:931-940)",
+      "SolrUpdateState.adds/deletes defined at openlibrary/solr/update_work.py:1254-1258 -> used in SolrUpdateState.has_changes at openlibrary/solr/update_work.py:1274-1275",
+      "SolrUpdateState.has_changes at openlibrary/solr/update_work.py:1274-1275 -> controls whether solr updates are emitted at openlibrary/solr/update_work.py:1479-1486",
+      "SolrUpdateState(adds/deletes/commit) -> to_solr_requests_json() -> content string used as httpx.post(..., content=content) in solr_update",
+      "SolrUpdateState.adds defined at openlibrary/solr/update_work.py:1254-1256; cleared at openlibrary/solr/update_work.py:1291-1293",
+      "SolrUpdateState.deletes defined at openlibrary/solr/update_work.py:1257-1259; cleared at openlibrary/solr/update_work.py:1291-1293"
+    ]
+  },
+  "structural": {
+    "must_co_edit_relations": [
+      "Broad rewrite (whole-file/whole-package scope): introduce a dedicated canonical Solr utils/config/state module (e.g., `openlibrary/solr/utils.py` or similarly named per repo conventions) and re-home the shared Solr configuration/state API currently exposed from `openlibrary/solr/update_work.py` (globals `solr_base_url`, `solr_next`, `data_provider`; accessors `get_solr_base_url/get_solr_next/set_solr_base_url/set_solr_next`; config init `load_config/load_configs`, and any shared helper entrypoints used externally). Then update all in-repo import/call sites to reference the new module instead of importing these concerns from `openlibrary.solr.update_work`.",
+      "After the new canonical module exists, `openlibrary/solr/update_work.py` should stop being the cross-module surface for config/state/helpers: it should import config/state utilities from the new module and retain only work-indexing logic; call sites in `openlibrary/solr/update_edition.py`, `scripts/solr_updater.py`, `scripts/solr_builder/...`, and `openlibrary/tests/solr/test_update_work.py` must be updated accordingly to remove direct coupling to update_work for config/state utilities.",
+      "Broad rewrite rule (config centralization): replace direct reads of Solr base_url / solr_next from `config.runtime_config['plugin_worksearch']...` in `openlibrary/solr/update_work.py` and from `config.plugin_worksearch...` in the worksearch plugin with a single canonical utility getter that applies consistent defaulting/caching and is used by both the CLI updater and worksearch (including `solr_select_url` derivation).",
+      "Canonicalization/adoption rule (broad rewrite): introduce `openlibrary/solr/utils.py` to own Solr-related config initialization and expose `load_config(c_config='conf/openlibrary.yml')` there; then update in-repo Solr-related call sites which currently invoke `openlibrary.solr.update_work.load_config/load_configs` or directly call `openlibrary.config.load_config` (as in `scripts/solr_updater.py`) to use the canonical `openlibrary.solr.utils.load_config` entrypoint so config initialization is centralized.",
+      "If a new canonical setter is introduced at openlibrary/solr/utils.py:set_solr_base_url, then references to openlibrary.solr.update_work.set_solr_base_url in scripts (and any other callers) must be updated OR update_work must delegate/re-export to preserve existing imports while adopting the new module path.",
+      "If `solr_insert_documents` is moved/introduced into `openlibrary/solr/utils.py`, then existing import sites using `from openlibrary.solr.update_work import solr_insert_documents` must be updated to import from the new module (and/or `update_work.py` must re-export it to preserve compatibility).",
+      "If `SolrUpdateState`/`has_changes` is moved to `openlibrary/solr/utils.py` as required, then all in-module references (e.g., `update_keys` and any imports) must be updated to import/use the new definition to avoid duplicate/conflicting class definitions."
+    ],
+    "dependency_propagation": [
+      "Config propagation: `get_solr_base_url/get_solr_next` depend on `config.runtime_config['plugin_worksearch']` after `load_config()`; any new canonical module must preserve the same config-loading semantics currently implemented in `openlibrary/solr/update_work.py:1509-1513`.",
+      "Import-surface propagation: multiple repo entrypoints (scripts, other solr modules, and base tests) import these utilities from `openlibrary.solr.update_work`; the canonical module must become the new import surface, requiring coordinated updates across all those files.",
+      "update_work.py getters depend on config.runtime_config being populated by config.load/config.load_config in update_work.load_config() (openlibrary/solr/update_work.py:1509-1513)",
+      "worksearch uses config.plugin_worksearch and caches a Solr instance independently (openlibrary/plugins/worksearch/search.py:9-14), and derives solr_select_url separately (openlibrary/plugins/worksearch/code.py:50-56)",
+      "openlibrary/tests/solr/test_update_work.py imports SolrUpdateState from openlibrary.solr.update_work (openlibrary/tests/solr/test_update_work.py:10-19)",
+      "openlibrary/solr/__init__.py is empty, providing no package-level re-export access point (openlibrary/solr/__init__.py:1-1)",
+      "Indexing scripts depend on openlibrary.solr.update_work symbols (build_subject_doc/solr_insert_documents), making those symbols part of a wider coupling surface: scripts/solr_builder/solr_builder/index_subjects.py:8-54",
+      "Same conceptual Solr settings are sourced from two different config stores depending on code path: `infogami.config.plugin_worksearch` (worksearch/web) vs `openlibrary.config.runtime_config['plugin_worksearch']` (solr updater), with additional module-global caching on both paths (openlibrary/plugins/worksearch/search.py:6-14, openlibrary/solr/update_work.py:51-87, 1509-1513).",
+      "`openlibrary/solr/update_work.py` consumers depend on `openlibrary.config.runtime_config` being populated before accessing `runtime_config['plugin_worksearch']...` (openlibrary/solr/update_work.py:55-86); the existing `update_work.load_config` achieves this by calling both `openlibrary.config.load` and `openlibrary.config.load_config` (openlibrary/solr/update_work.py:1509-1513; openlibrary/config.py:13-43).",
+      "`scripts/solr_updater.py` currently initializes config via `openlibrary.config.load_config(ol_config)` in `main` (scripts/solr_updater.py:289-291) while also calling `update_work.load_configs(args['ol_url'], args['ol_config'], 'default')` inside `update_keys` (scripts/solr_updater.py:213-236), so config loading is currently split across entrypoints.",
+      "The Solr base URL state is currently stored as a module-global `solr_base_url` in openlibrary/solr/update_work.py; any new utils module would need to either own that state or consistently delegate to the existing state holder to avoid divergent Solr base URL sources."
+    ],
+    "consistency_anchors": [
+      "openlibrary/solr/update_work.py:solr_update <-> openlibrary/tests/solr/test_update_work.py:16",
+      "openlibrary/solr/update_work.py:solr_insert_documents <-> scripts/solr_builder/solr_builder/index_subjects.py:8"
+    ]
+  },
+  "requirements": [
+    {
+      "id": "req-001",
+      "text": "- A single dedicated module (such as `openlibrary/solr/utils.py`) should handle Solr configuration, shared state, and helper functions, providing a clear and consistent access point for these utilities.\\n\\n",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:48-92",
+        "openlibrary/solr/update_work.py:922-944",
+        "openlibrary/solr/update_work.py:1010-1075",
+        "openlibrary/solr/update_work.py:1135-1147",
+        "openlibrary/solr/update_work.py:1509-1535",
+        "openlibrary/solr/update_edition.py:186-214",
+        "scripts/solr_updater.py:213-240",
+        "scripts/solr_updater.py:243-291",
+        "scripts/solr_builder/solr_builder/solr_builder.py:15-20",
+        "scripts/solr_builder/solr_builder/index_subjects.py:8-11",
+        "openlibrary/tests/solr/test_update_work.py:8-20",
+        "openlibrary/tests/solr/test_update_work.py:127-132"
+      ],
+      "findings": "Verified: Solr configuration access + shared mutable state + several cross-module helper utilities are currently hosted in `openlibrary/solr/update_work.py` and imported/used directly by other modules/scripts/tests, rather than being exposed via a dedicated Solr “utils/config/state” module.\n\nConcrete verified state/config globals and accessors in `openlibrary/solr/update_work.py`:\n- Module globals: `data_provider`, `solr_base_url`, `solr_next`.\n- `get_solr_base_url()` calls `load_config()` and lazily reads `config.runtime_config['plugin_worksearch']['solr_base_url']` into the module global.\n- `get_solr_next()` lazily reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)` into the module global.\n- Setters `set_solr_base_url()` / `set_solr_next()` mutate the module globals.\n- `load_config()` and `load_configs()` are the public configuration initialization path and also initialize the global `data_provider` singleton.\n\nVerified cross-repo coupling to this non-dedicated module surface:\n- `openlibrary/solr/update_edition.py` imports `get_solr_next` from `openlibrary.solr.update_work` inside `build_edition_data` and branches behavior on it.\n- `scripts/solr_updater.py` calls `update_work.load_configs(...)`, `update_work.set_query_host(...)`, `update_work.set_solr_base_url(...)`, `update_work.set_solr_next(...)`, and directly calls `update_work.data_provider.clear_cache()`.\n- `scripts/solr_builder/solr_builder/solr_builder.py` imports `load_configs` and `update_keys` from `openlibrary.solr.update_work` (and also imports the module as `update_work`).\n- `scripts/solr_builder/solr_builder/index_subjects.py` imports `build_subject_doc` and `solr_insert_documents` from `openlibrary.solr.update_work`.\n- `openlibrary/tests/solr/test_update_work.py` imports the module as `update_work` and assigns to `update_work.data_provider` in multiple tests; it also imports many symbols from `openlibrary.solr.update_work`.\n\nThese verified facts support the violation: Solr shared config/state/helpers are currently centralized in (and exported from) the large `update_work.py` implementation module and consumed from there across the repo, rather than through a dedicated canonical Solr utils/config/state module.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py (module globals: data_provider, solr_base_url, solr_next; functions: get_solr_base_url/get_solr_next/set_solr_base_url/set_solr_next/load_config/load_configs/solr_insert_documents/solr_update/build_subject_doc/update_keys)",
+            "openlibrary/solr/update_edition.py:build_edition_data (imports get_solr_next from update_work)",
+            "scripts/solr_updater.py (calls update_work config/state helpers, uses update_work.data_provider.clear_cache)",
+            "scripts/solr_builder/solr_builder/solr_builder.py (imports load_configs, update_keys; imports module update_work)",
+            "scripts/solr_builder/solr_builder/index_subjects.py (imports build_subject_doc, solr_insert_documents)",
+            "openlibrary/tests/solr/test_update_work.py (imports module update_work; mutates update_work.data_provider; imports many names from update_work)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:48-92",
+            "openlibrary/solr/update_work.py:922-944",
+            "openlibrary/solr/update_work.py:1010-1075",
+            "openlibrary/solr/update_work.py:1135-1147",
+            "openlibrary/solr/update_work.py:1509-1535",
+            "openlibrary/solr/update_edition.py:186-214",
+            "scripts/solr_updater.py:213-240",
+            "scripts/solr_updater.py:279-288",
+            "scripts/solr_builder/solr_builder/solr_builder.py:15-20",
+            "scripts/solr_builder/solr_builder/index_subjects.py:8-11",
+            "openlibrary/tests/solr/test_update_work.py:8-20",
+            "openlibrary/tests/solr/test_update_work.py:127-132"
+          ],
+          "call_chain_context": [
+            "scripts/solr_updater.py:update_keys -> openlibrary.solr.update_work.load_configs -> openlibrary.solr.update_work.load_config -> openlibrary.config.load/config.load_config",
+            "scripts/solr_updater.py:main -> update_work.set_query_host/set_solr_base_url/set_solr_next -> openlibrary.solr.update_work module globals",
+            "openlibrary/solr/update_edition.py:build_edition_data -> (local import) openlibrary.solr.update_work.get_solr_next",
+            "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects -> openlibrary.solr.update_work.build_subject_doc/solr_insert_documents"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:51-68 defines/reads global solr_base_url; sourced from config.runtime_config['plugin_worksearch']['solr_base_url']",
+            "openlibrary/solr/update_work.py:76-86 defines/reads global solr_next; sourced from config.runtime_config['plugin_worksearch'].get('solr_next', False)",
+            "openlibrary/solr/update_work.py:1509-1513 load_config populates config.runtime_config using config.load and config.load_config",
+            "openlibrary/solr/update_work.py:1527-1535 load_configs defines/sets global data_provider once (if currently None), based on c_data_provider/host"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "Broad rewrite (whole-file/whole-package scope): introduce a dedicated canonical Solr utils/config/state module (e.g., `openlibrary/solr/utils.py` or similarly named per repo conventions) and re-home the shared Solr configuration/state API currently exposed from `openlibrary/solr/update_work.py` (globals `solr_base_url`, `solr_next`, `data_provider`; accessors `get_solr_base_url/get_solr_next/set_solr_base_url/set_solr_next`; config init `load_config/load_configs`, and any shared helper entrypoints used externally). Then update all in-repo import/call sites to reference the new module instead of importing these concerns from `openlibrary.solr.update_work`.",
+            "After the new canonical module exists, `openlibrary/solr/update_work.py` should stop being the cross-module surface for config/state/helpers: it should import config/state utilities from the new module and retain only work-indexing logic; call sites in `openlibrary/solr/update_edition.py`, `scripts/solr_updater.py`, `scripts/solr_builder/...`, and `openlibrary/tests/solr/test_update_work.py` must be updated accordingly to remove direct coupling to update_work for config/state utilities."
+          ],
+          "dependency_propagation": [
+            "Config propagation: `get_solr_base_url/get_solr_next` depend on `config.runtime_config['plugin_worksearch']` after `load_config()`; any new canonical module must preserve the same config-loading semantics currently implemented in `openlibrary/solr/update_work.py:1509-1513`.",
+            "Import-surface propagation: multiple repo entrypoints (scripts, other solr modules, and base tests) import these utilities from `openlibrary.solr.update_work`; the canonical module must become the new import surface, requiring coordinated updates across all those files."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`get_solr_base_url()` and `get_solr_next()` are lazy and call `load_config()` themselves; values come from `config.runtime_config['plugin_worksearch']` (openlibrary/solr/update_work.py:55-86).",
+            "`load_configs()` normalizes host (strip `http://` and trailing `/`), sets query host, calls `load_config()`, and initializes `data_provider` only if it is currently `None` (openlibrary/solr/update_work.py:1515-1535).",
+            "`solr_insert_documents()` uses `httpx.AsyncClient` and POSTs JSON to `{solr_base_url}/update`; `skip_id_check` maps to `overwrite=false` (openlibrary/solr/update_work.py:922-944).",
+            "`solr_update()` uses sync `httpx.post`, `update.chain=tolerant-chain`, and has special handling for `status_code == 400` with per-error logging; retries via `RetryStrategy` (openlibrary/solr/update_work.py:1010-1075)."
+          ],
+          "behavioral_constraints": [
+            "Global mutable state: `solr_base_url`, `solr_next`, and `data_provider` are module-level globals; callers may override via setters and scripts expect these overrides to affect subsequent operations (openlibrary/solr/update_work.py:48-92; scripts/solr_updater.py:279-288).",
+            "Caller-driven overrides: `scripts/solr_updater.py` sets query host and optionally overrides solr URL, and sets solr_next before loading config and starting updates (scripts/solr_updater.py:279-291).",
+            "Cache lifecycle: `scripts/solr_updater.py` directly calls `update_work.data_provider.clear_cache()` between batches, implying global reachability of the shared data_provider (scripts/solr_updater.py:234-235).",
+            "Tests rely on mutating global `update_work.data_provider` to stub behavior (openlibrary/tests/solr/test_update_work.py:127-132 and other assignments)."
+          ],
+          "backward_compatibility": [
+            "In-repo callers currently import from `openlibrary.solr.update_work` (e.g., `load_configs`, `update_keys`, `build_subject_doc`, `solr_insert_documents`, `get_solr_next`) and also import the module itself (`from openlibrary.solr import update_work`) (scripts/solr_updater.py, scripts/solr_builder/..., openlibrary/solr/update_edition.py, openlibrary/tests/solr/test_update_work.py). Any refactor to a dedicated canonical module must update these existing import sites so they continue to resolve the needed APIs in-repo."
+          ],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1773,
+        "end": 1979,
+        "text": "- A single dedicated module (such as `openlibrary/solr/utils.py`) should handle Solr configuration, shared state, and helper functions, providing a clear and consistent access point for these utilities.\\n\\n"
+      },
+      "parent_contract_id": "contract-001",
+      "contract_kind": "behavior",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "openlibrary/solr/utils.py"
+      ],
+      "source_block_hash": "ec06e4104a1eefb62327ba2245dea2389094924e3263e16d56610d8bbc146717"
+    },
+    {
+      "id": "req-002",
+      "text": "- Utility functions like `get_solr_base_url`, `set_solr_base_url`, `get_solr_next`, `set_solr_next`, and `load_config` should be organized in a way that enables reliable initialization and retrieval of Solr connection parameters and configuration flags, even when Solr is unavailable or returns error responses.\\n\\n",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:55-68",
+        "openlibrary/solr/update_work.py:76-86",
+        "openlibrary/solr/update_work.py:1509-1513",
+        "openlibrary/plugins/worksearch/search.py:9-14",
+        "openlibrary/plugins/worksearch/code.py:50-56",
+        "openlibrary/plugins/worksearch/code.py:108-125",
+        "openlibrary/plugins/worksearch/code.py:232-236",
+        "openlibrary/plugins/worksearch/code.py:249-263",
+        "openlibrary/utils/solr.py:20-25",
+        "openlibrary/utils/solr.py:37-52",
+        "openlibrary/utils/solr.py:53-70",
+        "openlibrary/utils/solr.py:115-122"
+      ],
+      "findings": "Solr connection parameter/flag retrieval is not organized as a single, defensive “utility” layer; instead it is fragmented across at least two config sources with brittle access in the CLI updater.\n\n* `openlibrary/solr/update_work.py` provides `get_solr_base_url()` / `get_solr_next()` which call `load_config()` and then directly index into `config.runtime_config['plugin_worksearch']...`. This will raise `KeyError` if `runtime_config` lacks the `plugin_worksearch` section or expected keys (e.g. `solr_base_url`). `get_solr_next()` also assumes `config.runtime_config['plugin_worksearch']` exists before it can default via `.get('solr_next', False)`.\n\n* The worksearch plugin does not use the updater’s getters; it reads from `infogami.config.plugin_worksearch` and caches a `Solr` instance in `_ACTIVE_SOLR`. Additionally, worksearch has its own module-level derivation of `solr_select_url` based on `config.plugin_worksearch.get('solr_base_url', 'localhost')`, which is separate from the updater’s `runtime_config` access path.\n\n* Worksearch query execution catches `requests.HTTPError` around `raise_for_status()` and returns `None`, and `SearchResponse.from_solr_result` maps `None`/error to an empty response. However, the lower-level `openlibrary.utils.solr.Solr` client methods (`get`, `get_many`, `select`) call `.json()` on responses without catching request/network/JSON errors, so “reliable” behavior under Solr failure is not uniformly enforced at the utility/client layer.\n\nAs-is, configuration/initialization and retrieval of Solr parameters/flags is not centralized and is not consistently defensive against missing config and runtime failures.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:get_solr_base_url",
+            "openlibrary/solr/update_work.py:get_solr_next",
+            "openlibrary/solr/update_work.py:set_solr_base_url",
+            "openlibrary/solr/update_work.py:set_solr_next",
+            "openlibrary/solr/update_work.py:load_config",
+            "openlibrary/plugins/worksearch/search.py:get_solr",
+            "openlibrary/plugins/worksearch/code.py:execute_solr_query",
+            "openlibrary/plugins/worksearch/code.py:SearchResponse.from_solr_result",
+            "openlibrary/utils/solr.py:Solr.__init__",
+            "openlibrary/utils/solr.py:Solr.get",
+            "openlibrary/utils/solr.py:Solr.get_many",
+            "openlibrary/utils/solr.py:Solr.select"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:51-92",
+            "openlibrary/solr/update_work.py:1509-1513",
+            "openlibrary/plugins/worksearch/search.py:1-14",
+            "openlibrary/plugins/worksearch/code.py:50-56",
+            "openlibrary/plugins/worksearch/code.py:108-126",
+            "openlibrary/plugins/worksearch/code.py:232-236",
+            "openlibrary/plugins/worksearch/code.py:249-280",
+            "openlibrary/utils/solr.py:20-25",
+            "openlibrary/utils/solr.py:37-52",
+            "openlibrary/utils/solr.py:53-70",
+            "openlibrary/utils/solr.py:115-144"
+          ],
+          "call_chain_context": [
+            "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> infogami.config.load/config.load_config",
+            "openlibrary/plugins/worksearch/code.py:run_solr_query -> execute_solr_query -> get_solr (openlibrary/plugins/worksearch/search.py) -> Solr.raw_request (openlibrary/utils/solr.py)"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:63-67 sets solr_base_url from config.runtime_config['plugin_worksearch']['solr_base_url'] when cache unset",
+            "openlibrary/solr/update_work.py:82-85 sets solr_next from config.runtime_config['plugin_worksearch'].get('solr_next', False) when cache unset",
+            "openlibrary/plugins/worksearch/search.py:11-13 reads config.plugin_worksearch.get('solr_base_url') to construct cached _ACTIVE_SOLR",
+            "openlibrary/plugins/worksearch/code.py:51-55 computes solr_select_url from config.plugin_worksearch.get('solr_base_url', 'localhost')"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "Broad rewrite rule (config centralization): replace direct reads of Solr base_url / solr_next from `config.runtime_config['plugin_worksearch']...` in `openlibrary/solr/update_work.py` and from `config.plugin_worksearch...` in the worksearch plugin with a single canonical utility getter that applies consistent defaulting/caching and is used by both the CLI updater and worksearch (including `solr_select_url` derivation)."
+          ],
+          "dependency_propagation": [
+            "update_work.py getters depend on config.runtime_config being populated by config.load/config.load_config in update_work.load_config() (openlibrary/solr/update_work.py:1509-1513)",
+            "worksearch uses config.plugin_worksearch and caches a Solr instance independently (openlibrary/plugins/worksearch/search.py:9-14), and derives solr_select_url separately (openlibrary/plugins/worksearch/code.py:50-56)"
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "update_work.get_solr_base_url unconditionally indexes config.runtime_config['plugin_worksearch']['solr_base_url'] if solr_base_url is falsy, so missing config section/key triggers KeyError (openlibrary/solr/update_work.py:63-67).",
+            "update_work.get_solr_next assumes config.runtime_config['plugin_worksearch'] exists; missing section triggers KeyError before defaulting to False (openlibrary/solr/update_work.py:82-85).",
+            "openlibrary.utils.solr.Solr.get/get_many/select call .json() directly on responses and do not catch request/network/JSON errors (openlibrary/utils/solr.py:45-52, 62-70, 115-119)."
+          ],
+          "behavioral_constraints": [
+            "update_work.py caches solr_base_url/solr_next in module-level globals; once set, subsequent calls reuse cached values (openlibrary/solr/update_work.py:51-68, 76-86).",
+            "worksearch/search.py caches the Solr client instance in a module-level global _ACTIVE_SOLR (openlibrary/plugins/worksearch/search.py:6-14)."
+          ],
+          "backward_compatibility": [
+            "Worksearch code expects get_solr() to return an openlibrary.utils.solr.Solr instance (openlibrary/plugins/worksearch/search.py:9-14).",
+            "update_work.py expects get_solr_base_url()/get_solr_next() to be callable without args and to consult config via load_config() (openlibrary/solr/update_work.py:55-86, 1509-1513)."
+          ],
+          "similar_implementation_patterns": [
+            "Worksearch layer provides a defensive pattern for HTTP-level failures: execute_solr_query catches requests.HTTPError after raise_for_status and returns None (openlibrary/plugins/worksearch/code.py:117-123); SearchResponse.from_solr_result maps None/error to docs=[] (openlibrary/plugins/worksearch/code.py:255-263)."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 1979,
+        "end": 2294,
+        "text": "- Utility functions like `get_solr_base_url`, `set_solr_base_url`, `get_solr_next`, `set_solr_next`, and `load_config` should be organized in a way that enables reliable initialization and retrieval of Solr connection parameters and configuration flags, even when Solr is unavailable or returns error responses.\\n\\n"
+      },
+      "parent_contract_id": "contract-002",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [
+        "get_solr_base_url",
+        "set_solr_base_url",
+        "get_solr_next",
+        "set_solr_next",
+        "load_config"
+      ],
+      "source_block_hash": "bd3de49128d583b51d8597974a40689b6a327280d696bdb631166cf1dc2e48e4"
+    },
+    {
+      "id": "req-003",
+      "text": "- The class `SolrUpdateState` and related Solr update helper logic are required to be accessible throughout the codebase without causing import dependencies, and should provide mechanisms to serialize update requests, clear update operations, and combine multiple update states safely.\\n\\n",
+      "origin": "requirements",
+      "verdict": "TO_BE_PARTIAL",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1249-1294",
+        "openlibrary/solr/update_work.py:1415-1489",
+        "openlibrary/tests/solr/test_update_work.py:8-19",
+        "openlibrary/solr/__init__.py:1-1"
+      ],
+      "findings": "`SolrUpdateState` is present in `openlibrary/solr/update_work.py` as a dataclass holding `keys`, `adds`, `deletes`, and `commit`, and it implements (a) combination via `__add__` (concatenating lists and OR-ing `commit`), (b) request serialization via `to_solr_requests_json(...)`, and (c) clearing queued requests via `clear_requests()`. It is also actively used as the accumulator type in the `update_keys(...)` pipeline (initialized as `net_update`, per-updater `update_state`, accumulated via `+=`, and returned).\n\nThe remaining part of the requirement about being “accessible throughout the codebase without causing import dependencies” is not evidently satisfied by the current structure: `SolrUpdateState` lives inside the large `openlibrary/solr/update_work.py` module, and `openlibrary/solr/__init__.py` is empty (no re-export). In the visible test code, consumers import `SolrUpdateState` directly from `openlibrary.solr.update_work`, which couples them to that heavyweight module path rather than a lightweight/shared access point.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:SolrUpdateState",
+            "openlibrary/solr/update_work.py:update_keys",
+            "openlibrary/tests/solr/test_update_work.py"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1249-1294",
+            "openlibrary/solr/update_work.py:1415-1489",
+            "openlibrary/tests/solr/test_update_work.py:8-19",
+            "openlibrary/solr/__init__.py:1-1"
+          ],
+          "call_chain_context": [
+            "update_keys -> (per updater) updater.update_key -> returns SolrUpdateState -> update_state += ... -> net_update += update_state -> return net_update",
+            "openlibrary/tests/solr/test_update_work.py imports SolrUpdateState from openlibrary.solr.update_work"
+          ],
+          "dataflow_relevant_uses": [
+            "SolrUpdateState.__add__: returns new SolrUpdateState with adds/deletes/keys concatenated and commit OR-ed (openlibrary/solr/update_work.py:1263-1270)",
+            "update_keys: net_update and update_state are accumulated with '+=' (openlibrary/solr/update_work.py:1447-1487)",
+            "SolrUpdateState.to_solr_requests_json: emits JSON-ish payload for deletes/adds/commit (openlibrary/solr/update_work.py:1277-1289)",
+            "SolrUpdateState.clear_requests: clears adds/deletes lists in-place (openlibrary/solr/update_work.py:1291-1293)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [
+            "openlibrary/tests/solr/test_update_work.py imports SolrUpdateState from openlibrary.solr.update_work (openlibrary/tests/solr/test_update_work.py:10-19)",
+            "openlibrary/solr/__init__.py is empty, providing no package-level re-export access point (openlibrary/solr/__init__.py:1-1)"
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [
+            "Dataclass-based state container with operator overloading used as an accumulator across an async multi-updater pipeline (openlibrary/solr/update_work.py:1249-1270, 1447-1487)"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 2294,
+        "end": 2583,
+        "text": "- The class `SolrUpdateState` and related Solr update helper logic are required to be accessible throughout the codebase without causing import dependencies, and should provide mechanisms to serialize update requests, clear update operations, and combine multiple update states safely.\\n\\n"
+      },
+      "parent_contract_id": "contract-003",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [
+        "SolrUpdateState"
+      ],
+      "source_block_hash": "5247222b368a717c008917493cfb4a1b50d9723255e68da451979621ccef1430"
+    },
+    {
+      "id": "req-004",
+      "text": "- Any Solr insert or update operations, such as `solr_insert_documents` and `solr_update`, should be callable from scripts and modules that interact with Solr, and should be able to properly handle various Solr response scenarios including success, service unavailability, invalid requests, network errors, and partial failures in batch updates.\\n\\n",
+      "origin": "requirements",
+      "verdict": "TO_BE_PARTIAL",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:922-944",
+        "openlibrary/solr/update_work.py:1010-1075",
+        "scripts/solr_builder/solr_builder/index_subjects.py:1-54",
+        "openlibrary/tests/solr/test_update_work.py:751-889"
+      ],
+      "findings": "Verified in `openlibrary/solr/update_work.py` that there are two Solr write entrypoints with materially different robustness:\n\n- `solr_update()` (sync) wraps its POST in a `RetryStrategy` over `HTTPStatusError`, `TimeoutException`, and `HTTPError`, and has special handling for HTTP 400: it parses the JSON body, logs per-document failures from `responseHeader.errors` and global failures from `error`, and only calls `raise_for_status()` for 400s that don’t match either expected error shape. Non-400 statuses are handled via `raise_for_status()` and therefore trigger retry via the exception types listed above.\n- `solr_insert_documents()` (async) simply posts JSON to `/update` via `httpx.AsyncClient.post(...)` and then calls `resp.raise_for_status()` with no retry/backoff and no parsing/logging of Solr’s 400 error JSON shapes.\n\nRepo tests cover the `solr_update()` behavior for 200 success, 503 non-JSON response (retries), Solr offline connection errors (retries), and 400 responses with either global error or individual errors (no retry). There are no analogous scenario-handling tests/logic for `solr_insert_documents()`. Therefore, only the `solr_update()` path satisfies the scenario-handling expectations as implemented; the `solr_insert_documents()` path remains missing those behaviors, making this requirement only partially met as-is.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:solr_insert_documents",
+            "openlibrary/solr/update_work.py:solr_update",
+            "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:922-944",
+            "openlibrary/solr/update_work.py:1010-1075",
+            "scripts/solr_builder/solr_builder/index_subjects.py:1-54",
+            "openlibrary/tests/solr/test_update_work.py:751-889"
+          ],
+          "call_chain_context": [
+            "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects -> openlibrary.solr.update_work:solr_insert_documents"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:1015 content=update_request.to_solr_requests_json() -> httpx.post(..., content=content) (openlibrary/solr/update_work.py:1028-1035)",
+            "openlibrary/solr/update_work.py:923 documents -> json.dumps(documents) -> AsyncClient.post(..., content=...) (openlibrary/solr/update_work.py:936-942)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`solr_update` only performs JSON-body error-shape inspection on HTTP 400; other statuses rely on `raise_for_status()` and exception-driven retry (openlibrary/solr/update_work.py:1037-1054,1055-1073).",
+            "`solr_insert_documents` performs no retry/backoff and no 400-body inspection; it always raises on any non-2xx via `resp.raise_for_status()` (openlibrary/solr/update_work.py:935-944)."
+          ],
+          "behavioral_constraints": [
+            "`solr_update` posts with `update.chain=tolerant-chain` and logs individual errors without failing the whole batch when `responseHeader.errors` is present (openlibrary/solr/update_work.py:1018-1044).",
+            "`solr_update` retries up to 5 times with delay=8 for `HTTPStatusError`/`TimeoutException`/`HTTPError` exceptions (openlibrary/solr/update_work.py:1065-1074)."
+          ],
+          "backward_compatibility": [
+            "`solr_update(update_request, skip_id_check=False, solr_base_url=None) -> None` is directly exercised by tests; its current retry/no-retry behavior for the tested scenarios is part of the existing contract (openlibrary/tests/solr/test_update_work.py:823-889; openlibrary/solr/update_work.py:1010-1075).",
+            "`solr_insert_documents(documents, solr_base_url=None, skip_id_check=False)` is awaited by the subject indexing script; current behavior is to raise exceptions on non-2xx (scripts/solr_builder/solr_builder/index_subjects.py:49-53; openlibrary/solr/update_work.py:922-944)."
+          ],
+          "similar_implementation_patterns": [
+            "Sync POST wrapped by RetryStrategy around an inner make_request() closure (openlibrary/solr/update_work.py:1025-1073)",
+            "HTTP 400 parsing of Solr JSON for per-document errors (`responseHeader.errors`) and global error (`error`) (openlibrary/solr/update_work.py:1037-1053)"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 2583,
+        "end": 2932,
+        "text": "- Any Solr insert or update operations, such as `solr_insert_documents` and `solr_update`, should be callable from scripts and modules that interact with Solr, and should be able to properly handle various Solr response scenarios including success, service unavailability, invalid requests, network errors, and partial failures in batch updates.\\n\\n"
+      },
+      "parent_contract_id": "contract-004",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [
+        "solr_insert_documents",
+        "solr_update"
+      ],
+      "source_block_hash": "c507b355a7881bf7a4e038625277f9c5592115884dc122d3854b2266984cb56a"
+    },
+    {
+      "id": "req-005",
+      "text": "- References to Solr utilities in other modules, including edition and subject indexing, are expected to rely on the new utility module to avoid direct dependencies on core update logic, ensuring separation of concerns and easier future extensions.\\n\\n",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "scripts/solr_builder/solr_builder/index_subjects.py:8-54",
+        "openlibrary/solr/update_edition.py:194-194",
+        "openlibrary/plugins/worksearch/subjects.py:14-15",
+        "openlibrary/plugins/worksearch/subjects.py:219-240"
+      ],
+      "findings": "There is no “new utility module” abstraction layer for Solr utilities; multiple modules continue to import and depend directly on core Solr update/indexing logic in `openlibrary/solr/update_work.py`.\n\nConcrete examples:\n- Subject indexing in the solr-builder script imports `build_subject_doc` and `solr_insert_documents` directly from `openlibrary.solr.update_work`, which couples subject indexing to the main update/index implementation.\n- `openlibrary/solr/update_edition.py` imports `get_solr_next` from `openlibrary.solr.update_work`, again creating a direct dependency on the core update module.\n\nWhile there *is* a separate Solr query-string utility module (`openlibrary/solr/query_utils.py`) used by subject browsing/search (`openlibrary/plugins/worksearch/subjects.py`), this does not address the requirement’s intent about other modules (including subject/edition indexing) relying on a new utility module instead of core update logic.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "scripts/solr_builder/solr_builder/index_subjects.py:index_subjects",
+            "openlibrary/solr/update_work.py:build_subject_doc",
+            "openlibrary/solr/update_work.py:solr_insert_documents",
+            "openlibrary/solr/update_edition.py (import of get_solr_next)"
+          ],
+          "exact_code_regions": [
+            "scripts/solr_builder/solr_builder/index_subjects.py:1-64",
+            "openlibrary/solr/update_edition.py:190-200",
+            "openlibrary/plugins/worksearch/subjects.py:12-16",
+            "openlibrary/plugins/worksearch/subjects.py:209-244"
+          ],
+          "call_chain_context": [
+            "scripts.solr_builder.solr_builder.index_subjects.index_subjects -> openlibrary.solr.update_work.build_subject_doc",
+            "scripts.solr_builder.solr_builder.index_subjects.index_subjects -> openlibrary.solr.update_work.solr_insert_documents",
+            "openlibrary.plugins.worksearch.subjects.SubjectEngine.get_subject -> openlibrary.plugins.worksearch.code.run_solr_query -> (solr query pipeline)"
+          ],
+          "dataflow_relevant_uses": [
+            "SubjectEngine.get_subject builds query via openlibrary.solr.query_utils.query_dict_to_str -> passed as params['q'] into run_solr_query (openlibrary/plugins/worksearch/subjects.py:231-244)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [
+            "Indexing scripts depend on openlibrary.solr.update_work symbols (build_subject_doc/solr_insert_documents), making those symbols part of a wider coupling surface: scripts/solr_builder/solr_builder/index_subjects.py:8-54"
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Subject browsing/search uses query utilities (query_dict_to_str) but subject *indexing* uses update_work directly; no intermediate module boundary exists for indexing helpers (scripts/solr_builder/solr_builder/index_subjects.py:8-54)."
+          ],
+          "behavioral_constraints": [
+            "Solr base URL and schema/version behavior is centralized in openlibrary.solr.update_work (e.g., get_solr_next and config loading), and other modules rely on these globals/functions by importing from update_work (openlibrary/solr/update_edition.py:194)."
+          ],
+          "backward_compatibility": [
+            "These functions are currently imported as public module-level symbols: build_subject_doc/solr_insert_documents from openlibrary.solr.update_work are used by scripts/solr_builder/solr_builder/index_subjects.py:8-54; changing/removing them would break that script."
+          ],
+          "similar_implementation_patterns": [
+            "Existing separation for query utilities: openlibrary/solr/query_utils.py is imported by openlibrary/plugins/worksearch/subjects.py:14-15"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 2932,
+        "end": 3184,
+        "text": "- References to Solr utilities in other modules, including edition and subject indexing, are expected to rely on the new utility module to avoid direct dependencies on core update logic, ensuring separation of concerns and easier future extensions.\\n\\n"
+      },
+      "parent_contract_id": "contract-005",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "4d6965d02a8b2e9d44bcaad74d31418ba56477e877abcca754c5bb9d46e5ed1a"
+    },
+    {
+      "id": "req-006",
+      "text": "- Configuration values and logic for determining Solr behaviors (like which Solr instance or schema version to use) should be managed consistently and transparently across the application, making sure that configuration changes propagate reliably and that error states are handled gracefully.\"",
+      "origin": "requirements",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/plugins/worksearch/search.py:6-14",
+        "openlibrary/solr/update_work.py:51-87",
+        "openlibrary/solr/update_work.py:1509-1513",
+        "openlibrary/plugins/worksearch/code.py:108-126",
+        "openlibrary/utils/solr.py:37-52",
+        "openlibrary/utils/solr.py:53-70"
+      ],
+      "findings": "Verified split/duplicated Solr configuration paths and caching semantics:\n\n- Worksearch runtime uses `infogami.config.plugin_worksearch['solr_base_url']` and caches a module-level singleton `Solr` instance in `_ACTIVE_SOLR`. After the first `get_solr()` call, changes to `config.plugin_worksearch.solr_base_url` will not be reflected because `_ACTIVE_SOLR` is never invalidated/refreshed.\n\n- The Solr updater/indexing code path uses a separate configuration store, `openlibrary.config.runtime_config['plugin_worksearch']`, and initializes it via `load_config()` which calls BOTH `config.load()` (deprecated legacy loader populating `runtime_config`) and `config.load_config()` (infogami loader populating `infogami.config`). This creates dual configuration sources for the same Solr settings (`solr_base_url`, `solr_next`).\n\n- `solr_next` is likewise read from `config.runtime_config['plugin_worksearch']` and cached in a module global (`solr_next`) on first use, reinforcing the pattern of multiple stores + one-time caching.\n\nAlso verified: `execute_solr_query` catches `requests.HTTPError` and returns `None` (after logging), while the `Solr` wrapper methods `get()`/`get_many()` directly call `.json()` on the response without checking HTTP status, meaning request failure behavior differs depending on which API surface is used.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/plugins/worksearch/search.py:get_solr",
+            "openlibrary/plugins/worksearch/search.py:_ACTIVE_SOLR",
+            "openlibrary/solr/update_work.py:get_solr_base_url",
+            "openlibrary/solr/update_work.py:get_solr_next",
+            "openlibrary/solr/update_work.py:load_config",
+            "openlibrary/config.py:runtime_config",
+            "openlibrary/config.py:load",
+            "openlibrary/utils/solr.py:Solr.get",
+            "openlibrary/utils/solr.py:Solr.get_many"
+          ],
+          "exact_code_regions": [
+            "openlibrary/plugins/worksearch/search.py:6-14",
+            "openlibrary/solr/update_work.py:51-92",
+            "openlibrary/solr/update_work.py:1509-1513",
+            "openlibrary/plugins/worksearch/code.py:108-126",
+            "openlibrary/utils/solr.py:37-52",
+            "openlibrary/utils/solr.py:53-70",
+            "openlibrary/config.py:10-40",
+            "conf/openlibrary.yml:50-54"
+          ],
+          "call_chain_context": [
+            "openlibrary/plugins/worksearch/code.py:execute_solr_query -> openlibrary/plugins/worksearch/search.py:get_solr -> openlibrary/utils/solr.py:Solr.raw_request",
+            "openlibrary/solr/update_work.py:get_solr_base_url/get_solr_next -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config"
+          ],
+          "dataflow_relevant_uses": [
+            "conf/openlibrary.yml:50-54 plugin_worksearch.solr_base_url -> infogami.config.plugin_worksearch (consumed in openlibrary/plugins/worksearch/search.py:12-13 and openlibrary/plugins/worksearch/code.py:51-53)",
+            "conf/openlibrary.yml:50-54 plugin_worksearch.solr_base_url/solr_next -> openlibrary.config.runtime_config['plugin_worksearch'] (consumed in openlibrary/solr/update_work.py:66-67 and 84-85)",
+            "openlibrary/plugins/worksearch/search.py:11-14 caches Solr(base_url) into _ACTIVE_SOLR and reuses it for subsequent calls"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [
+            "Same conceptual Solr settings are sourced from two different config stores depending on code path: `infogami.config.plugin_worksearch` (worksearch/web) vs `openlibrary.config.runtime_config['plugin_worksearch']` (solr updater), with additional module-global caching on both paths (openlibrary/plugins/worksearch/search.py:6-14, openlibrary/solr/update_work.py:51-87, 1509-1513)."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Worksearch `get_solr()` is effectively one-time configured per process: once `_ACTIVE_SOLR` is set, later changes to `config.plugin_worksearch['solr_base_url']` do not take effect (openlibrary/plugins/worksearch/search.py:9-14).",
+            "Updater `get_solr_base_url()` caches `solr_base_url` once populated from `config.runtime_config` and will not re-read config unless the global is cleared (openlibrary/solr/update_work.py:55-68).",
+            "Updater `get_solr_next()` caches `solr_next` once populated from `config.runtime_config` and will not re-read config unless the global is reset (openlibrary/solr/update_work.py:76-87)."
+          ],
+          "behavioral_constraints": [
+            "`execute_solr_query` returns `None` on `requests.HTTPError` and logs; callers must tolerate the `None` path (openlibrary/plugins/worksearch/code.py:108-126)."
+          ],
+          "backward_compatibility": [
+            "`openlibrary.plugins.worksearch.search.get_solr()` currently returns a cached singleton `Solr`; callers may rely on repeated calls being cheap and returning the same instance (openlibrary/plugins/worksearch/search.py:6-14).",
+            "`execute_solr_query` currently suppresses `requests.HTTPError` and returns `None`; changing it to raise would alter observable behavior (openlibrary/plugins/worksearch/code.py:108-126)."
+          ],
+          "similar_implementation_patterns": [],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 3184,
+        "end": 3477,
+        "text": "- Configuration values and logic for determining Solr behaviors (like which Solr instance or schema version to use) should be managed consistently and transparently across the application, making sure that configuration changes propagate reliably and that error states are handled gracefully.\""
+      },
+      "parent_contract_id": "contract-006",
+      "contract_kind": "behavior",
+      "explicit_paths": [],
+      "explicit_symbols": [],
+      "source_block_hash": "c54886d5db84feae4c2e856b40829d2b879f42d16f341adaf4a6bd6fd988a2a2"
+    },
+    {
+      "id": "req-007",
+      "text": "Type: New Public Class \\n\\nName: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nDescription: Dataclass that manages Solr update operations including keys, documents to add, records to delete, and commit status; provides methods for merging, clearing, and serializing update states.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1249-1295",
+        "openlibrary/solr/update_work.py:1415-1490"
+      ],
+      "findings": "A `SolrUpdateState` dataclass does exist, but it is defined in `openlibrary/solr/update_work.py`, not at the required path `openlibrary/solr/utils.py` (that file is absent). The existing class partially matches the described responsibilities (tracks `keys`, `adds`, `deletes`, `commit`; supports merging via `__add__`; supports clearing via `clear_requests`; supports serialization to Solr JSON update format via `to_solr_requests_json`). However, it does not satisfy the interface requirement as stated because it is not located at `openlibrary/solr/utils.py` and the required module path/class location contract is therefore not met.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:SolrUpdateState (dataclass)",
+            "openlibrary/solr/update_work.py:update_keys (uses/returns SolrUpdateState)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1249-1295",
+            "openlibrary/solr/update_work.py:1415-1490"
+          ],
+          "call_chain_context": [
+            "update_keys -> updater.update_key -> (returns SolrUpdateState) -> update_state += ... -> _solr_update(update_state) using to_solr_requests_json/solr_update"
+          ],
+          "dataflow_relevant_uses": [
+            "SolrUpdateState(keys/adds/deletes/commit) constructed in update_keys and updater.update_key; merged via __add__ and += in update_keys; serialized via to_solr_requests_json in update_keys (print/pprint modes)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`has_changes()` only considers `adds`/`deletes` (not `keys`/`commit`) when deciding whether there are changes to apply.",
+            "`to_solr_requests_json()` emits a handcrafted JSON-ish string with repeated \"add\" keys for each doc (intended for Solr update semantics), not a single JSON array structure."
+          ],
+          "behavioral_constraints": [
+            "`__add__` merges lists by concatenation and `commit` by boolean OR; callers rely on `+=` accumulating updates without mutating RHS.",
+            "`clear_requests()` clears only `adds` and `deletes` (leaves `keys` and `commit` intact)."
+          ],
+          "backward_compatibility": [
+            "Existing imports/tests currently import `SolrUpdateState` from `openlibrary.solr.update_work` (e.g., test suite). Relocating without a compatible re-export would break these call sites."
+          ],
+          "similar_implementation_patterns": [
+            "`SolrUpdateState` in openlibrary/solr/update_work.py is the in-repo implementation pattern for an update-state accumulator/merger/serializer."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 3739,
+        "end": 4031,
+        "text": "Type: New Public Class \\n\\nName: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nDescription: Dataclass that manages Solr update operations including keys, documents to add, records to delete, and commit status; provides methods for merging, clearing, and serializing update states.\\n\\n"
+      },
+      "parent_contract_id": "contract-007",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Class",
+        "SolrUpdateState"
+      ],
+      "source_block_hash": "784c219e412111fbfe01943a8dce99b68d6daff6931562369104d36ca7f0eeda"
+    },
+    {
+      "id": "req-008",
+      "text": "Type: New Public Function\\n\\nName: load_config\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: c_config='conf/openlibrary.yml'\\n\\nOutput: None\\n\\nDescription: Loads the Open Library runtime configuration if it has not been loaded yet.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1509-1513",
+        "openlibrary/solr/update_work.py:55-68",
+        "openlibrary/solr/update_work.py:76-86",
+        "scripts/solr_updater.py:213-236",
+        "scripts/solr_updater.py:243-291",
+        "openlibrary/solr/update_edition.py:186-214"
+      ],
+      "findings": "Verified: there is currently **no** module at `openlibrary/solr/utils.py` in the repo, so the required API surface `openlibrary.solr.utils.load_config(c_config='conf/openlibrary.yml')` is not implemented at the specified path.\n\nInstead, a same-named function already exists in `openlibrary/solr/update_work.py`:\n- `openlibrary/solr/update_work.py:load_config(c_config='conf/openlibrary.yml')` performs a lazy one-time load by checking `if not config.runtime_config:` and then calling both `openlibrary.config.load(c_config)` (legacy runtime_config population) and `openlibrary.config.load_config(c_config)` (infogami/global config load).\n\nThere are multiple verified in-repo call sites currently depending on this config-loading behavior:\n- `openlibrary/solr/update_work.py:get_solr_base_url()` calls `load_config()` before reading `config.runtime_config['plugin_worksearch']['solr_base_url']`.\n- `openlibrary/solr/update_work.py:get_solr_next()` calls `load_config()` before reading `config.runtime_config['plugin_worksearch'].get('solr_next', False)`.\n- `scripts/solr_updater.py:update_keys()` calls `update_work.load_configs(args['ol_url'], args['ol_config'], 'default')`.\n- `scripts/solr_updater.py:main()` calls `load_config(ol_config)` where `load_config` is imported from `openlibrary.config` (direct use of config loader outside `update_work`).\n- `openlibrary/solr/update_edition.py:build_edition_data()` imports and calls `get_solr_next` from `openlibrary.solr.update_work`, indirectly depending on `update_work`’s lazy config load.\n\nTherefore, the requirement (new canonical `openlibrary/solr/utils.py` module + `load_config` function at that path) is violated as-is; existing behavior lives in `openlibrary/solr/update_work.py` and is relied upon by multiple modules/scripts.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:load_config",
+            "openlibrary/solr/update_work.py:load_configs",
+            "openlibrary/solr/update_work.py:get_solr_base_url",
+            "openlibrary/solr/update_work.py:get_solr_next",
+            "scripts/solr_updater.py:update_keys",
+            "scripts/solr_updater.py:main",
+            "openlibrary/solr/update_edition.py:build_edition_data",
+            "openlibrary/config.py:load",
+            "openlibrary/config.py:load_config"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:55-92",
+            "openlibrary/solr/update_work.py:1509-1535",
+            "scripts/solr_updater.py:213-236",
+            "scripts/solr_updater.py:243-291",
+            "openlibrary/solr/update_edition.py:186-214",
+            "openlibrary/config.py:10-43"
+          ],
+          "call_chain_context": [
+            "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config",
+            "openlibrary/solr/update_work.py:get_solr_next -> openlibrary/solr/update_work.py:load_config -> openlibrary/config.py:load + openlibrary/config.py:load_config",
+            "scripts/solr_updater.py:update_keys -> openlibrary.solr.update_work.load_configs -> openlibrary.solr.update_work.load_config",
+            "scripts/solr_updater.py:main -> openlibrary.config.load_config (direct call)",
+            "openlibrary/solr/update_edition.py:build_edition_data -> (local import) openlibrary.solr.update_work.get_solr_next -> openlibrary/solr/update_work.py:load_config"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:1509-1513 `load_config` populates `openlibrary.config.runtime_config` via `config.load(c_config)` and global infogami config via `config.load_config(c_config)` once `runtime_config` is empty",
+            "openlibrary/solr/update_work.py:63-67 `get_solr_base_url` reads `config.runtime_config['plugin_worksearch']['solr_base_url']` after invoking `load_config()`",
+            "openlibrary/solr/update_work.py:82-85 `get_solr_next` reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)` after invoking `load_config()`",
+            "scripts/solr_updater.py:289-291 calls `load_config(ol_config)` (imported from `openlibrary.config`)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "Canonicalization/adoption rule (broad rewrite): introduce `openlibrary/solr/utils.py` to own Solr-related config initialization and expose `load_config(c_config='conf/openlibrary.yml')` there; then update in-repo Solr-related call sites which currently invoke `openlibrary.solr.update_work.load_config/load_configs` or directly call `openlibrary.config.load_config` (as in `scripts/solr_updater.py`) to use the canonical `openlibrary.solr.utils.load_config` entrypoint so config initialization is centralized."
+          ],
+          "dependency_propagation": [
+            "`openlibrary/solr/update_work.py` consumers depend on `openlibrary.config.runtime_config` being populated before accessing `runtime_config['plugin_worksearch']...` (openlibrary/solr/update_work.py:55-86); the existing `update_work.load_config` achieves this by calling both `openlibrary.config.load` and `openlibrary.config.load_config` (openlibrary/solr/update_work.py:1509-1513; openlibrary/config.py:13-43).",
+            "`scripts/solr_updater.py` currently initializes config via `openlibrary.config.load_config(ol_config)` in `main` (scripts/solr_updater.py:289-291) while also calling `update_work.load_configs(args['ol_url'], args['ol_config'], 'default')` inside `update_keys` (scripts/solr_updater.py:213-236), so config loading is currently split across entrypoints."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [
+            "Existing lazy-load pattern: `openlibrary/solr/update_work.py:load_config` guards on `if not config.runtime_config:` (openlibrary/solr/update_work.py:1509-1513).",
+            "Dual loader pattern: `openlibrary/config.py:load` populates `runtime_config`, while `openlibrary/config.py:load_config` loads infogami/global config and updates server config (openlibrary/config.py:13-43)."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 4031,
+        "end": 4266,
+        "text": "Type: New Public Function\\n\\nName: load_config\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: c_config='conf/openlibrary.yml'\\n\\nOutput: None\\n\\nDescription: Loads the Open Library runtime configuration if it has not been loaded yet.\\n\\n"
+      },
+      "parent_contract_id": "contract-008",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py",
+        "conf/openlibrary.yml"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "load_config"
+      ],
+      "source_block_hash": "3965c8678bde21791546bb5561675bc6fa8768a50462fa881c6550f65886c0e9"
+    },
+    {
+      "id": "req-009",
+      "text": "Type: New Public Function\\n\\nName: get_solr_base_url\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: None\\n\\nOutput: str\\n\\nDescription: Returns the Solr base URL from the loaded configuration.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "TO_BE_MISSING",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:55-68",
+        "openlibrary/solr/update_work.py:1509-1513"
+      ],
+      "findings": "`openlibrary/solr/utils.py` is not present in the repository (no such file under `openlibrary/solr/`), so the requirement’s specified module location for `get_solr_base_url()` is missing as-is.\n\nA function named `get_solr_base_url()` does exist today, but it is implemented in `openlibrary/solr/update_work.py`. That implementation calls `load_config()`, reads `config.runtime_config['plugin_worksearch']['solr_base_url']` on first use (cached in a module-global `solr_base_url`), and returns the cached value thereafter.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:get_solr_base_url",
+            "openlibrary/solr/update_work.py:load_config",
+            "openlibrary/solr/update_work.py:solr_base_url",
+            "infogami.config.runtime_config (referenced via `from infogami import config`)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:55-68",
+            "openlibrary/solr/update_work.py:1509-1513"
+          ],
+          "call_chain_context": [
+            "openlibrary/solr/update_work.py:get_solr_base_url -> openlibrary/solr/update_work.py:load_config -> infogami.config.load / infogami.config.load_config"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:51 defines module-global `solr_base_url` -> openlibrary/solr/update_work.py:65-68 initializes it from `config.runtime_config['plugin_worksearch']['solr_base_url']` -> openlibrary/solr/update_work.py:68 returns it",
+            "openlibrary/solr/update_work.py:1509-1513 `load_config()` populates `config.runtime_config` by calling `config.load()` and `config.load_config()` when empty"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py:55-68 implements `get_solr_base_url()` via config load + read of `config.runtime_config['plugin_worksearch']['solr_base_url']`",
+            "openlibrary/plugins/worksearch/search.py:9-14 reads `config.plugin_worksearch.get('solr_base_url')` to construct a Solr client",
+            "openlibrary/plugins/worksearch/code.py:50-53 builds `solr_select_url` from `config.plugin_worksearch.get('solr_base_url', 'localhost')`"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 4266,
+        "end": 4460,
+        "text": "Type: New Public Function\\n\\nName: get_solr_base_url\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: None\\n\\nOutput: str\\n\\nDescription: Returns the Solr base URL from the loaded configuration.\\n\\n"
+      },
+      "parent_contract_id": "contract-009",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "get_solr_base_url"
+      ],
+      "source_block_hash": "45635315f1b0afce83914900ce560c3fa30244544365fa26e35d55f352f9b604"
+    },
+    {
+      "id": "req-010",
+      "text": "Type: New Public Function\\n\\nName: set_solr_base_url\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: solr_url: str\\n\\nOutput: None\\n\\nDescription: Sets the Solr base URL in the module's internal state.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "TO_BE_MISSING",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:51-74",
+        "scripts/solr_updater.py:279-288",
+        "scripts/solr_builder/solr_builder/solr_builder.py:409-411"
+      ],
+      "findings": "Verified: `openlibrary/solr/utils.py` does not exist in the repository, and there is no module `openlibrary.solr.utils` providing `set_solr_base_url`. A function `set_solr_base_url(solr_url: str)` currently exists in `openlibrary/solr/update_work.py` and sets the module-level global `solr_base_url`. Current callers invoke it via `openlibrary.solr.update_work.set_solr_base_url(...)` (e.g., `scripts/solr_updater.py` and `scripts/solr_builder/.../solr_builder.py`), so the requirement of having the function at the specific new module path `openlibrary/solr/utils.py` is not satisfied as-is.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:solr_base_url",
+            "openlibrary/solr/update_work.py:get_solr_base_url",
+            "openlibrary/solr/update_work.py:set_solr_base_url",
+            "scripts/solr_updater.py (calls update_work.set_solr_base_url)",
+            "scripts/solr_builder/solr_builder/solr_builder.py (calls update_work.set_solr_base_url)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:51-74",
+            "scripts/solr_updater.py:279-288",
+            "scripts/solr_builder/solr_builder/solr_builder.py:409-411",
+            "openlibrary/solr/update_work.py:1568-1574"
+          ],
+          "call_chain_context": [
+            "scripts/solr_updater.py:main -> openlibrary.solr.update_work.set_solr_base_url",
+            "scripts/solr_builder/solr_builder/solr_builder.py:index -> openlibrary.solr.update_work.set_solr_base_url",
+            "openlibrary/solr/update_work.py:main -> set_solr_base_url"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:71-73 set_solr_base_url(solr_url) assigns module global solr_base_url",
+            "openlibrary/solr/update_work.py:55-68 get_solr_base_url() reads solr_base_url and loads from config if unset",
+            "scripts/solr_updater.py:284-285 passes solr_url -> update_work.set_solr_base_url(solr_url)",
+            "scripts/solr_builder/solr_builder/solr_builder.py:409-410 passes solr -> update_work.set_solr_base_url(solr)",
+            "openlibrary/solr/update_work.py:1571-1572 main() passes solr_base -> set_solr_base_url(solr_base)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If a new canonical setter is introduced at openlibrary/solr/utils.py:set_solr_base_url, then references to openlibrary.solr.update_work.set_solr_base_url in scripts (and any other callers) must be updated OR update_work must delegate/re-export to preserve existing imports while adopting the new module path."
+          ],
+          "dependency_propagation": [
+            "The Solr base URL state is currently stored as a module-global `solr_base_url` in openlibrary/solr/update_work.py; any new utils module would need to either own that state or consistently delegate to the existing state holder to avoid divergent Solr base URL sources."
+          ],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [],
+          "behavioral_constraints": [],
+          "backward_compatibility": [],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py:55-68 get_solr_base_url() implements lazy config loading + module-level cache",
+            "openlibrary/solr/update_work.py:71-73 set_solr_base_url(solr_url: str) is a simple module-global setter"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 4460,
+        "end": 4662,
+        "text": "Type: New Public Function\\n\\nName: set_solr_base_url\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: solr_url: str\\n\\nOutput: None\\n\\nDescription: Sets the Solr base URL in the module's internal state.\\n\\n"
+      },
+      "parent_contract_id": "contract-010",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "set_solr_base_url"
+      ],
+      "source_block_hash": "88d9b486e5657c2ea723c1df7c6f5b9c0b270fa8ba417ba1c090414e5ecfab20"
+    },
+    {
+      "id": "req-011",
+      "text": "Type: New Public Function\\n\\nName: get_solr_next\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: None\\n\\nOutput: bool\\n\\nDescription: Returns whether the application should use the next Solr schema version, based on configuration.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:76-92",
+        "openlibrary/solr/update_edition.py:186-214"
+      ],
+      "findings": "`get_solr_next()` is implemented in `openlibrary/solr/update_work.py` and reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)` with a module-global cache (`solr_next`). The required module path `openlibrary/solr/utils.py` does not exist in the repository, so there is currently no `openlibrary.solr.utils:get_solr_next` symbol to import. Existing code instead imports `get_solr_next` from `openlibrary.solr.update_work` (e.g., `build_edition_data`), meaning the requirement that `get_solr_next` exist at `openlibrary/solr/utils.py` is not satisfied as-is.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:get_solr_next",
+            "openlibrary/solr/update_work.py:set_solr_next",
+            "openlibrary/solr/update_work.py:solr_next (module global)",
+            "openlibrary/solr/update_edition.py:build_edition_data (imports get_solr_next from update_work)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:60-92",
+            "openlibrary/solr/update_edition.py:186-214"
+          ],
+          "call_chain_context": [
+            "openlibrary.solr.update_edition.build_edition_data -> openlibrary.solr.update_work.get_solr_next"
+          ],
+          "dataflow_relevant_uses": [
+            "config.runtime_config['plugin_worksearch'].get('solr_next', False) -> solr_next (module-global cache) -> return value of get_solr_next()"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "If `solr_next` is `None`, `get_solr_next()` calls `load_config()` and reads `config.runtime_config['plugin_worksearch'].get('solr_next', False)`; otherwise it returns the cached `solr_next` without re-reading config."
+          ],
+          "behavioral_constraints": [
+            "`get_solr_next()` caches into module-global `solr_next`; callers will not observe runtime config changes unless `solr_next` is reset (e.g., via `set_solr_next`)."
+          ],
+          "backward_compatibility": [
+            "Current in-repo callers import `get_solr_next` from `openlibrary.solr.update_work` (e.g., `update_edition.py`); removing/renaming that symbol or changing its behavior would break those imports."
+          ],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py defines paired getter/setter globals: get_solr_base_url()/set_solr_base_url() and get_solr_next()/set_solr_next() (same module-level caching pattern)"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 4662,
+        "end": 4893,
+        "text": "Type: New Public Function\\n\\nName: get_solr_next\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: None\\n\\nOutput: bool\\n\\nDescription: Returns whether the application should use the next Solr schema version, based on configuration.\\n\\n"
+      },
+      "parent_contract_id": "contract-011",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "get_solr_next"
+      ],
+      "source_block_hash": "560e3cb1486bffeec2689b86d92588d6133eafb473a09dfffb38aabc47cf6058"
+    },
+    {
+      "id": "req-012",
+      "text": "Type: New Public Function\\n\\nName: set_solr_next\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: val: bool\\n\\nOutput: None\\n\\nDescription: Sets the internal state to indicate whether to use the next Solr schema version.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:76-92",
+        "openlibrary/solr/update_work.py:1571-1576",
+        "scripts/solr_updater.py:279-288",
+        "openlibrary/solr/update_edition.py:186-214"
+      ],
+      "findings": "`set_solr_next(val: bool)` already exists, but it is implemented in `openlibrary/solr/update_work.py` (paired with `get_solr_next()` and backed by a module-level global `solr_next`). The required module path `openlibrary/solr/utils.py` does not exist in this repository, so there is no `openlibrary.solr.utils.set_solr_next` available at the specified location. Current callers set the flag via `openlibrary.solr.update_work.set_solr_next` (e.g., `scripts/solr_updater.py` and `openlibrary/solr/update_work.py:main`), and other code reads it via `openlibrary.solr.update_work.get_solr_next` (e.g., `openlibrary/solr/update_edition.py`).",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:def set_solr_next",
+            "openlibrary/solr/update_work.py:def get_solr_next",
+            "openlibrary/solr/update_work.py:solr_next (module-level global)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:76-92",
+            "openlibrary/solr/update_work.py:1571-1576",
+            "scripts/solr_updater.py:279-288",
+            "openlibrary/solr/update_edition.py:186-214"
+          ],
+          "call_chain_context": [
+            "scripts/solr_updater.py -> openlibrary.solr.update_work.set_solr_next",
+            "openlibrary/solr/update_work.py:main -> set_solr_next",
+            "openlibrary/solr/update_edition.py:build_edition_data -> openlibrary.solr.update_work.get_solr_next"
+          ],
+          "dataflow_relevant_uses": [
+            "openlibrary/solr/update_work.py:82-85 initializes solr_next from config when None; openlibrary/solr/update_work.py:89-91 assigns solr_next = val; openlibrary/solr/update_edition.py:212 branches on get_solr_next()"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`set_solr_next` simply sets the module global without validation (openlibrary/solr/update_work.py:89-91).",
+            "`get_solr_next` lazy-loads from config only when `solr_next is None`; otherwise returns the cached/overridden value (openlibrary/solr/update_work.py:82-86)."
+          ],
+          "behavioral_constraints": [
+            "Calling `set_solr_next` overrides the cached value used by `get_solr_next` for the lifetime of the process (openlibrary/solr/update_work.py:82-91)."
+          ],
+          "backward_compatibility": [
+            "Existing code imports/uses `get_solr_next` from `openlibrary.solr.update_work` (openlibrary/solr/update_edition.py:194) and calls `set_solr_next` on `openlibrary.solr.update_work` (scripts/solr_updater.py:287; openlibrary/solr/update_work.py:1574)."
+          ],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py:71-74 paired setter for module-level solr option (set_solr_base_url)",
+            "openlibrary/solr/update_work.py:76-92 paired getter/setter pattern for a module-level option (get_solr_next/set_solr_next)"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 4893,
+        "end": 5113,
+        "text": "Type: New Public Function\\n\\nName: set_solr_next\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: val: bool\\n\\nOutput: None\\n\\nDescription: Sets the internal state to indicate whether to use the next Solr schema version.\\n\\n"
+      },
+      "parent_contract_id": "contract-012",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "set_solr_next"
+      ],
+      "source_block_hash": "40320584d45f5b3fed9a8700efe9f7aaa901195c23e5621a1a2f16721fbe75ad"
+    },
+    {
+      "id": "req-013",
+      "text": "Type: New Public Function\\n\\nName: solr_update\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: update_request: SolrUpdateState, skip_id_check=False, solr_base_url: Optional[str]=None\\n\\nOutput: None\\n\\nDescription: Sends a batch update request to Solr, handling retries and various Solr response scenarios.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1010-1075",
+        "openlibrary/tests/solr/test_update_work.py:8-19"
+      ],
+      "findings": "The required public function `solr_update` is implemented, but it is located in `openlibrary/solr/update_work.py` rather than the required path `openlibrary/solr/utils.py` (which does not exist in this repo). The function signature and behavior mostly match the requirement: it accepts `update_request: SolrUpdateState`, `skip_id_check=False`, and `solr_base_url` (typed as `str | None`, equivalent to `Optional[str]`), returns `None`, sends a batch update POST to Solr `/update`, and uses a retry strategy for HTTP/status/timeout errors while logging different error scenarios (including Solr 400 with per-document errors vs global error). However, because the function is not present at the specified module path (`openlibrary/solr/utils.py`), the interface requirement as stated is not satisfied; current callers/tests import it from `openlibrary.solr.update_work`.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:solr_update",
+            "openlibrary/solr/update_work.py:SolrUpdateState"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1010-1075",
+            "openlibrary/tests/solr/test_update_work.py:8-19"
+          ],
+          "call_chain_context": [
+            "update_keys._solr_update -> solr_update (openlibrary/solr/update_work.py:1433-1436 -> 1010)"
+          ],
+          "dataflow_relevant_uses": [
+            "solr_update: update_request.to_solr_requests_json() -> `content` used as httpx.post(..., content=content) (openlibrary/solr/update_work.py:1015,1028-1035)",
+            "solr_update: solr_base_url param -> defaulted via get_solr_base_url() -> used in request URL (openlibrary/solr/update_work.py:1017,1029)",
+            "solr_update: skip_id_check -> params['overwrite']='false' (openlibrary/solr/update_work.py:1022-1024)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": [
+            "openlibrary/solr/update_work.py:solr_update <-> openlibrary/tests/solr/test_update_work.py:16"
+          ]
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "Treats HTTP 400 specially: only retries if no per-document errors and no global error are present; otherwise it logs errors and does not raise for 400 (openlibrary/solr/update_work.py:1037-1053).",
+            "Hard-coded POST timeout of 300 seconds; max_retries=5, delay=8 for HTTPStatusError/TimeoutException/HTTPError (openlibrary/solr/update_work.py:1030-1035,1065-1069).",
+            "If MaxRetriesExceeded occurs, it only logs and does not re-raise (openlibrary/solr/update_work.py:1073-1075)."
+          ],
+          "behavioral_constraints": [
+            "Always sends param update.chain='tolerant-chain' for batch updates; sets overwrite=false when skip_id_check=True (openlibrary/solr/update_work.py:1018-1024)."
+          ],
+          "backward_compatibility": [
+            "Existing code/tests import solr_update from openlibrary.solr.update_work, not from openlibrary.solr.utils (openlibrary/tests/solr/test_update_work.py:10-17)."
+          ],
+          "similar_implementation_patterns": [
+            "RetryStrategy wrapper with nested make_request() and httpx.post + error-specific logging (openlibrary/solr/update_work.py:1025-1075)"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 5113,
+        "end": 5420,
+        "text": "Type: New Public Function\\n\\nName: solr_update\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: update_request: SolrUpdateState, skip_id_check=False, solr_base_url: Optional[str]=None\\n\\nOutput: None\\n\\nDescription: Sends a batch update request to Solr, handling retries and various Solr response scenarios.\\n\\n"
+      },
+      "parent_contract_id": "contract-013",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "solr_update"
+      ],
+      "source_block_hash": "3c174437c155e676fac587c26d794d0804a17ffb437f0ca1bf283b9c686a0ffe"
+    },
+    {
+      "id": "req-014",
+      "text": "Type: New Public Function\\n\\nName: solr_insert_documents\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: documents: list[dict], solr_base_url: Optional[str]=None, skip_id_check=False\\n\\nOutput: None (async)\\n\\nDescription: Asynchronously inserts a list of documents into Solr with optional parameters and error handling.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:922-944",
+        "scripts/solr_builder/solr_builder/index_subjects.py:8-53"
+      ],
+      "findings": "The required new public function `solr_insert_documents` is not implemented at the required path `openlibrary/solr/utils.py` (no such file exists). A function with the exact name and matching signature/behavior exists instead in `openlibrary/solr/update_work.py` as an `async def` which posts JSON documents to `{solr_base_url}/update` using `httpx.AsyncClient`, supports `skip_id_check` by setting Solr param `overwrite=false`, and raises on HTTP error via `resp.raise_for_status()`. At least one caller imports it from `openlibrary.solr.update_work`, confirming the current public interface is exposed from the wrong module relative to the requirement.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:solr_insert_documents",
+            "scripts/solr_builder/solr_builder/index_subjects.py (import/call site)"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:922-944",
+            "scripts/solr_builder/solr_builder/index_subjects.py:8-53"
+          ],
+          "call_chain_context": [
+            "scripts/solr_builder/solr_builder/index_subjects.index_subjects -> openlibrary.solr.update_work.solr_insert_documents"
+          ],
+          "dataflow_relevant_uses": [
+            "documents (param) -> json.dumps(documents) -> httpx.AsyncClient.post(..., content=...) (openlibrary/solr/update_work.py:936-942)",
+            "solr_base_url (param/defaulted) -> f\"{solr_base_url}/update\" (openlibrary/solr/update_work.py:930-938)",
+            "skip_id_check -> params['overwrite']='false' -> httpx post params (openlibrary/solr/update_work.py:931-940)"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If `solr_insert_documents` is moved/introduced into `openlibrary/solr/utils.py`, then existing import sites using `from openlibrary.solr.update_work import solr_insert_documents` must be updated to import from the new module (and/or `update_work.py` must re-export it to preserve compatibility)."
+          ],
+          "dependency_propagation": [],
+          "consistency_anchors": [
+            "openlibrary/solr/update_work.py:solr_insert_documents <-> scripts/solr_builder/solr_builder/index_subjects.py:8"
+          ]
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`skip_id_check` only affects request param `overwrite=false`; no other validation is performed on the documents list.",
+            "Uses `content=json.dumps(documents)` and sets `Content-Type: application/json`; assumes `documents` is JSON-serializable.",
+            "Timeout is fixed at 30 seconds; no retry/backoff logic is present."
+          ],
+          "behavioral_constraints": [
+            "Always raises on non-2xx responses via `resp.raise_for_status()`; no internal exception handling/suppression.",
+            "Creates a new `httpx.AsyncClient` per call (connection pooling lifetime is per-call)."
+          ],
+          "backward_compatibility": [
+            "Callers currently import `solr_insert_documents` from `openlibrary.solr.update_work`; changing/removing that symbol or moving it without a shim/re-export would break `scripts/solr_builder/solr_builder/index_subjects.py` and any similar callers."
+          ],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py:922-944 implements async Solr update posting via httpx.AsyncClient.post + resp.raise_for_status"
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 5420,
+        "end": 5741,
+        "text": "Type: New Public Function\\n\\nName: solr_insert_documents\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: documents: list[dict], solr_base_url: Optional[str]=None, skip_id_check=False\\n\\nOutput: None (async)\\n\\nDescription: Asynchronously inserts a list of documents into Solr with optional parameters and error handling.\\n\\n"
+      },
+      "parent_contract_id": "contract-014",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "solr_insert_documents"
+      ],
+      "source_block_hash": "44255937fdd57b4913f39a59f4ff64dca591223b72cd127f11bd7b7054edcf84"
+    },
+    {
+      "id": "req-015",
+      "text": "Type: New Public Function\\n\\nName: has_changes\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self\\n\\nOutput: bool\\n\\nDescription: Returns True if the SolrUpdateState contains any add or delete operations.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1249-1276",
+        "openlibrary/solr/update_work.py:1479-1486"
+      ],
+      "findings": "The repo does define a public method `has_changes(self) -> bool` on `SolrUpdateState`, and it returns True when there are any add or delete operations (`bool(self.adds or self.deletes)`). However, it is implemented in `openlibrary/solr/update_work.py`, not at the required path `openlibrary/solr/utils.py`. Additionally, `openlibrary/solr/utils.py` does not exist in the current tree, so the requirement’s specified location is not satisfied.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py",
+            "SolrUpdateState",
+            "SolrUpdateState.has_changes"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1249-1276",
+            "openlibrary/solr/update_work.py:1479-1486"
+          ],
+          "call_chain_context": [
+            "update_keys -> SolrUpdateState.has_changes"
+          ],
+          "dataflow_relevant_uses": [
+            "SolrUpdateState.adds/deletes defined at openlibrary/solr/update_work.py:1254-1258 -> used in SolrUpdateState.has_changes at openlibrary/solr/update_work.py:1274-1275",
+            "SolrUpdateState.has_changes at openlibrary/solr/update_work.py:1274-1275 -> controls whether solr updates are emitted at openlibrary/solr/update_work.py:1479-1486"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [
+            "If `SolrUpdateState`/`has_changes` is moved to `openlibrary/solr/utils.py` as required, then all in-module references (e.g., `update_keys` and any imports) must be updated to import/use the new definition to avoid duplicate/conflicting class definitions."
+          ],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`has_changes` only considers `adds` and `deletes`; it intentionally ignores `keys` and `commit` flags (openlibrary/solr/update_work.py:1274-1275)."
+          ],
+          "behavioral_constraints": [
+            "`update_keys` relies on `has_changes()` to decide whether to emit/perform a Solr update; when it returns False, no update is sent/written (openlibrary/solr/update_work.py:1479-1486)."
+          ],
+          "backward_compatibility": [
+            "Existing code calls `update_state.has_changes()` as a method on `SolrUpdateState` (openlibrary/solr/update_work.py:1479), so any refactor must preserve this callable interface or update all call sites accordingly."
+          ],
+          "similar_implementation_patterns": [
+            "SolrUpdateState.to_solr_requests_json uses the same `adds`/`deletes` state to emit requests JSON; it conditionally includes delete/add operations based on whether these lists are non-empty (openlibrary/solr/update_work.py:1277-1285)."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 5741,
+        "end": 5981,
+        "text": "Type: New Public Function\\n\\nName: has_changes\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self\\n\\nOutput: bool\\n\\nDescription: Returns True if the SolrUpdateState contains any add or delete operations.\\n\\n"
+      },
+      "parent_contract_id": "contract-015",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "has_changes"
+      ],
+      "source_block_hash": "98d05d9ed23e2d601abf5114362e5d671f700a7cc7cd8ae5834d2c536acd59fa"
+    },
+    {
+      "id": "req-016",
+      "text": "Type: New Public Function\\n\\nName: to_solr_requests_json\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self, indent: Optional[str] = None, sep=','\\n\\nOutput: str\\n\\nDescription: Serializes the SolrUpdateState to a JSON string for Solr requests.\\n\\n",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1010-1016",
+        "openlibrary/solr/update_work.py:1249-1290",
+        "openlibrary/solr/update_work.py:1433-1440"
+      ],
+      "findings": "A method named `to_solr_requests_json` already exists on `SolrUpdateState`, but it is implemented in `openlibrary/solr/update_work.py`, not in the required path `openlibrary/solr/utils.py`. The repo currently has no `openlibrary/solr/utils.py` file at all. Callers (e.g., `solr_update` and printing modes in `update_keys`) invoke `SolrUpdateState.to_solr_requests_json()`, so the interface exists but is located in the wrong module relative to the requirement.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:SolrUpdateState",
+            "openlibrary/solr/update_work.py:SolrUpdateState.to_solr_requests_json",
+            "openlibrary/solr/update_work.py:solr_update",
+            "openlibrary/solr/update_work.py:update_keys"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1010-1016",
+            "openlibrary/solr/update_work.py:1249-1290",
+            "openlibrary/solr/update_work.py:1433-1440"
+          ],
+          "call_chain_context": [
+            "update_keys._solr_update -> solr_update -> SolrUpdateState.to_solr_requests_json",
+            "solr_update -> SolrUpdateState.to_solr_requests_json"
+          ],
+          "dataflow_relevant_uses": [
+            "SolrUpdateState(adds/deletes/commit) -> to_solr_requests_json() -> content string used as httpx.post(..., content=content) in solr_update"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`to_solr_requests_json` emits a JSON object with possibly repeated \"add\" keys (one per doc), rather than a JSON array; deletes are rendered as a JSON list; commit renders as an empty object.",
+            "`indent` is passed through to `json.dumps` for both deletes and add-doc payloads; `sep` is used as a raw string delimiter and then trimmed if trailing."
+          ],
+          "behavioral_constraints": [
+            "`solr_update` always posts the serialized content with header `Content-Type: application/json` and expects `to_solr_requests_json()` to produce the complete request body.",
+            "`update_keys` printing modes rely on `sep='/n'` and optional indentation for human-readable output."
+          ],
+          "backward_compatibility": [
+            "Existing callers invoke `SolrUpdateState.to_solr_requests_json()` from `openlibrary/solr/update_work.py` (same module) and expect the current signature `(indent: str|None = None, sep=',') -> str` and behavior to remain usable."
+          ],
+          "similar_implementation_patterns": [
+            "openlibrary/solr/update_work.py:1277-1289 constructs a Solr update JSON request body by concatenating optional \"delete\", repeated \"add\" operations, and optional \"commit\" into a single JSON object string, trimming a trailing separator."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 5981,
+        "end": 6261,
+        "text": "Type: New Public Function\\n\\nName: to_solr_requests_json\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self, indent: Optional[str] = None, sep=','\\n\\nOutput: str\\n\\nDescription: Serializes the SolrUpdateState to a JSON string for Solr requests.\\n\\n"
+      },
+      "parent_contract_id": "contract-016",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "to_solr_requests_json"
+      ],
+      "source_block_hash": "e73e1b4e0d92b82ad7d9da66effdf20c416f54899b43be9bafb7ffd0ea786fcd"
+    },
+    {
+      "id": "req-017",
+      "text": "Type: New Public Function\\n\\nName: clear_requests\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self\\n\\nOutput: None\\n\\nDescription: Clears the add and delete operations from the SolrUpdateState.\\n\\n\"",
+      "origin": "new_interfaces",
+      "verdict": "AS_IS_VIOLATED",
+      "evidence_locations": [
+        "openlibrary/solr/update_work.py:1249-1294"
+      ],
+      "findings": "The function `clear_requests(self) -> None` exists, but it is implemented as a method on `SolrUpdateState` in `openlibrary/solr/update_work.py`, not in the required path `openlibrary/solr/utils.py`. The method clears the pending Solr operations by calling `self.adds.clear()` and `self.deletes.clear()`, matching the described behavior, but the required file location/class placement is not satisfied because `openlibrary/solr/utils.py` does not exist in this repo and `SolrUpdateState` is defined in `openlibrary/solr/update_work.py`.",
+      "scoped_evidence": {
+        "localization": {
+          "suspect_entities": [
+            "openlibrary/solr/update_work.py:SolrUpdateState",
+            "openlibrary/solr/update_work.py:SolrUpdateState.clear_requests"
+          ],
+          "exact_code_regions": [
+            "openlibrary/solr/update_work.py:1249-1294"
+          ],
+          "call_chain_context": [],
+          "dataflow_relevant_uses": [
+            "SolrUpdateState.adds defined at openlibrary/solr/update_work.py:1254-1256; cleared at openlibrary/solr/update_work.py:1291-1293",
+            "SolrUpdateState.deletes defined at openlibrary/solr/update_work.py:1257-1259; cleared at openlibrary/solr/update_work.py:1291-1293"
+          ]
+        },
+        "structural": {
+          "must_co_edit_relations": [],
+          "dependency_propagation": [],
+          "consistency_anchors": []
+        },
+        "constraint": {
+          "semantic_boundaries": [
+            "`clear_requests` clears only `adds` and `deletes`; it does not clear `keys` or change `commit` (openlibrary/solr/update_work.py:1291-1294)."
+          ],
+          "behavioral_constraints": [
+            "Clearing is done in-place by mutating existing lists (`list.clear()`), so any external references to `self.adds`/`self.deletes` observe the cleared state rather than list replacement (openlibrary/solr/update_work.py:1291-1294)."
+          ],
+          "backward_compatibility": [
+            "`SolrUpdateState` is used across the codebase/tests (e.g., `openlibrary/tests/solr/test_update_work.py` references it), so existing imports/callers currently expect it to live in `openlibrary/solr/update_work.py` unless a compatibility shim is added elsewhere."
+          ],
+          "similar_implementation_patterns": [
+            "SolrUpdateState.has_changes() checks for pending add/delete operations via `bool(self.adds or self.deletes)` (openlibrary/solr/update_work.py:1274-1275), consistent with `clear_requests` operating on `adds`/`deletes`."
+          ],
+          "missing_elements_to_implement": []
+        }
+      },
+      "rework_context": "",
+      "source_span": {
+        "start": 6261,
+        "end": 6493,
+        "text": "Type: New Public Function\\n\\nName: clear_requests\\n\\nParent class: SolrUpdateState\\n\\nPath: openlibrary/solr/utils.py\\n\\nInput: self\\n\\nOutput: None\\n\\nDescription: Clears the add and delete operations from the SolrUpdateState.\\n\\n\""
+      },
+      "parent_contract_id": "contract-017",
+      "contract_kind": "interface",
+      "explicit_paths": [
+        "openlibrary/solr/utils.py"
+      ],
+      "explicit_symbols": [
+        "New Public Function",
+        "clear_requests"
+      ],
+      "source_block_hash": "809ffd6b89e42fb52c9ae27d687859ff0a9d800038ab0be9b0e8dd536e635638"
+    }
+  ],
+  "requirement_status": [],
+  "schema_version": "v3"
+}
