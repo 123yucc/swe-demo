@@ -20,14 +20,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.artifacts import instance_to_artifact_text
+from src.agents._cost_tracker import get_totals as get_cost_totals, reset as reset_cost_tracker
+from src.agents.call_metrics import configure as configure_call_metrics
 from src.memory import ensure_running as ensure_ltm_running
-from src.orchestrator.engine import run_orchestrator
+from src.output_paths import default_output_dir, model_output_dir_name
+from src.orchestrator.engine import (
+    _delete_checkpoint,
+    _load_checkpoint,
+    _model_runtime_metadata,
+    run_orchestrator,
+    run_pipeline_from_checkpoint,
+)
 
 
 def load_instance_from_dataset(
@@ -119,6 +132,65 @@ def prepare_repo(repo_dir: Path, base_commit: str) -> None:
     print(f"[repo-init] Repo prepared at {base_commit[:8]}")
 
 
+def validate_analysis_checkpoint(output_dir: Path) -> dict:
+    """Require a closure-approved checkpoint ready for patch generation."""
+    checkpoint_path = output_dir / "checkpoint.json"
+    checkpoint = _load_checkpoint(output_dir)
+    if (
+        not checkpoint
+        or checkpoint.get("pipeline_state") != "Closed"
+    ):
+        raise RuntimeError(
+            "analysis phase ended without a closure-approved "
+            f"checkpoint at {checkpoint_path}"
+        )
+    return checkpoint
+
+
+def merge_retry_run_metrics(prior: dict, current: dict) -> dict:
+    """Accumulate an explicit closure-only retry without hiding prior cost."""
+    if not prior:
+        return current
+    merged = dict(current)
+    merged["run_start_utc"] = prior.get("run_start_utc", current.get("run_start_utc"))
+    merged["wall_clock_seconds"] = round(
+        float(prior.get("wall_clock_seconds", 0) or 0)
+        + float(current.get("wall_clock_seconds", 0) or 0),
+        1,
+    )
+    additive = {
+        "total_cost_usd",
+        "estimated_cost_usd",
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    }
+    for key in additive:
+        merged[key] = (prior.get(key, 0) or 0) + (current.get(key, 0) or 0)
+    segments = list(prior.get("segments", []))
+    if not segments:
+        segments.append({
+            key: prior.get(key)
+            for key in (
+                "run_start_utc", "run_end_utc", "wall_clock_seconds",
+                *sorted(additive),
+            )
+            if key in prior
+        })
+    segments.append({
+        key: current.get(key)
+        for key in (
+            "run_start_utc", "run_end_utc", "wall_clock_seconds",
+            *sorted(additive),
+        )
+        if key in current
+    })
+    merged["segments"] = segments
+    merged["retry_kind"] = "closure_only"
+    return merged
+
+
 def write_prediction(
     output_dir: Path,
     instance_id: str,
@@ -138,6 +210,72 @@ def write_prediction(
     pred_path.write_text(json.dumps(pred, indent=2), encoding="utf-8")
     print(f"Prediction written -> {pred_path}")
     return pred_path
+
+
+_TERMINAL_ARTIFACTS = (
+    "patch.diff",
+    "patch_outcome.json",
+    "prediction.json",
+    "compile_check.json",
+    "build_verification.json",
+    "run_metrics.json",
+    "working_memory.json",
+    "patch_plan.json",
+    "patch_failures.log",
+)
+
+
+def clear_terminal_artifacts(output_dir: Path) -> None:
+    """Archive stale terminal artifacts before starting or resuming a run."""
+    existing = [
+        output_dir / name
+        for name in _TERMINAL_ARTIFACTS
+        if (output_dir / name).exists()
+    ]
+    if not existing:
+        return
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    archive_dir = output_dir / "history" / "terminal_artifacts" / timestamp
+    suffix = 1
+    while archive_dir.exists():
+        archive_dir = (
+            output_dir
+            / "history"
+            / "terminal_artifacts"
+            / f"{timestamp}.{suffix}"
+        )
+        suffix += 1
+    archive_dir.mkdir(parents=True)
+    archived: list[str] = []
+    for name in _TERMINAL_ARTIFACTS:
+        path = output_dir / name
+        if not path.exists():
+            continue
+        shutil.move(str(path), str(archive_dir / name))
+        archived.append(name)
+    print(
+        "[outputs] archived stale terminal artifacts to "
+        f"{archive_dir}: " + ", ".join(sorted(archived)),
+        flush=True,
+    )
+
+
+def archive_model_calls(output_dir: Path) -> Path | None:
+    """Preserve prior call-level metrics before a genuinely new run."""
+    source = output_dir / "model_calls.jsonl"
+    if not source.exists():
+        return None
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    archive_dir = output_dir / "history" / "model_calls"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / f"model_calls.{timestamp}.jsonl"
+    suffix = 1
+    while target.exists():
+        target = archive_dir / f"model_calls.{timestamp}.{suffix}.jsonl"
+        suffix += 1
+    shutil.move(str(source), str(target))
+    print(f"[outputs] archived prior model call metrics to {target}", flush=True)
+    return target
 
 
 def main() -> None:
@@ -166,12 +304,35 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help=(
-            "Output directory. Defaults to workdir/<issue_name>/outputs for "
-            "--instance-json mode, otherwise workdir/<instance_id>/outputs."
+            "Output directory. Defaults to workdir/<issue_name>/outputs_<model> "
+            "for --instance-json mode, otherwise workdir/<instance_id>/outputs_<model>."
         ),
     )
-
+    parser.add_argument(
+        "--force-restart", action="store_true",
+        help="Ignore any existing checkpoint and start the pipeline from scratch.",
+    )
+    parser.add_argument(
+        "--stop-after-closure",
+        action="store_true",
+        help="Run analysis only, preserve the CLOSED checkpoint, and do not generate a patch.",
+    )
+    parser.add_argument(
+        "--retry-failed-closure",
+        action="store_true",
+        help=(
+            "Retry only the semantic closure call from a ClosureForcedFail "
+            "analysis checkpoint, preserving evidence and budget counters."
+        ),
+    )
     args = parser.parse_args()
+    if args.retry_failed_closure and (
+        args.force_restart or not args.stop_after_closure
+    ):
+        parser.error(
+            "--retry-failed-closure requires --stop-after-closure and cannot "
+            "be combined with --force-restart"
+        )
 
     # --- Load instance ---
     if args.instance_json:
@@ -220,9 +381,9 @@ def main() -> None:
                 issue_dir = instance_json_path.parent.parent
             else:
                 issue_dir = instance_json_path.parent
-            output_dir = issue_dir / "outputs"
+            output_dir = default_output_dir(issue_dir)
         else:
-            output_dir = Path("workdir") / instance_id / "outputs"
+            output_dir = default_output_dir(Path("workdir") / instance_id)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Schema-version guard: refuse stale evidence.json ---
@@ -232,9 +393,9 @@ def main() -> None:
             existing = json.loads(existing_evidence.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = None
-        if isinstance(existing, dict) and existing.get("schema_version") != "v2":
+        if isinstance(existing, dict) and existing.get("schema_version") not in {"v2", "v3"}:
             print(
-                f"ERROR: existing {existing_evidence} is missing schema_version='v2'. "
+                f"ERROR: existing {existing_evidence} is missing a supported schema_version. "
                 "Phase 16 does NOT auto-migrate old-schema artifacts. "
                 "Move or delete the file and re-run to regenerate."
             )
@@ -249,17 +410,105 @@ def main() -> None:
     print(f"Output dir  : {output_dir}")
     print()
 
-    # --- Run orchestrator ---
-    evidence_path = run_orchestrator(
-        issue_id=instance_id,
-        repo_dir=repo_dir,
-        artifact_text=artifact_text,
-        output_dir=output_dir,
-        problem_statement=instance.get("problem_statement", "") or artifact_text,
-    )
+    # --- Run orchestrator (with checkpoint resume support) ---
+    reset_cost_tracker()
+    calls_path = output_dir / "model_calls.jsonl"
+    if calls_path.exists() and (args.force_restart or not (output_dir / "checkpoint.json").exists()):
+        archive_model_calls(output_dir)
+    configure_call_metrics(calls_path)
+    run_start_ts = time.monotonic()
+    run_start_iso = datetime.now(timezone.utc).isoformat()
+
+    checkpoint = _load_checkpoint(output_dir)
+    if checkpoint and not args.force_restart:
+        saved_runtime = checkpoint.get("runtime")
+        current_runtime = _model_runtime_metadata()
+        if saved_runtime and saved_runtime != current_runtime:
+            print(
+                "[resume] Checkpoint runtime does not match current model "
+                f"runtime. checkpoint={saved_runtime}, current={current_runtime}. "
+                "Use --force-restart to start a fresh run.",
+                flush=True,
+            )
+            sys.exit(1)
+    clear_terminal_artifacts(output_dir)
+    if checkpoint and not args.force_restart:
+        state_name = checkpoint.get("pipeline_state", "?")
+        saved_at = checkpoint.get("saved_at", "?")
+        print(
+            f"[resume] Checkpoint found (state={state_name}, saved={saved_at}). "
+            "Resuming from last save point.",
+            flush=True,
+        )
+        evidence_path = asyncio.run(run_pipeline_from_checkpoint(
+            issue_id=instance_id,
+            repo_dir=repo_dir,
+            output_dir=output_dir,
+            checkpoint=checkpoint,
+            stop_after_closure=args.stop_after_closure,
+            retry_failed_closure=args.retry_failed_closure,
+        ))
+    else:
+        if checkpoint and args.force_restart:
+            print("[resume] --force-restart: ignoring existing checkpoint, starting fresh.")
+            _delete_checkpoint(output_dir)
+        evidence_path = run_orchestrator(
+            issue_id=instance_id,
+            repo_dir=repo_dir,
+            artifact_text=artifact_text,
+            output_dir=output_dir,
+            problem_statement=instance.get("problem_statement", "") or artifact_text,
+            stop_after_closure=args.stop_after_closure,
+        )
+
+    run_end_iso = datetime.now(timezone.utc).isoformat()
+    wall_clock_seconds = time.monotonic() - run_start_ts
 
     print(f"\n=== COMPLETE ===")
     print(f"Evidence JSON: {evidence_path}")
+
+    # --- Write run metrics (timing + token cost) ---
+    cost = get_cost_totals()
+    runtime = _model_runtime_metadata()
+    metrics = {
+        "instance_id": instance_id,
+        "model_backend": runtime.get("model_backend", "unknown"),
+        "model": runtime.get("model") or "unknown",
+        "output_dir_name": model_output_dir_name(runtime.get("model") or None),
+        "run_start_utc": run_start_iso,
+        "run_end_utc": run_end_iso,
+        "wall_clock_seconds": round(wall_clock_seconds, 1),
+        **cost,
+    }
+    metrics_name = "run_metrics.analysis.json" if args.stop_after_closure else "run_metrics.json"
+    metrics_path = output_dir / metrics_name
+    if args.retry_failed_closure and metrics_path.exists():
+        try:
+            prior_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            prior_metrics = {}
+        metrics = merge_retry_run_metrics(prior_metrics, metrics)
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(f"Run metrics  -> {metrics_path}")
+
+    if args.stop_after_closure:
+        validate_analysis_checkpoint(output_dir)
+        stage_path = output_dir / "analysis_stage.json"
+        stage_path.write_text(
+            json.dumps(
+                {
+                    "instance_id": instance_id,
+                    "status": "analysis_complete",
+                    "checkpoint": str(output_dir / "checkpoint.json"),
+                    "handoff_version": 2,
+                    "handoff_ready": True,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Analysis stage -> {stage_path}")
+        return
 
     # --- Write prediction for SWE-bench eval ---
     patch_path = output_dir / "patch.diff"

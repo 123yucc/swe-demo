@@ -6,8 +6,12 @@ structured EvidenceCards via SDK structured output.
 import asyncio
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 from src.agents._structured import run_structured_query
+from src.agents.contract_parser import build_requirement_ledger, validate_ledger_coverage
 from src.models.context import EvidenceCards
+from src.models.evidence import ConstraintCard, LocalizationCard, StructuralCard, SymptomCard
 
 
 PARSER_SYSTEM_PROMPT = """\
@@ -41,12 +45,37 @@ requirements
     - evidence_locations: []
     - findings: ""
 
-schema_version: "v2".
+schema_version: "v3".
 
 All other fields (constraint.behavioral_constraints, semantic_boundaries,
 backward_compatibility, similar_implementation_patterns, localization.*,
 structural.*) are deep-search's responsibility. You MUST leave them empty.
 """
+
+
+PARSER_COST_CONTROL_PROMPT = """\
+You are a software-defect analyst. Read the SWE-bench Pro problem statement
+and emit JSON matching the required schema. No Markdown, prose, or guessing.
+
+Extract only:
+- symptom.observable_failures: visible errors, traces, or wrong output.
+- symptom.repair_targets: the stated end-goal behavior.
+- symptom.regression_expectations: behavior explicitly required not to break.
+- constraint.missing_elements_to_implement: verbatim API signatures from the
+  "New interfaces introduced:" section, one entry per interface.
+
+Do not reproduce the Requirements section. Contract extraction and all
+deep-search-owned evidence are constructed deterministically by the caller.
+"""
+
+
+class _ParserConstraint(BaseModel):
+    missing_elements_to_implement: list[str] = Field(default_factory=list)
+
+
+class _ParserOutput(BaseModel):
+    symptom: SymptomCard = Field(default_factory=SymptomCard)
+    constraint: _ParserConstraint = Field(default_factory=_ParserConstraint)
 
 
 _PARSER_FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
@@ -94,17 +123,30 @@ def _enforce_parser_field_whitelist(evidence: EvidenceCards) -> None:
 
 
 async def _run_parser_async(md_contents: str, cwd: str | None = None) -> EvidenceCards:
-    evidence = await run_structured_query(
-        system_prompt=PARSER_SYSTEM_PROMPT,
+    parsed = await run_structured_query(
+        system_prompt=PARSER_COST_CONTROL_PROMPT,
         user_prompt=md_contents,
-        response_model=EvidenceCards,
+        response_model=_ParserOutput,
         component="parser",
         allowed_tools=[],
         max_turns=10,
         max_budget_usd=1.0,
         cwd=cwd,
     )
-    _enforce_parser_field_whitelist(evidence)
+    ledger = build_requirement_ledger(md_contents)
+    evidence = EvidenceCards(
+        symptom=parsed.symptom,
+        constraint=ConstraintCard(
+            missing_elements_to_implement=(
+                parsed.constraint.missing_elements_to_implement
+            ),
+        ),
+        localization=LocalizationCard(),
+        structural=StructuralCard(),
+        requirements=ledger,
+        schema_version="v3",
+    )
+    validate_ledger_coverage(md_contents, evidence.requirements)
     return evidence
 
 
@@ -118,14 +160,3 @@ def run_parser(md_contents: str) -> EvidenceCards:
         Populated EvidenceCards instance.
     """
     return asyncio.run(_run_parser_async(md_contents))
-
-
-def load_artifacts(artifacts_dir: str | Path) -> str:
-    """Read all .md files in *artifacts_dir* and concatenate them."""
-    artifacts_dir = Path(artifacts_dir)
-    parts: list[str] = []
-    for md_file in sorted(artifacts_dir.glob("*.md")):
-        parts.append(f"=== {md_file.name} ===\n{md_file.read_text(encoding='utf-8')}\n")
-    if not parts:
-        raise FileNotFoundError(f"No .md files found in {artifacts_dir}")
-    return "\n".join(parts)

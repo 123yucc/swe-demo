@@ -6,7 +6,10 @@ Two tools are exposed:
 1. ``update_localization`` — persists deep-search's AS-IS code observations
    back to the evidence cards.  Phase 16 redesign: each call is scoped to a
    ``scope_requirement_id``; the scope's previous entries are fully replaced
-   (no merge, no dedup, no contradiction guard).
+   (no merge, no dedup, no contradiction guard).  The scope's slice is stored
+   on ``RequirementItem.scoped_evidence`` (the persisted per-requirement
+   source); the top-level aggregate cards are rebuilt from every
+   requirement's slice.
 
 2. ``cache_retrieved_code`` — caches critical code snippets in
    SharedWorkingMemory for downstream agents.
@@ -29,6 +32,9 @@ from claude_agent_sdk import tool
 from src.models.evidence import (
     ConstraintCard,
     LocalizationCard,
+    RequirementItem,
+    RequirementStatus,
+    ScopedEvidence,
     StructuralCard,
 )
 from src.models.context import EvidenceCards
@@ -41,10 +47,73 @@ _working_memory: SharedWorkingMemory | None = None
 _evidence_json_path: Path | None = None
 _repo_root: str = ""
 
-# Scope-based store for deep-search-owned fields.  Outer key: requirement id;
-# inner key: evidence-card field name; value: the full list of entries that
-# scope contributed (replaced wholesale on every update_localization call).
-_scoped_store: dict[str, dict[str, list[str]]] = {}
+
+_COMPLIANT_BLOCKER_RE = re.compile(
+    r"traceability failure|unverifiable|must be verified|not backed by read|"
+    r"cannot be confirmed|not confirmed by read|requires read re-verification|"
+    r"not re-verified|inconclusive|self-reflection failure",
+    re.IGNORECASE,
+)
+
+
+def _has_compliant_blocker(findings: str) -> bool:
+    """Return True when findings explicitly say compliant is not verified."""
+    return bool(_COMPLIANT_BLOCKER_RE.search(findings or ""))
+
+
+def _short_reason(findings: str, limit: int = 240) -> str:
+    """Compact a verified compliant finding for status storage."""
+    text = re.sub(r"\s+", " ", (findings or "").strip())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _normalize_compliant_requirements(evidence: EvidenceCards) -> None:
+    """Migrate legacy compliant RequirementItems into lightweight status.
+
+    Existing evidence artifacts may still carry AS_IS_COMPLIANT entries in the
+    main requirements list.  Valid ones are moved to requirement_status; invalid
+    ones are downgraded so the attribution/rework gates can reopen them.
+    """
+    active: list[RequirementItem] = []
+    statuses = {
+        status.id: status for status in evidence.requirement_status
+    }
+    for req in evidence.requirements:
+        if req.verdict != "AS_IS_COMPLIANT":
+            active.append(req)
+            continue
+        if (
+            not req.evidence_locations
+            or _has_compliant_blocker(req.findings)
+            or req.origin == "new_interfaces"
+        ):
+            req.verdict = "TO_BE_PARTIAL"
+            req.findings = (
+                "AS_IS_COMPLIANT rejected during evidence normalization: "
+                "compliant status requires traceable evidence_locations, "
+                "no unverifiable/traceability-failure language, and "
+                "non-new_interfaces origin.\n\n"
+                f"{req.findings}"
+            ).strip()
+            active.append(req)
+            continue
+        statuses[req.id] = RequirementStatus(
+            id=req.id,
+            text=req.text,
+            origin=req.origin,
+            short_reason=_short_reason(req.findings),
+            evidence_locations=list(req.evidence_locations),
+            source_span=req.source_span,
+            parent_contract_id=req.parent_contract_id,
+            contract_kind=req.contract_kind,
+            explicit_paths=list(req.explicit_paths),
+            explicit_symbols=list(req.explicit_symbols),
+            source_block_hash=req.source_block_hash,
+        )
+    evidence.requirements = active
+    evidence.requirement_status = list(statuses.values())
 
 
 # ── Field ownership tables (single source of truth) ──────────────────────
@@ -114,12 +183,12 @@ def init_working_memory(
     issue_context: str, evidence: EvidenceCards
 ) -> SharedWorkingMemory:
     """Initialize shared working memory (called by engine after parser)."""
-    global _working_memory, _scoped_store
+    global _working_memory
+    _normalize_compliant_requirements(evidence)
     _working_memory = SharedWorkingMemory(
         issue_context=issue_context,
         evidence_cards=evidence,
     )
-    _scoped_store = {}
     return _working_memory
 
 
@@ -137,6 +206,7 @@ def get_submitted_evidence() -> EvidenceCards | None:
 def set_submitted_evidence(evidence: EvidenceCards) -> None:
     """Backward-compatible setter — updates evidence_cards inside working memory."""
     global _working_memory
+    _normalize_compliant_requirements(evidence)
     if _working_memory is not None:
         _working_memory.evidence_cards = evidence
     else:
@@ -147,29 +217,68 @@ def set_submitted_evidence(evidence: EvidenceCards) -> None:
 
 
 def reset_submitted_evidence() -> None:
-    global _working_memory, _scoped_store
+    global _working_memory
     _working_memory = None
-    _scoped_store = {}
+
+
+def restore_working_memory(memory: SharedWorkingMemory) -> None:
+    """Set working memory directly from a deserialized checkpoint.
+
+    Used by run_pipeline_from_checkpoint to restore the full in-process
+    state without re-running the parser or calling init_working_memory.
+    """
+    global _working_memory
+    _working_memory = memory
+
+
+def _format_previous_state(target: RequirementItem) -> str:
+    """Render a requirement's about-to-be-cleared state as a 'rejected state'
+    block, prepended to rework_context so the next deep-search iteration sees
+    the prior (rejected) verdict/locations/findings as a negative example."""
+    findings = (target.findings or "").strip()
+    if len(findings) > 600:
+        findings = findings[:597].rstrip() + "..."
+    locs = ", ".join(target.evidence_locations) if target.evidence_locations else "(none)"
+    return (
+        "── PREVIOUS (REJECTED) STATE ──\n"
+        f"verdict: {target.verdict}\n"
+        f"evidence_locations: {locs}\n"
+        f"findings (excerpt): {findings or '(none)'}\n"
+        "──────────────────────────────"
+    )
 
 
 def reset_requirement_for_rework(
     requirement_id: str,
     audit_feedback: str = "",
+    fields_to_reset: set[str] | None = None,
 ) -> bool:
     """Re-open a RequirementItem for a rework deep-search cycle.
 
-    Sets verdict back to UNCHECKED, clears its findings / evidence_locations,
-    and drops its scope in _scoped_store so stale localization entries do not
-    contaminate the next investigation.  Rebuilds the aggregate view.
+    Always sets verdict back to UNCHECKED (otherwise the TODO picker will not
+    re-dispatch deep-search for it).  Which other fields are cleared depends on
+    *fields_to_reset*:
 
-    *audit_feedback* — optional closure-checker audit text specific to this
-    requirement. Stored on ``RequirementItem.rework_context`` so the next
-    deep-search iteration can read it and steer its reasoning.  Deep-search
-    is responsible for clearing the field after a new verdict is persisted.
+    - ``None`` (default, full reset): clears findings, evidence_locations, and
+      the requirement's ``scoped_evidence`` slice (then rebuilds the aggregate
+      view).  Used by the deterministic gates (attribution / anchor / I2 /
+      static grounding) and by the ``deepen`` (sufficiency) and cross-req
+      ``reconcile`` (consistency) rework operators.
+    - ``{"findings"}``: clears findings ONLY, preserving evidence_locations and
+      the scoped_evidence slice.  Used when the cited locations were verified
+      OK but the findings text was a hallucination / failed the prescriptive
+      boundary check — only the conclusion needs rewriting.
+
+    Before clearing, the prior verdict / locations / findings are snapshotted
+    into ``rework_context`` as a "previous rejected state" block so the next
+    deep-search iteration can avoid repeating the same reasoning.
+
+    *audit_feedback* — closure-checker (or gate) feedback specific to this
+    requirement, appended after the snapshot block.  Deep-search is responsible
+    for clearing rework_context after a new verdict is persisted.
 
     Returns True if the requirement existed and was reset.
     """
-    global _scoped_store
     if _working_memory is None:
         return False
     evidence = _working_memory.evidence_cards
@@ -178,15 +287,69 @@ def reset_requirement_for_rework(
         if req.id == requirement_id:
             target = req
             break
+
     if target is None:
-        return False
-    target.verdict = "UNCHECKED"
-    target.evidence_locations = []
-    target.findings = ""
-    target.rework_context = audit_feedback or ""
-    if requirement_id in _scoped_store:
-        del _scoped_store[requirement_id]
+        # Compliant requirement parked in requirement_status: re-materialize it
+        # as a fresh active RequirementItem (always a full reset — no prior
+        # active state to preserve).
+        status = None
+        for item in evidence.requirement_status:
+            if item.id == requirement_id:
+                status = item
+                break
+        if status is None:
+            return False
+        snapshot = (
+            "── PREVIOUS (REJECTED) STATE ──\n"
+            "verdict: AS_IS_COMPLIANT\n"
+            f"evidence_locations: "
+            f"{', '.join(status.evidence_locations) if status.evidence_locations else '(none)'}\n"
+            f"findings (excerpt): {(status.short_reason or '(none)')}\n"
+            "──────────────────────────────"
+        )
+        context = snapshot + (f"\n\n{audit_feedback}" if audit_feedback else "")
+        target = RequirementItem(
+            id=status.id,
+            text=status.text,
+            origin=status.origin,
+            verdict="UNCHECKED",
+            evidence_locations=[],
+            findings="",
+            scoped_evidence=ScopedEvidence(),
+            rework_context=context,
+            source_span=status.source_span,
+            parent_contract_id=status.parent_contract_id,
+            contract_kind=status.contract_kind,
+            explicit_paths=list(status.explicit_paths),
+            explicit_symbols=list(status.explicit_symbols),
+            source_block_hash=status.source_block_hash,
+        )
+        evidence.requirements.append(target)
+        evidence.requirement_status = [
+            item for item in evidence.requirement_status if item.id != requirement_id
+        ]
         _rebuild_aggregate_view()
+        _persist_evidence_to_disk()
+        return True
+
+    snapshot = _format_previous_state(target)
+    context = snapshot + (f"\n\n{audit_feedback}" if audit_feedback else "")
+
+    target.verdict = "UNCHECKED"
+    target.rework_context = context
+
+    findings_only = fields_to_reset is not None and fields_to_reset == {"findings"}
+    if findings_only:
+        # Conclusion-only rework: keep verified locations and scoped slice.
+        target.findings = ""
+    else:
+        # Full reset: drop findings, locations, and the scoped_evidence slice.
+        target.findings = ""
+        target.evidence_locations = []
+        target.scoped_evidence = ScopedEvidence()
+        _rebuild_aggregate_view()
+
+    _persist_evidence_to_disk()
     return True
 
 
@@ -250,13 +413,27 @@ def _normalize_path(text: str) -> str:
 
 # ── Scope → aggregate rebuild ─────────────────────────────────────────────
 
+def _card_attr_for_field(field_name: str) -> str:
+    """Return the ScopedEvidence card attribute ('localization' / 'structural'
+    / 'constraint') that owns *field_name*."""
+    if field_name in _LOCALIZATION_FIELDS:
+        return "localization"
+    if field_name in _STRUCTURAL_FIELDS:
+        return "structural"
+    return "constraint"
+
+
 def _aggregate_field(field_name: str) -> list[str]:
-    """Flatten all scopes' contributions for one field, preserving scope
-    insertion order."""
+    """Flatten every requirement's scoped_evidence contribution for one field,
+    preserving requirements-list order and de-duplicating across requirements."""
+    if _working_memory is None:
+        return []
+    card_attr = _card_attr_for_field(field_name)
     out: list[str] = []
     seen: set[str] = set()
-    for scope_entries in _scoped_store.values():
-        for v in scope_entries.get(field_name, []):
+    for req in _working_memory.evidence_cards.requirements:
+        card = getattr(req.scoped_evidence, card_attr)
+        for v in getattr(card, field_name, []):
             if v not in seen:
                 out.append(v)
                 seen.add(v)
@@ -265,7 +442,8 @@ def _aggregate_field(field_name: str) -> list[str]:
 
 def _rebuild_aggregate_view() -> None:
     """Rebuild LocalizationCard / StructuralCard / ConstraintCard (deep-search
-    subset) from the scoped store, preserving parser-owned fields intact."""
+    subset) from every requirement's scoped_evidence slice, preserving
+    parser-owned fields intact."""
     if _working_memory is None:
         return
     evidence = _working_memory.evidence_cards
@@ -337,7 +515,7 @@ _UPDATE_LOCALIZATION_SCHEMA: dict[str, Any] = {
 )
 async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
     print(f"[update_localization CALLED] args keys: {list(args.keys())}", flush=True)
-    global _working_memory, _scoped_store
+    global _working_memory
 
     if _working_memory is None:
         return {
@@ -389,18 +567,41 @@ async def update_localization(args: dict[str, Any]) -> dict[str, Any]:
             }]
         }
 
-    # ── Build fresh scope bucket (wholesale replace) ──
-    new_bucket: dict[str, list[str]] = {}
+    # ── Locate the owning RequirementItem (scoped_evidence is the source) ──
+    target = None
+    for req in _working_memory.evidence_cards.requirements:
+        if req.id == scope_id:
+            target = req
+            break
+    if target is None:
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"ERROR: scope_requirement_id '{scope_id}' not found among "
+                    f"active requirements "
+                    f"{[r.id for r in _working_memory.evidence_cards.requirements]}. "
+                    "Only active (non-compliant) requirements can receive "
+                    "scoped observations."
+                ),
+            }]
+        }
+
+    # ── Rebuild this requirement's scoped slice (wholesale replace) ──
+    new_scoped = ScopedEvidence()
+    counts: dict[str, int] = {}
     for name in DEEP_SEARCH_OWNED_FIELDS:
         values = args.get(name)
         if values:
-            new_bucket[name] = [_normalize_path(v) for v in values]
+            normalized = [_normalize_path(v) for v in values]
+            card = getattr(new_scoped, _card_attr_for_field(name))
+            setattr(card, name, normalized)
+            counts[name] = len(normalized)
+    target.scoped_evidence = new_scoped
 
-    _scoped_store[scope_id] = new_bucket
     _rebuild_aggregate_view()
     saved_msg = _persist_evidence_to_disk()
 
-    counts = {k: len(v) for k, v in new_bucket.items()}
     total = sum(counts.values()) if counts else 0
     _working_memory.record_action(
         phase="deep-search",
@@ -449,8 +650,9 @@ _UPDATE_REQUIREMENT_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "Code locations ('file.py:LINE' or 'file.py:LINE-LINE') "
-                "substantiating the verdict. Non-empty unless "
-                "verdict == 'AS_IS_COMPLIANT'."
+                "substantiating the verdict. Required for AS_IS_COMPLIANT, "
+                "AS_IS_VIOLATED, and TO_BE_PARTIAL; TO_BE_MISSING may be "
+                "empty when no definition exists."
             ),
         },
         "findings": {
@@ -498,10 +700,13 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
     evidence_locations = [_normalize_path(v) for v in args.get("evidence_locations", [])]
     findings = args.get("findings", "") or ""
 
+    evidence = _working_memory.evidence_cards
     target = None
-    for item in _working_memory.evidence_cards.requirements:
+    target_index = -1
+    for index, item in enumerate(evidence.requirements):
         if item.id == req_id:
             target = item
+            target_index = index
             break
     if target is None:
         return {
@@ -509,12 +714,33 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
                 "type": "text",
                 "text": (
                     f"ERROR: requirement_id '{req_id}' not found among "
-                    f"{[r.id for r in _working_memory.evidence_cards.requirements]}."
+                    f"{[r.id for r in evidence.requirements]}."
                 ),
             }]
         }
 
-    if verdict not in ("AS_IS_COMPLIANT", "TO_BE_MISSING") and not evidence_locations:
+    downgraded_compliant = False
+    if verdict == "AS_IS_COMPLIANT":
+        if (
+            not evidence_locations
+            or _has_compliant_blocker(findings)
+            or target.origin == "new_interfaces"
+        ):
+            verdict = "TO_BE_PARTIAL"
+            downgraded_compliant = True
+            reason = (
+                "AS_IS_COMPLIANT rejected: compliant requirements require "
+                "traceable evidence_locations, must not contain unverifiable "
+                "or traceability-failure language, and cannot originate from "
+                "new_interfaces."
+            )
+            findings = f"{reason}\n\n{findings}".strip()
+
+    if (
+        verdict not in ("AS_IS_COMPLIANT", "TO_BE_MISSING")
+        and not evidence_locations
+        and not downgraded_compliant
+    ):
         return {
             "content": [{
                 "type": "text",
@@ -525,9 +751,56 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
             }]
         }
 
+    if verdict == "AS_IS_COMPLIANT":
+        status = RequirementStatus(
+            id=target.id,
+            text=target.text,
+            origin=target.origin,
+            short_reason=_short_reason(findings),
+            evidence_locations=evidence_locations,
+            source_span=target.source_span,
+            parent_contract_id=target.parent_contract_id,
+            contract_kind=target.contract_kind,
+            explicit_paths=list(target.explicit_paths),
+            explicit_symbols=list(target.explicit_symbols),
+            source_block_hash=target.source_block_hash,
+        )
+        evidence.requirement_status = [
+            item for item in evidence.requirement_status if item.id != req_id
+        ]
+        evidence.requirement_status.append(status)
+        del evidence.requirements[target_index]
+        # The requirement (and its scoped_evidence slice) is gone from the
+        # active list; rebuild the aggregate view so its observations no longer
+        # appear in the top-level cards.
+        _rebuild_aggregate_view()
+        target.rework_context = ""
+
+        _working_memory.record_action(
+            phase="deep-search",
+            subagent="update_requirement_verdict",
+            outcome=f"{verdict}:{len(evidence_locations)}_locs:moved_to_status",
+            requirement_id=req_id,
+        )
+        saved_msg = _persist_evidence_to_disk()
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": (
+                    f"Requirement '{req_id}' -> AS_IS_COMPLIANT stored as "
+                    f"lightweight status with {len(evidence_locations)} "
+                    f"locations.{saved_msg}"
+                ),
+            }]
+        }
+
     target.verdict = verdict
     target.evidence_locations = evidence_locations
     target.findings = findings
+    evidence.requirement_status = [
+        item for item in evidence.requirement_status if item.id != req_id
+    ]
     # Consume any rework_context now that a fresh verdict has been recorded;
     # the audit feedback was meant to steer this single iteration only.
     target.rework_context = ""
@@ -535,7 +808,10 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
     _working_memory.record_action(
         phase="deep-search",
         subagent="update_requirement_verdict",
-        outcome=f"{verdict}:{len(evidence_locations)}_locs",
+        outcome=(
+            f"{verdict}:{len(evidence_locations)}_locs"
+            + (":downgraded_from_compliant" if downgraded_compliant else "")
+        ),
         requirement_id=req_id,
     )
     saved_msg = _persist_evidence_to_disk()
@@ -545,7 +821,9 @@ async def update_requirement_verdict(args: dict[str, Any]) -> dict[str, Any]:
             "type": "text",
             "text": (
                 f"Requirement '{req_id}' -> {verdict} with "
-                f"{len(evidence_locations)} locations.{saved_msg}"
+                f"{len(evidence_locations)} locations"
+                f"{' (downgraded from invalid AS_IS_COMPLIANT)' if downgraded_compliant else ''}."
+                f"{saved_msg}"
             ),
         }]
     }

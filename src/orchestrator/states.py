@@ -39,6 +39,7 @@ ALLOWED_TRANSITIONS: dict[PipelineState, set[PipelineState]] = {
     },
     PipelineState.CLOSED: {
         PipelineState.PATCH_PLANNING,
+        PipelineState.PATCH_FAILED,         # repatch planner produced no plan
     },
     PipelineState.PATCH_PLANNING: {
         PipelineState.PATCH_VERIFYING,

@@ -10,6 +10,7 @@ from pathlib import Path
 from src.agents._structured import run_structured_query
 from src.models.memory import SharedWorkingMemory
 from src.models.patch import FileEditPlan, PatchPlan
+from src.orchestrator.consistency_checks import is_test_file
 
 # Prescriptive patterns that indicate boundary constraints to preserve.
 _PRESCRIPTIVE_PATTERNS = (
@@ -32,6 +33,19 @@ _PRESCRIPTIVE_PATTERNS = (
 # Works for .py, .js, .ts, .go, .rs, .java, .cpp, .rb, .php, etc.
 _FILE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]{1,6})\b")
 
+# Structured-config extensions whose values conventionally name a code symbol
+# resolved at load time (qutebrowser ``configdata.yml`` ``type: Foo``; Django
+# settings; DI wiring). Used by the cross-edit symbol contract to know which
+# FileEditPlans are "reference sites" for a symbol another edit must define.
+_CONFIG_EDIT_SUFFIXES = (".yml", ".yaml", ".json", ".jsonc", ".toml", ".ini", ".cfg")
+
+# A standalone CamelCase identifier (class/type-name shape): an internal
+# lower→upper transition, no surrounding dot (so dotted enum *values* like
+# ``VersionChange.major`` are not captured as a type reference).
+_CAMEL_SYMBOL_RE = re.compile(
+    r"(?<![.\w])([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*)(?![\w.])"
+)
+
 # Verbs that, when co-occurring with a file path inside a single co-edit
 # relation, signal the file is a required edit target (as opposed to a
 # reference/mention).  Language- and framework-neutral.
@@ -47,6 +61,9 @@ _COEDIT_ACTION_VERBS = (
     # cross-edit direction ("X -> Y must ...") is expressed as an arrow.
     "->",
 )
+
+_MAX_TARGET_FUNCTIONS_PER_EDIT = 3
+_MAX_PRESERVED_FINDINGS_PER_EDIT = 12
 
 
 def _is_new_file_edit(edit: FileEditPlan, memory: SharedWorkingMemory) -> bool:
@@ -109,6 +126,166 @@ def _extract_prescriptive_snippets(findings: str) -> list[str]:
     return snippets
 
 
+def _target_aliases(target: str) -> list[str]:
+    text = (target or "").strip()
+    if not text:
+        return []
+    aliases = {text}
+    last = text.rsplit(".", 1)[-1]
+    aliases.add(last)
+    simple = re.sub(r"\(.*?\)", "", last).strip()
+    if simple:
+        aliases.add(simple)
+    return [alias for alias in aliases if alias and alias != "(file-wide pass)"]
+
+
+def _chunk_preserved_findings(findings: list[str], limit: int) -> list[list[str]]:
+    """Partition findings into stable chunks bounded by *limit*."""
+    if not findings:
+        return [[]]
+    return [
+        findings[start : start + limit]
+        for start in range(0, len(findings), limit)
+    ]
+
+
+def _split_heavy_edits(plan: PatchPlan) -> None:
+    """Split oversized same-file edits into smaller themed edits.
+
+    This is a post-LLM structural repair only. It preserves all constraints
+    but prevents a single FileEditPlan from carrying too many target functions
+    or preserved findings, which bloats patch-generator prompts and burns
+    retry budget.
+    """
+    rewritten: list[FileEditPlan] = []
+    split_count = 0
+
+    for edit in plan.edits:
+        n_targets = len(edit.target_functions)
+        n_findings = len(edit.preserved_findings)
+        if edit.creates_new_file or (
+            n_targets <= _MAX_TARGET_FUNCTIONS_PER_EDIT
+            and n_findings <= _MAX_PRESERVED_FINDINGS_PER_EDIT
+        ):
+            rewritten.append(edit)
+            continue
+
+        if not edit.target_functions:
+            for start in range(0, n_findings, _MAX_PRESERVED_FINDINGS_PER_EDIT):
+                chunk_findings = edit.preserved_findings[start : start + _MAX_PRESERVED_FINDINGS_PER_EDIT]
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "preserved_findings": chunk_findings,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: file-wide constraint chunk]"
+                            ),
+                        }
+                    )
+                )
+                split_count += 1
+            continue
+
+        target_buckets: dict[str, list[str]] = {target: [] for target in edit.target_functions}
+        unassigned: list[str] = []
+        for finding in edit.preserved_findings:
+            lowered = finding.lower()
+            matched = False
+            for target in edit.target_functions:
+                aliases = _target_aliases(target)
+                if aliases and any(alias.lower() in lowered for alias in aliases):
+                    target_buckets[target].append(finding)
+                    matched = True
+            if not matched:
+                unassigned.append(finding)
+
+        chunk_size = _MAX_TARGET_FUNCTIONS_PER_EDIT
+        target_chunks: list[tuple[list[str], list[str]]] = []
+        for start in range(0, len(edit.target_functions), chunk_size):
+            chunk_targets = edit.target_functions[start : start + chunk_size]
+            chunk_findings: list[str] = []
+            for target in chunk_targets:
+                for finding in target_buckets.get(target, []):
+                    if finding not in chunk_findings:
+                        chunk_findings.append(finding)
+            target_chunks.append((chunk_targets, chunk_findings))
+
+        if unassigned and target_chunks:
+            # Generic same-file constraints still belong with a concrete edit
+            # whenever possible; standalone file-wide passes are the main source
+            # of oversized prompts on large files.
+            for idx, finding in enumerate(unassigned):
+                chunk_targets, chunk_findings = target_chunks[idx % len(target_chunks)]
+                if finding not in chunk_findings:
+                    chunk_findings.append(finding)
+                target_chunks[idx % len(target_chunks)] = (chunk_targets, chunk_findings)
+            unassigned = []
+
+        for chunk_targets, chunk_findings in target_chunks:
+            expected_symbols = [
+                symbol
+                for symbol in edit.expected_symbols
+                if any(
+                    symbol in _target_aliases(target)
+                    for target in chunk_targets
+                )
+            ] or edit.expected_symbols
+            for sub_idx, finding_chunk in enumerate(
+                _chunk_preserved_findings(
+                    chunk_findings,
+                    _MAX_PRESERVED_FINDINGS_PER_EDIT,
+                ),
+                1,
+            ):
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "target_functions": chunk_targets,
+                            "preserved_findings": finding_chunk,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: focused target subset "
+                                + ", ".join(chunk_targets)
+                                + (
+                                    f" / finding chunk {sub_idx}"
+                                    if len(chunk_findings) > _MAX_PRESERVED_FINDINGS_PER_EDIT
+                                    else ""
+                                )
+                                + "]"
+                            ),
+                            "expected_symbols": expected_symbols,
+                        }
+                    )
+                )
+                split_count += 1
+
+        if unassigned:
+            for start in range(0, len(unassigned), _MAX_PRESERVED_FINDINGS_PER_EDIT):
+                chunk_findings = unassigned[start : start + _MAX_PRESERVED_FINDINGS_PER_EDIT]
+                rewritten.append(
+                    edit.model_copy(
+                        update={
+                            "target_functions": [],
+                            "preserved_findings": chunk_findings,
+                            "change_rationale": (
+                                edit.change_rationale
+                                + " [planner auto-split: file-wide constraint pass]"
+                            ),
+                            "expected_symbols": edit.expected_symbols,
+                        }
+                    )
+                )
+                split_count += 1
+
+    if split_count:
+        plan.edits = rewritten
+        print(
+            f"[patch-planner] auto-split oversized edits into {split_count} focused plan chunk(s)",
+            flush=True,
+        )
+
+
 PATCH_PLANNER_SYSTEM_PROMPT = """\
 You are a Senior Staff Engineer planning a precise bug fix.
 
@@ -118,6 +295,15 @@ then browse selected experience ids in detail if they seem analogous.
 Focus on: exact_code_regions, call_chain_context, behavioral_constraints,
 backward_compatibility, missing_elements_to_implement,
 must_co_edit_relations, dependency_propagation.
+
+CRITICAL — NEVER plan edits to test files. The evaluator owns the test suite
+and applies its OWN test patch on top of yours. Any edit you plan to a test
+file (paths under tests/ or test/, files named *_test.go, test_*.py,
+*_test.py, *.test.js, *.spec.ts, *.spec.js, __tests__/...) is reverted before
+verification and can only collide with the evaluator's gold tests. Plan ONLY
+production-code changes. If a requirement says tests "should be relocated" or
+"moved", that describes the evaluator's work, not yours: your job is to put
+the production symbol in its new home so the relocated tests can resolve it.
 
 CRITICAL — co-edit completeness (framework-agnostic):
 Every file path that appears in `structural.must_co_edit_relations`
@@ -216,6 +402,13 @@ Rules:
 - NO CODE: describe *what* and *why*, not actual code
 - TO-BE items in constraints describe behaviors to ADD, not existing ones
 - preserved_findings: copy verbatim, never summarize, distribute by theme
+- expected_diff_required: keep true for every non-reference edit that must
+  appear in patch.diff; only set false for genuine read-only/reference context.
+- creates_new_file: set true when the plan creates a file/module/package.
+- expected_symbols: when adding a new function/type/class/export, list the
+  exact symbol names so the artifact verifier can catch missing definitions.
+- required_by_requirement_ids: list the req-IDs that make the edit mandatory
+  when they are available from evidence.
 
 Return a structured JSON object matching the required schema.
 """
@@ -251,6 +444,8 @@ def _backfill_declared_coedit_files(
     for path, sentence in _extract_coedit_targets(memory):
         if path in existing_paths or path in seen_new:
             continue
+        if is_test_file(path):
+            continue
         if repo_dir is not None and not (repo_dir / path).is_file():
             # Path mentioned in evidence but absent from disk — almost
             # always a truncated/malformed path from deep-search prose
@@ -273,6 +468,7 @@ def _backfill_declared_coedit_files(
                 ),
                 preserved_findings=[],
                 co_edit_dependencies=[],
+                reference_only=True,
             )
         )
         appended.append(path)
@@ -480,10 +676,156 @@ def _deduplicate_shared_findings(plan: PatchPlan) -> None:
         )
 
 
+def _edit_symbol_text(edit: FileEditPlan) -> str:
+    """Concatenate the free-text fields of an edit where a shared symbol name
+    would be mentioned (rationale, findings, target functions)."""
+    return "\n".join(
+        [edit.change_rationale, *edit.preserved_findings, *edit.target_functions]
+    )
+
+
+def _is_config_edit(edit: FileEditPlan) -> bool:
+    suffix = edit.filepath.lower().rsplit(".", 1)
+    return len(suffix) == 2 and ("." + suffix[1]) in _CONFIG_EDIT_SUFFIXES
+
+
+def _enforce_cross_edit_symbol_contract(plan: PatchPlan) -> None:
+    """Pin a shared identifier into every edit that references it when the
+    symbol spans a config/data file and a code file.
+
+    Root cause this addresses (issue 008): the patch-generator runs one
+    independent sub-agent per FileEditPlan. When a symbol is *referenced* in
+    one file (``configdata.yml`` → ``type: VersionChangeFilter``) and must be
+    *defined* in another (``configtypes.py`` → ``class ...``), the two
+    sub-agents each invent a name and drift — the yml said
+    ``VersionChangeFilter`` while the class was written as
+    ``ChangelogAfterUpgrade``. ``pytest --collect-only`` cannot see the
+    mismatch (the lookup is load-time), so the patch ships broken.
+
+    Fix: detect every CamelCase symbol that appears in ≥2 edits with different
+    filepaths where at least one side is a structured-config file, and inject a
+    verbatim "SYMBOL NAME CONTRACT" line into each referencing edit's
+    preserved_findings. Both sub-agents then receive the same authoritative
+    spelling and cannot diverge.
+
+    Framework-agnostic: keys off CamelCase shape + config-extension, not any
+    specific project layout. Mutates ``plan.edits`` in place.
+    """
+    # symbol -> set of filepaths whose edit text mentions it
+    symbol_files: dict[str, set[str]] = {}
+    # symbol -> list of edits that mention it (for injection)
+    symbol_edits: dict[str, list[FileEditPlan]] = {}
+    edit_is_config: dict[int, bool] = {}
+
+    for edit in plan.edits:
+        edit_is_config[id(edit)] = _is_config_edit(edit)
+        mentioned = {m.group(1) for m in _CAMEL_SYMBOL_RE.finditer(_edit_symbol_text(edit))}
+        for sym in mentioned:
+            symbol_files.setdefault(sym, set()).add(edit.filepath)
+            symbol_edits.setdefault(sym, []).append(edit)
+
+    pinned = 0
+    for sym, files in sorted(symbol_files.items()):
+        if len(files) < 2:
+            continue  # symbol confined to one file — no cross-edit drift risk
+        edits = symbol_edits[sym]
+        # Only enforce when at least one referencing edit is a config/data
+        # file. Pure code↔code shared symbols are already protected by the
+        # build gate (import/compile errors surface there); the load-time
+        # config blind spot is what needs the contract.
+        if not any(edit_is_config[id(e)] for e in edits):
+            continue
+        sorted_files = sorted(files)
+        contract = (
+            f"SYMBOL NAME CONTRACT: the identifier `{sym}` is shared across "
+            f"{', '.join(sorted_files)}. Use this EXACT spelling in every "
+            f"file — the definition site and every reference site must match "
+            f"character-for-character. Do not rename, abbreviate, or re-case "
+            f"it on either side; a mismatch fails at config-load time and is "
+            f"invisible to import-only checks."
+        )
+        for e in edits:
+            if contract not in e.preserved_findings:
+                e.preserved_findings.append(contract)
+                pinned += 1
+
+    if pinned:
+        print(
+            f"[patch-planner] cross-edit symbol contract: pinned {pinned} "
+            f"shared-symbol constraint(s) across config/code edits.",
+            flush=True,
+        )
+
+
+def _clean_expected_symbol(symbol: str) -> str:
+    symbol = symbol.strip()
+    if ")." in symbol:
+        symbol = symbol.rsplit(").", 1)[-1]
+    if not symbol or symbol.startswith("("):
+        return ""
+    if "." in symbol and not symbol.endswith(".py"):
+        symbol = symbol.rsplit(".", 1)[-1]
+    return symbol.strip()
+
+
+def _annotate_artifact_expectations(
+    plan: PatchPlan,
+    memory: SharedWorkingMemory,
+    repo_dir: Path | None,
+) -> None:
+    """Populate verifier-facing FileEditPlan fields conservatively."""
+    cached_paths = {
+        key.split(":", 1)[0].replace("\\", "/")
+        for key in memory.retrieved_code
+    }
+    for edit in plan.edits:
+        path = edit.filepath.replace("\\", "/").strip().lstrip("./")
+        edit.filepath = path
+        edit.expected_diff_required = not edit.reference_only
+        cleaned_symbols = [
+            cleaned
+            for cleaned in (
+                _clean_expected_symbol(symbol)
+                for symbol in (edit.expected_symbols or [])
+            )
+            if cleaned
+        ]
+        edit.expected_symbols = list(dict.fromkeys(cleaned_symbols))
+        if repo_dir is not None and not (repo_dir / path).exists():
+            edit.creates_new_file = True
+        elif path not in cached_paths:
+            text = (
+                edit.change_rationale
+                + "\n"
+                + "\n".join(edit.preserved_findings)
+            ).lower()
+            if any(
+                phrase in text
+                for phrase in (
+                    "create the new",
+                    "create a new",
+                    "new file",
+                    "new module",
+                    "define the new",
+                )
+            ):
+                edit.creates_new_file = True
+        if edit.creates_new_file and not edit.expected_symbols:
+            symbols = [
+                cleaned
+                for cleaned in (
+                    _clean_expected_symbol(s) for s in edit.target_functions
+                )
+                if cleaned
+            ]
+            edit.expected_symbols = list(dict.fromkeys(symbols))
+
+
 async def _run_patch_planner_async(
     memory: SharedWorkingMemory,
     repo_dir: Path | None = None,
-) -> PatchPlan:
+    allow_none: bool = False,
+) -> PatchPlan | None:
     prompt = (
         "Plan a bug fix based on the following context:\n\n"
         f"{memory.format_for_prompt()}\n\n"
@@ -498,7 +840,21 @@ async def _run_patch_planner_async(
         allowed_tools=[],
         max_turns=20,
         max_budget_usd=1.5,
+        # The planner prompt is the largest in the pipeline (full evidence +
+        # prior plan + build feedback on a repatch round), so it is the most
+        # prone to the "success but empty structured_output" failure mode that
+        # crashed issue 010. Empty output is probabilistic under a big prompt;
+        # more re-runs (each appends the structured-only nudge) materially
+        # raise the odds of recovering a valid plan before falling back.
+        max_attempts=5,
+        allow_none=allow_none,
     )
+    # Empty structured_output under allow_none (issue 010: repatch-round prompt
+    # bloat). Return None so the orchestrator can degrade to BUILD_FAILED
+    # instead of crashing. Do NOT touch memory.patch_plan — the prior (pruned)
+    # plan stays as the last good state for diagnostics.
+    if plan is None:
+        return None
 
     # ── Framework-agnostic co-edit backfill ──
     # Any file path declared in must_co_edit_relations / dependency_propagation
@@ -517,12 +873,27 @@ async def _run_patch_planner_async(
     # the same file. Remove the shared (broadcast) ones from secondary plans
     # so each plan stays focused and patch-generator prompts stay small.
     _deduplicate_shared_findings(plan)
+    _split_heavy_edits(plan)
+
+    # ── Cross-edit symbol contract ──
+    # When a CamelCase symbol is shared between a config/data file and a code
+    # file (one references it, the other defines it), pin its exact spelling
+    # into every referencing edit. The patch-generator runs one independent
+    # sub-agent per FileEditPlan; without this, the two sides can drift to
+    # different names (issue 008: yml said `VersionChangeFilter`, class was
+    # written `ChangelogAfterUpgrade`) — a load-time failure invisible to the
+    # import-only build check. Runs after dedup (it spans distinct filepaths,
+    # so same-file dedup never strips it) and before the coverage gate.
+    _enforce_cross_edit_symbol_contract(plan)
 
     # ── Coverage gate: every prescriptive finding must reach at least one
     # FileEditPlan.  Replaces the older "fill empty preserved_findings with
     # everything" backfill — that was a broadcast that only fired when the
     # whole list was empty, leaving partial coverage silently broken.
     _enforce_preserved_findings_coverage(plan, memory)
+    _split_heavy_edits(plan)
+
+    _annotate_artifact_expectations(plan, memory, repo_dir)
 
     memory.patch_plan = plan
     return plan

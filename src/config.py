@@ -1,4 +1,4 @@
-"""Load .env into os.environ so the Claude Agent SDK picks up ANTHROPIC_API_KEY.
+"""Load .env into os.environ for model backends.
 
 Simple key=value parser, no extra deps. Anything the SDK needs (API key,
 model selection, thinking/effort, etc.) is driven by environment variables
@@ -15,4 +15,4 @@ if _env_file.exists():
         if not _line or _line.startswith("#") or "=" not in _line:
             continue
         _key, _, _val = _line.partition("=")
-        os.environ[_key.strip()] = _val.strip()
+        os.environ.setdefault(_key.strip(), _val.strip())

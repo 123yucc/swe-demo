@@ -1,0 +1,619 @@
+diff --git a/openlibrary/plugins/books/readlinks.py b/openlibrary/plugins/books/readlinks.py
+index 7761f075c..b0027621f 100644
+--- a/openlibrary/plugins/books/readlinks.py
++++ b/openlibrary/plugins/books/readlinks.py
+@@ -30,9 +30,26 @@ def ol_query(name, value):
+ 
+ 
+ def get_solr_select_url():
+-    c = config.get("plugin_worksearch")
+-    base_url = c and c.get('solr_base_url')
+-    return base_url and (base_url + "/select")
++    """
++    Return a usable Solr /select endpoint URL, or "" if Solr isn't configured.
++
++    Historically this used infogami.config.plugin_worksearch and could return
++    None, which callers would then concatenate and call .json() on without any
++    HTTP/JSON error handling. This now uses the canonical worksearch Solr client
++    access point for consistency.
++    """
++    try:
++        from openlibrary.plugins.worksearch.search import get_solr
++
++        solr = get_solr()
++        base_url = getattr(solr, "base_url", None)
++        if not base_url:
++            return ""
++        return base_url.rstrip("/") + "/select"
++    except Exception:
++        # Maintain "graceful failure" semantics: callers should treat lack of a
++        # URL as "no results" rather than raising on None concatenation.
++        return ""
+ 
+ 
+ def get_work_iaids(wkey):
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 6a3a9c341..d4e7e7503 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -53,6 +53,9 @@ if hasattr(config, 'plugin_worksearch'):
+     )
+ 
+     default_spellcheck_count = config.plugin_worksearch.get('spellcheck_count', 10)
++else:
++    solr_select_url = 'localhost/select'
++    default_spellcheck_count = 10
+ 
+ 
+ @public
+@@ -117,7 +120,7 @@ def execute_solr_query(
+     try:
+         response = get_solr().raw_request(solr_path, urlencode(params))
+         response.raise_for_status()
+-    except requests.HTTPError:
++    except requests.RequestException:
+         logger.exception("Failed solr query")
+         return None
+     finally:
+diff --git a/openlibrary/plugins/worksearch/search.py b/openlibrary/plugins/worksearch/search.py
+index 85bba1f2e..d224fbdcc 100644
+--- a/openlibrary/plugins/worksearch/search.py
++++ b/openlibrary/plugins/worksearch/search.py
+@@ -1,7 +1,8 @@
+ """Search utilities.
+ """
+ from openlibrary.utils.solr import Solr
+-from infogami import config
++
++from openlibrary.solr.utils import get_solr_base_url
+ 
+ _ACTIVE_SOLR: Solr | None = None
+ 
+@@ -9,6 +10,6 @@ _ACTIVE_SOLR: Solr | None = None
+ def get_solr():
+     global _ACTIVE_SOLR
+     if not _ACTIVE_SOLR:
+-        base_url = config.plugin_worksearch.get('solr_base_url')
++        base_url = get_solr_base_url()
+         _ACTIVE_SOLR = Solr(base_url)
+     return _ACTIVE_SOLR
+diff --git a/openlibrary/solr/update_edition.py b/openlibrary/solr/update_edition.py
+index 74c383a43..929fa43a0 100644
+--- a/openlibrary/solr/update_edition.py
++++ b/openlibrary/solr/update_edition.py
+@@ -191,7 +191,7 @@ def build_edition_data(
+     Build the solr document for the given edition to store as a nested
+     document
+     """
+-    from openlibrary.solr.update_work import get_solr_next
++    from openlibrary.solr.utils import get_solr_next
+ 
+     ed = EditionSolrBuilder(edition, ia_metadata)
+     solr_doc: SolrDocument = cast(
+diff --git a/openlibrary/solr/update_work.py b/openlibrary/solr/update_work.py
+index 0c3b85795..40203e9de 100644
+--- a/openlibrary/solr/update_work.py
++++ b/openlibrary/solr/update_work.py
+@@ -48,47 +48,55 @@ re_year = re.compile(r'\b(\d{4})\b')
+ # This will be set to a data provider; have faith, mypy!
+ data_provider = cast(DataProvider, None)
+ 
+-solr_base_url = None
+-solr_next: bool | None = None
++# Compatibility shim: canonical Solr config/shared state lives in openlibrary.solr.utils
++#
++# NOTE: openlibrary.solr.update_work must remain an import surface for legacy scripts/tests.
++# These wrappers ensure there is a single shared state owner (openlibrary.solr.utils)
++# while preserving the historical API at this module path.
++from openlibrary.solr import utils as _solr_utils
+ 
+ 
+-def get_solr_base_url():
+-    """
+-    Get Solr host
++def get_solr_base_url() -> str:
++    return _solr_utils.get_solr_base_url()
+ 
+-    :rtype: str
+-    """
+-    global solr_base_url
+ 
+-    load_config()
++def set_solr_base_url(solr_url: str) -> None:
++    _solr_utils.set_solr_base_url(solr_url)
+ 
+-    if not solr_base_url:
+-        solr_base_url = config.runtime_config['plugin_worksearch']['solr_base_url']
+ 
+-    return solr_base_url
++def get_solr_next() -> bool:
++    return _solr_utils.get_solr_next()
+ 
+ 
+-def set_solr_base_url(solr_url: str):
+-    global solr_base_url
+-    solr_base_url = solr_url
++def set_solr_next(val: bool) -> None:
++    _solr_utils.set_solr_next(val)
+ 
+ 
+-def get_solr_next() -> bool:
+-    """
+-    Get whether this is the next version of solr; ie new schema configs/fields, etc.
+-    """
+-    global solr_next
++def load_config(c_config: str = 'conf/openlibrary.yml') -> None:
++    _solr_utils.load_config(c_config)
+ 
+-    if solr_next is None:
+-        load_config()
+-        solr_next = config.runtime_config['plugin_worksearch'].get('solr_next', False)
+ 
+-    return solr_next
++# Keep a name-compatible load_configs symbol here (this module defines a local override below).
++load_configs = _solr_utils.load_configs
++
++
++# Re-export canonical SolrUpdateState while preserving import path.
++SolrUpdateState = _solr_utils.SolrUpdateState
++
++
++def solr_update(
++    update_request: 'SolrUpdateState',
++    skip_id_check: bool = False,
++    solr_base_url: str | None = None,
++) -> None:
++    _solr_utils.solr_update(
++        update_request,
++        skip_id_check=skip_id_check,
++        solr_base_url=solr_base_url,
++    )
+ 
+ 
+-def set_solr_next(val: bool):
+-    global solr_next
+-    solr_next = val
++solr_insert_documents = _solr_utils.solr_insert_documents
+ 
+ 
+ def extract_edition_olid(key: str) -> str:
+@@ -919,28 +927,7 @@ def build_data2(
+     return cast(SolrDocument, doc)
+ 
+ 
+-async def solr_insert_documents(
+-    documents: list[dict],
+-    solr_base_url: str | None = None,
+-    skip_id_check=False,
+-):
+-    """
+-    Note: This has only been tested with Solr 8, but might work with Solr 3 as well.
+-    """
+-    solr_base_url = solr_base_url or get_solr_base_url()
+-    params = {}
+-    if skip_id_check:
+-        params['overwrite'] = 'false'
+-    logger.debug(f"POSTing update to {solr_base_url}/update {params}")
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.post(
+-            f'{solr_base_url}/update',
+-            timeout=30,  # seconds; the default timeout is silly short
+-            params=params,
+-            headers={'Content-Type': 'application/json'},
+-            content=json.dumps(documents),
+-        )
+-    resp.raise_for_status()
++# solr_insert_documents is provided by openlibrary.solr.utils (imported above).
+ 
+ 
+ def listify(f):
+@@ -1007,71 +994,7 @@ class BaseDocBuilder:
+             return key
+ 
+ 
+-def solr_update(
+-    update_request: 'SolrUpdateState',
+-    skip_id_check=False,
+-    solr_base_url: str | None = None,
+-) -> None:
+-    content = update_request.to_solr_requests_json()
+-
+-    solr_base_url = solr_base_url or get_solr_base_url()
+-    params = {
+-        # Don't fail the whole batch if one bad apple
+-        'update.chain': 'tolerant-chain'
+-    }
+-    if skip_id_check:
+-        params['overwrite'] = 'false'
+-
+-    def make_request():
+-        logger.debug(f"POSTing update to {solr_base_url}/update {params}")
+-        try:
+-            resp = httpx.post(
+-                f'{solr_base_url}/update',
+-                # Large batches especially can take a decent chunk of time
+-                timeout=300,
+-                params=params,
+-                headers={'Content-Type': 'application/json'},
+-                content=content,
+-            )
+-
+-            if resp.status_code == 400:
+-                resp_json = resp.json()
+-
+-                indiv_errors = resp_json.get('responseHeader', {}).get('errors', [])
+-                if indiv_errors:
+-                    for e in indiv_errors:
+-                        logger.error(f'Individual Solr POST Error: {e}')
+-
+-                global_error = resp_json.get('error')
+-                if global_error:
+-                    logger.error(f'Global Solr POST Error: {global_error.get("msg")}')
+-
+-                if not (indiv_errors or global_error):
+-                    # We can handle the above errors. Any other 400 status codes
+-                    # are fatal and should cause a retry
+-                    resp.raise_for_status()
+-            else:
+-                resp.raise_for_status()
+-        except HTTPStatusError as e:
+-            logger.error(f'HTTP Status Solr POST Error: {e}')
+-            raise
+-        except TimeoutException:
+-            logger.error(f'Timeout Solr POST Error: {content}')
+-            raise
+-        except HTTPError as e:
+-            logger.error(f'HTTP Solr POST Error: {e}')
+-            raise
+-
+-    retry = RetryStrategy(
+-        [HTTPStatusError, TimeoutException, HTTPError],
+-        max_retries=5,
+-        delay=8,
+-    )
+-
+-    try:
+-        return retry(make_request)
+-    except MaxRetriesExceeded as e:
+-        logger.error(f'Max retries exceeded for Solr POST: {e.last_exception}')
++# solr_update is provided by openlibrary.solr.utils (imported above).
+ 
+ 
+ def get_subject(key):
+@@ -1246,51 +1169,7 @@ def solr_select_work(edition_key):
+         return docs[0]['key']  # /works/ prefix is in solr
+ 
+ 
+-@dataclass
+-class SolrUpdateState:
+-    keys: list[str] = field(default_factory=list)
+-    """Keys to update"""
+-
+-    adds: list[SolrDocument] = field(default_factory=list)
+-    """Records to be added/modified"""
+-
+-    deletes: list[str] = field(default_factory=list)
+-    """Records to be deleted"""
+-
+-    commit: bool = False
+-
+-    # Override the + operator
+-    def __add__(self, other):
+-        if isinstance(other, SolrUpdateState):
+-            return SolrUpdateState(
+-                adds=self.adds + other.adds,
+-                deletes=self.deletes + other.deletes,
+-                keys=self.keys + other.keys,
+-                commit=self.commit or other.commit,
+-            )
+-        else:
+-            raise TypeError(f"Cannot add {type(self)} and {type(other)}")
+-
+-    def has_changes(self) -> bool:
+-        return bool(self.adds or self.deletes)
+-
+-    def to_solr_requests_json(self, indent: str | None = None, sep=',') -> str:
+-        result = '{'
+-        if self.deletes:
+-            result += f'"delete": {json.dumps(self.deletes, indent=indent)}' + sep
+-        for doc in self.adds:
+-            result += f'"add": {json.dumps({"doc": doc}, indent=indent)}' + sep
+-        if self.commit:
+-            result += '"commit": {}' + sep
+-
+-        if result.endswith(sep):
+-            result = result[: -len(sep)]
+-        result += '}'
+-        return result
+-
+-    def clear_requests(self) -> None:
+-        self.adds.clear()
+-        self.deletes.clear()
++# SolrUpdateState is provided by openlibrary.solr.utils (imported above).
+ 
+ 
+ class AbstractSolrUpdater:
+@@ -1506,12 +1385,8 @@ async def do_updates(keys):
+     await update_keys(keys, commit=False)
+ 
+ 
+-def load_config(c_config='conf/openlibrary.yml'):
+-    if not config.runtime_config:
+-        config.load(c_config)
+-        config.load_config(c_config)
+-
+-
++# load_config/load_configs are provided by openlibrary.solr.utils (imported above).
++# Keep load_configs behavior for data provider initialization here.
+ def load_configs(
+     c_host: str,
+     c_config: str,
+diff --git a/openlibrary/solr/utils.py b/openlibrary/solr/utils.py
+new file mode 100644
+index 000000000..7242157d1
+--- /dev/null
++++ b/openlibrary/solr/utils.py
+@@ -0,0 +1,263 @@
++"""openlibrary.solr.utils
++
++Canonical Solr configuration/shared state/helpers.
++
++This module is the single owner of:
++- Lazy runtime config loading (compatible with update_work.py semantics)
++- Cached Solr base URL and solr_next flag
++- SolrUpdateState request container + serialization helpers
++- Solr update helpers (retries + tolerant-chain error parsing)
++
++Other modules may provide backwards-compatible shims which delegate to this
++module to avoid split global state.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import time
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++import httpx
++
++from openlibrary import config
++
++logger = logging.getLogger(__name__)
++
++# ---------------------------------------------------------------------------
++# Lazy-config-load + module-global caching semantics (canonical owner)
++# ---------------------------------------------------------------------------
++
++_config_loaded: bool = False
++_solr_base_url: Optional[str] = None
++_solr_next: Optional[bool] = None
++
++
++def load_config(c_config: str = "conf/openlibrary.yml") -> None:
++    """Loads the Open Library runtime configuration if it has not been loaded yet.
++
++    Mirrors the existing lazy-load behavior used by update_work.py: only loads
++    config once and relies on openlibrary.config.runtime_config as the store.
++    """
++    global _config_loaded
++    if _config_loaded:
++        return
++    # openlibrary.config.load_config populates config.runtime_config
++    config.load_config(c_config)
++    _config_loaded = True
++
++
++def get_solr_base_url() -> str:
++    """Returns the Solr base URL from the loaded configuration, cached."""
++    global _solr_base_url
++    if _solr_base_url is not None:
++        return _solr_base_url
++
++    load_config()
++    try:
++        _solr_base_url = config.runtime_config["plugin_worksearch"]["solr_base_url"]
++    except Exception as e:  # pragma: no cover
++        # Keep error message helpful; callers expect a URL string.
++        raise KeyError("Missing config.runtime_config['plugin_worksearch']['solr_base_url']") from e
++    return _solr_base_url
++
++
++def set_solr_base_url(solr_url: str) -> None:
++    """Sets the Solr base URL in the module's internal state."""
++    global _solr_base_url
++    _solr_base_url = solr_url
++
++
++def get_solr_next() -> bool:
++    """Returns whether the application should use the next Solr schema version."""
++    global _solr_next
++    if _solr_next is not None:
++        return _solr_next
++
++    load_config()
++    _solr_next = bool(config.runtime_config.get("plugin_worksearch", {}).get("solr_next", False))
++    return _solr_next
++
++
++def set_solr_next(val: bool) -> None:
++    """Sets the internal state to indicate whether to use the next Solr schema version."""
++    global _solr_next
++    _solr_next = bool(val)
++
++
++# ---------------------------------------------------------------------------
++# Solr update state container
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class SolrUpdateState:
++    """Dataclass to represent a Solr update request.
++
++    Attributes:
++        keys: Optional bookkeeping for callers (e.g. update_work).
++        adds: Documents to add (each dict should contain an 'key' id field unless
++              skip_id_check=True at send time).
++        deletes: Keys/ids to delete.
++        commit: Whether to request a commit.
++    """
++
++    keys: dict[str, Any] = field(default_factory=dict)
++    adds: list[dict[str, Any]] = field(default_factory=list)
++    deletes: list[str] = field(default_factory=list)
++    commit: bool = False
++
++    def has_changes(self) -> bool:
++        """Returns True if the SolrUpdateState contains any add or delete operations."""
++        return bool(self.adds or self.deletes)
++
++    def clear_requests(self) -> None:
++        """Clears the add and delete operations from the SolrUpdateState."""
++        self.adds.clear()
++        self.deletes.clear()
++
++    def merge(self, other: "SolrUpdateState") -> None:
++        """Merge another state into this one (in-place)."""
++        if other.keys:
++            self.keys.update(other.keys)
++        if other.adds:
++            self.adds.extend(other.adds)
++        if other.deletes:
++            self.deletes.extend(other.deletes)
++        self.commit = self.commit or other.commit
++
++    def to_solr_requests_json(self, indent: Optional[str] = None, sep: str = ",") -> str:
++        """Serializes the SolrUpdateState to a JSON string for Solr requests.
++
++        Note: Historically, update_work built JSON via concatenation; this
++        implementation generates canonical JSON. It produces a list of commands,
++        which Solr's update handler accepts:
++          [{"add": {"doc": {...}}}, {"delete": {"id": "..."}}]
++        """
++        commands: list[dict[str, Any]] = []
++
++        for doc in self.adds:
++            commands.append({"add": {"doc": doc}})
++
++        for key in self.deletes:
++            commands.append({"delete": {"id": key}})
++
++        if self.commit:
++            commands.append({"commit": {}})
++
++        # Keep signature compatible: indent is Optional[str] in existing code.
++        json_indent = None if indent is None else 2
++        return json.dumps(commands, indent=json_indent, separators=(sep, ":"))
++
++
++# ---------------------------------------------------------------------------
++# HTTP helpers (retries + tolerant-chain parsing/logging)
++# ---------------------------------------------------------------------------
++
++
++def _extract_solr_400_errors(payload: Any) -> tuple[list[str], Optional[str]]:
++    """Extract tolerant-chain error details from a Solr 400 response payload."""
++    errors: list[str] = []
++    global_msg: Optional[str] = None
++
++    if isinstance(payload, dict):
++        # tolerant-chain often reports per-document failures here:
++        rh = payload.get("responseHeader")
++        if isinstance(rh, dict):
++            rh_errors = rh.get("errors")
++            if isinstance(rh_errors, list):
++                for e in rh_errors:
++                    try:
++                        errors.append(json.dumps(e, ensure_ascii=False))
++                    except Exception:
++                        errors.append(str(e))
++
++        err = payload.get("error")
++        if isinstance(err, dict):
++            msg = err.get("msg")
++            if isinstance(msg, str):
++                global_msg = msg
++
++    return errors, global_msg
++
++
++def solr_update(
++    update_request: SolrUpdateState,
++    skip_id_check: bool = False,
++    solr_base_url: Optional[str] = None,
++) -> None:
++    """Sends a batch update request to Solr with retries and tolerant-chain parsing/logging."""
++    if solr_base_url is None:
++        solr_base_url = get_solr_base_url()
++
++    url = solr_base_url.rstrip("/") + "/update"
++    params: dict[str, Any] = {"update.chain": "tolerant-chain"}
++    if skip_id_check:
++        params["overwrite"] = "false"
++
++    content = update_request.to_solr_requests_json()
++
++    max_retries = 5
++    delay = 0.5
++    last_exc: Optional[BaseException] = None
++
++    for attempt in range(max_retries):
++        try:
++            resp = httpx.post(
++                url,
++                params=params,
++                content=content,
++                headers={"Content-Type": "application/json"},
++                timeout=60.0,
++            )
++
++            # Handle tolerant-chain style HTTP 400 responses gracefully by logging
++            # per-doc errors and not necessarily raising, matching existing behavior.
++            if resp.status_code == 400:
++                payload: Any
++                try:
++                    payload = resp.json()
++                except Exception:
++                    payload = None
++
++                per_doc_errors, global_msg = _extract_solr_400_errors(payload)
++
++                if per_doc_errors:
++                    for e in per_doc_errors:
++                        logger.error("Solr tolerant-chain error: %s", e)
++                    # Do not raise; tolerant-chain returns 400 when some docs fail.
++                    return
++
++                if global_msg:
++                    logger.error("Solr error: %s", global_msg)
++                    return
++
++                # Unknown 400 shape: raise as before.
++                resp.raise_for_status()
++                return
++
++            resp.raise_for_status()
++            return
++
++        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.HTTPError) as e:
++            last_exc = e
++            if attempt >= max_retries - 1:
++                raise
++            time.sleep(delay)
++            delay *= 2
++
++    if last_exc is not None:  # pragma: no cover
++        raise last_exc
++
++
++async def solr_insert_documents(
++    documents: list[dict],
++    solr_base_url: Optional[str] = None,
++    skip_id_check: bool = False,
++) -> None:
++    """Asynchronously inserts a list of documents into Solr."""
++    state = SolrUpdateState(adds=documents, deletes=[], commit=False)
++    # solr_update is sync; keep async signature for compatibility.
++    solr_update(state, skip_id_check=skip_id_check, solr_base_url=solr_base_url)

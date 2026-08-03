@@ -32,7 +32,7 @@ pip install docker pandas datasets tqdm
 ```bash
 python -m src.main --instance-json workdir/swe_issue_011/artifacts/instance_metadata.json     --repo-dir workdir/swe_issue_011/repo
 ```
-输出 patch 位于 `workdir/swe_issue_011/outputs/patch.diff`
+输出 patch 位于 `workdir/swe_issue_011/outputs_<model>/patch.diff`（例如 `outputs_gpt-5.2`）
 
 **2. 准备评测输入文件：**
 
@@ -56,11 +56,20 @@ python eval/SWE-bench_Pro-os/swe_bench_pro_eval.py \
     --raw_sample_path workdir/eval_result/samples.jsonl \
     --patch_path workdir/eval_result/patches.json \
     --output_dir workdir/eval_result \
-    --scripts_dir eval/SWE-bench_Pro-os/run_scripts \
+    --scripts_dir run_scripts \
     --dockerhub_username jefzda \
     --use_local_docker \
     --redo
 ```
+
+> ⚠️ **`--scripts_dir` 路径坑（务必注意）**
+> `swe_bench_pro_eval.py` 对**相对路径**的解析基准是脚本自身所在目录
+> （`BASE_DIR = eval/SWE-bench_Pro-os`），不是当前工作目录。
+> - ✅ 正确：`--scripts_dir run_scripts`（解析为 `eval/SWE-bench_Pro-os/run_scripts`）
+> - ✅ 正确：传绝对路径，如 `--scripts_dir D:/demo/eval/SWE-bench_Pro-os/run_scripts`
+> - ❌ 错误：`--scripts_dir eval/SWE-bench_Pro-os/run_scripts`
+>   → 会被拼成 `eval/SWE-bench_Pro-os/eval/SWE-bench_Pro-os/run_scripts`（路径翻倍），
+>   报错 `Script not found: ...`，且结果被记为 `false`（伪失败，patch 根本没被测试）。
 
 **4. 查看结果：**
 
@@ -87,11 +96,17 @@ python eval/SWE-bench_Pro-os/swe_bench_pro_eval.py \
 
 **1. 确保各 issue 的 patch 已生成：**
 
-每个 issue 目录下应有 `outputs/patch.diff` 或 `artifacts/instance_metadata.json` 中包含 gold patch。
+每个 issue 目录下应有 `outputs_<model>/patch.diff` 或 `artifacts/instance_metadata.json` 中包含 gold patch。
 
 **2. 准备评测输入文件：**
 ```bash
 python eval/make_eval_inputs.py --issues swe_issue_001 swe_issue_002 swe_issue_003
+```
+
+默认读取当前 `.env` 模型对应的 `outputs_<model>` 目录；如需评测其他模型输出，显式指定：
+
+```bash
+python eval/make_eval_inputs.py --issues swe_issue_001 --output-subdir outputs_claude-sonnet-4.5
 ```
 
 也可以用 `--all` 自动扫描所有有 patch 的 issue：
@@ -105,7 +120,7 @@ python eval/SWE-bench_Pro-os/swe_bench_pro_eval.py \
     --raw_sample_path workdir/eval_result/samples.jsonl \
     --patch_path workdir/eval_result/patches.json \
     --output_dir workdir/eval_result \
-    --scripts_dir eval/SWE-bench_Pro-os/run_scripts \
+    --scripts_dir run_scripts \
     --dockerhub_username 123yucc \
     --use_local_docker \
     --num_workers 4 \
@@ -143,7 +158,7 @@ workdir/
 │   ├── artifacts/
 │   │   └── instance_metadata.json
 │   ├── repo/               # 克隆的目标仓库
-│   └── outputs/
+│   └── outputs_<model>/
 │       └── patch.diff      # harness 生成的 patch
 ├── eval_result/            # 统一评测结果目录
 │   ├── patches.json        # 评测输入：patch 列表

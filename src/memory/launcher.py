@@ -91,8 +91,40 @@ def ensure_running(
     data_dir = Path(data_dir).resolve()
     _validate_data_dir(data_dir)
 
+    # Concurrent harness workers share one read-only LTM service. Serialize
+    # the health-check/launch window so they do not all race to bind 9030.
+    lock_path = data_dir / ".experience_server.start.lock"
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(lock_fd, str(os.getpid()).encode("ascii"))
+    except FileExistsError:
+        print(
+            f"[ltm] another worker is starting experience_server on port {port}; "
+            "waiting for shared health...",
+            flush=True,
+        )
+        if wait_until_ready(max_wait_sec=max_wait_sec):
+            print("[ltm] shared experience_server ready.", flush=True)
+            return True
+        raise RuntimeError(
+            f"shared experience_server did not become ready within {max_wait_sec}s"
+        )
+
+    # A server may have become healthy between the optimistic check above and
+    # acquiring the launch lock.
+    if health_check(timeout=3):
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
+        print(f"[ltm] experience_server already running on port {port}", flush=True)
+        return True
+
     server_script = Path(__file__).resolve().parents[2] / "tools" / "experience_server.py"
     if not server_script.exists():
+        if lock_fd is not None:
+            os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
         raise FileNotFoundError(f"experience_server.py not found at {server_script}")
 
     env = os.environ.copy()
@@ -109,22 +141,32 @@ def ensure_running(
         flush=True,
     )
 
-    _launched_proc = subprocess.Popen(
-        [sys.executable, str(server_script)],
-        env=env,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-    )
-    atexit.register(_terminate_launched)
-
-    print(f"[ltm] waiting for /health on port {port} (up to {max_wait_sec}s)...", flush=True)
-    if not wait_until_ready(max_wait_sec=max_wait_sec):
-        # Subprocess died or never came up; surface its exit code if any.
-        rc = _launched_proc.poll()
-        raise RuntimeError(
-            f"experience_server failed to become ready within {max_wait_sec}s "
-            f"(subprocess exit code: {rc})."
+    persist = os.environ.get("MEMGOVERN_PERSIST", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    try:
+        _launched_proc = subprocess.Popen(
+            [sys.executable, str(server_script)],
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            start_new_session=persist,
         )
+        if not persist:
+            atexit.register(_terminate_launched)
 
-    print("[ltm] experience_server ready.", flush=True)
-    return True
+        print(f"[ltm] waiting for /health on port {port} (up to {max_wait_sec}s)...", flush=True)
+        if not wait_until_ready(max_wait_sec=max_wait_sec):
+            # Subprocess died or never came up; surface its exit code if any.
+            rc = _launched_proc.poll()
+            raise RuntimeError(
+                f"experience_server failed to become ready within {max_wait_sec}s "
+                f"(subprocess exit code: {rc})."
+            )
+
+        print("[ltm] experience_server ready.", flush=True)
+        return True
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)

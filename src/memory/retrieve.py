@@ -8,9 +8,8 @@ workflow:
 * ``fetch_detail`` / ``browse_experience``: open one selected experience and
   return its inner fix guidance
 
-Higher-level callers may still use ``retrieve_experiences()`` when they want a
-code-controlled join, but the preferred paper-aligned flow is progressive:
-search summaries first, then browse details selectively.
+The retrieval flow is progressive: search summaries first (``search_experiences``),
+then browse details selectively (``browse_experience``).
 """
 
 from __future__ import annotations
@@ -177,57 +176,6 @@ def browse_experience(
         symptom=str(detail.get("bug_description") or detail.get("symptom") or ""),
         guidance=str(detail.get("fix_experience") or detail.get("guidance") or ""),
     )
-
-
-def retrieve_experiences(
-    query: str,
-    top_k: int = 5,
-    *,
-    fetch_full: bool = True,
-    timeout: int = DEFAULT_TIMEOUT_SEC,
-) -> list[Experience]:
-    """Search by query and return joined experience records.
-
-    Args:
-        query:      problem_statement text used as the semantic query.
-        top_k:      number of candidates to retrieve from /search.
-        fetch_full: if True, also call /get_experience for each id and fill
-                    fix_experience.  Set False when you only need previews
-                    (e.g. for a triage step that does not need the full body).
-        timeout:    per-request HTTP timeout in seconds.
-    """
-    if not query.strip():
-        return []
-
-    disabled = _load_disabled_ids()
-    raw = search_ids(query, top_k=top_k, timeout=timeout)
-    out: list[Experience] = []
-    for hit in raw:
-        if disabled and str(hit.get("id") or "") in disabled:
-            continue
-        unique_id = str(hit.get("id") or "")
-        if not unique_id:
-            continue
-        symptom = hit.get("symptom") or hit.get("content_preview") or ""
-        score = float(hit.get("score") or 0.0)
-
-        title = ""
-        guidance = ""
-        if fetch_full:
-            detail = fetch_detail(unique_id, timeout=timeout)
-            if detail:
-                symptom = detail.get("symptom") or symptom
-                guidance = detail.get("guidance") or ""
-                title = detail.get("title") or ""
-
-        out.append(Experience(
-            id=unique_id,
-            score=score,
-            title=title,
-            symptom=symptom,
-            guidance=guidance,
-        ))
-    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────

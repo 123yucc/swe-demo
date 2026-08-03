@@ -8,9 +8,12 @@ implicit in the SDK — each subagent session is its own local memory.
 
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, Field
 
 from src.models.context import EvidenceCards
+from src.models.evidence import RequirementItem
 from src.models.patch import PatchPlan
 
 
@@ -113,6 +116,21 @@ class SharedWorkingMemory(BaseModel):
             "plan fixes the broken build. Empty on the first planning pass."
         ),
     )
+    evidence_focus_files: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Repatch-round evidence slicing (issue 010). When non-empty, "
+            "format_for_prompt injects a SLICED evidence view instead of the "
+            "full EvidenceCards dump: the top-level aggregate localization/"
+            "structural/constraint cards (a redundant rebuilt view) are "
+            "skipped, and only the RequirementItems whose evidence touches one "
+            "of these files contribute their per-requirement scoped_evidence. "
+            "The full repatch prompt was ~72k chars for navidrome — 56% of it "
+            "the doubly-stored evidence — which pushed the planner SDK into the "
+            "empty-structured_output failure mode. Empty = full-dump (first "
+            "planning pass needs the global view; default behaviour unchanged)."
+        ),
+    )
     action_history: list[ActionEvent] = Field(
         default_factory=list,
         description=(
@@ -158,7 +176,11 @@ class SharedWorkingMemory(BaseModel):
         history_section = ""
         if self.action_history:
             lines: list[str] = []
-            for i, evt in enumerate(self.action_history):
+            recent_history = self.action_history[-20:]
+            omitted = len(self.action_history) - len(recent_history)
+            if omitted:
+                lines.append(f"  ... {omitted} earlier events persisted on disk ...")
+            for i, evt in enumerate(recent_history):
                 parts = [f"phase={evt.phase}"]
                 if evt.subagent:
                     parts.append(f"subagent={evt.subagent}")
@@ -207,13 +229,14 @@ class SharedWorkingMemory(BaseModel):
                 f"{self.build_error_feedback}\n\n"
             )
 
+        evidence_section = self._render_evidence_section()
+
         return (
             "═══ SHARED WORKING MEMORY ═══\n\n"
             f"{ltm_section}"
             f"{custom_section}"
             f"{build_section}"
-            "## Evidence Cards (current state)\n"
-            f"```json\n{self.evidence_cards.model_dump_json(indent=2)}\n```\n\n"
+            f"{evidence_section}"
             f"{patch_section}"
             "## Retrieved Code Cache\n"
             f"{code_section}\n\n"
@@ -221,3 +244,116 @@ class SharedWorkingMemory(BaseModel):
             f"{history_section}\n"
             "═══ END WORKING MEMORY ═══"
         )
+
+    def format_for_deep_search(self, requirement: RequirementItem) -> str:
+        """Render narrow non-evidence context for one investigation."""
+        sections: list[str] = []
+        if self.ltm_search_summaries:
+            sections.append("## Relevant LTM summaries\n" + "\n".join(
+                f"- {item}" for item in self.ltm_search_summaries
+            ))
+        if self.ltm_reference_block:
+            sections.append(self.ltm_reference_block)
+        if self.custom_repair_block:
+            sections.append("## Custom repair rules\n" + self.custom_repair_block)
+        if self.build_error_feedback:
+            sections.append("## Relevant build feedback\n" + self.build_error_feedback)
+        related = [
+            event for event in self.action_history
+            if not event.requirement_id or event.requirement_id == requirement.id
+        ][-12:]
+        if related:
+            sections.append("## Recent action summary\n" + "\n".join(
+                f"- {e.phase}|{e.subagent or '-'}|{e.requirement_id or '-'}|{e.outcome}"
+                for e in related
+            ))
+        return "\n\n".join(sections)
+
+    def _render_evidence_section(self) -> str:
+        """Render the evidence-cards block, full or sliced.
+
+        Full dump (``evidence_focus_files`` empty): the entire EvidenceCards
+        JSON minus ``requirement_status``. This is the first-pass behaviour —
+        the planner needs the global aggregate view to plan from scratch.
+
+        Sliced (``evidence_focus_files`` non-empty, set on a repatch round):
+        the top-level aggregate localization/structural/constraint cards are
+        SKIPPED — they are a redundant rebuild of the per-requirement slices
+        and account for ~half of a large evidence dump (issue 010). Only the
+        RequirementItems whose own evidence touches a focus file are emitted,
+        each carrying its scoped_evidence. The parser-owned, globally-scoped
+        symptom card is small and always kept.
+        """
+        if not self.evidence_focus_files:
+            full_json = self.evidence_cards.model_dump_json(
+                indent=2,
+                exclude={"requirement_status"},
+            )
+            mode = os.environ.get("EVIDENCE_PROMPT_COMPACTION", "auto").strip().lower()
+            if mode not in {"auto", "always", "off"}:
+                mode = "auto"
+            try:
+                min_chars = max(
+                    0,
+                    int(os.environ.get("EVIDENCE_PROMPT_COMPACTION_MIN_CHARS", "50000")),
+                )
+            except ValueError:
+                min_chars = 50000
+
+            compact = mode == "always" or (mode == "auto" and len(full_json) >= min_chars)
+            if compact:
+                # Aggregate cards are rebuilt from these per-requirement slices,
+                # so retaining both representations doubles large planner prompts.
+                full_json = self.evidence_cards.model_dump_json(
+                    indent=2,
+                    exclude={
+                        "requirement_status": True,
+                        "requirements": {"__all__": {"scoped_evidence"}},
+                    },
+                )
+                note = (
+                    "Nested requirement scoped_evidence is omitted because it is "
+                    "duplicated by the aggregate cards above. Requirement text, "
+                    "verdicts, findings, and evidence locations are preserved.\n"
+                )
+            else:
+                note = ""
+            return (
+                "## Evidence Cards (active repair context)\n"
+                f"{note}```json\n{full_json}\n```\n\n"
+            )
+
+        focus = [f.replace("\\", "/").strip().lstrip("./")
+                 for f in self.evidence_focus_files]
+
+        def _req_touches_focus(req: RequirementItem) -> bool:
+            # Serialize the requirement's own evidence (locations + scoped
+            # cards) and check whether any focus file path appears in it.
+            blob = "\n".join(req.evidence_locations)
+            blob += "\n" + req.scoped_evidence.model_dump_json()
+            blob = blob.replace("\\", "/")
+            return any(f in blob for f in focus)
+
+        kept = [r for r in self.evidence_cards.requirements
+                if _req_touches_focus(r)]
+        # Fallback: if slicing matched nothing (e.g. errors only in test files
+        # the requirements never cited), keep all active requirements rather
+        # than emit an empty evidence section that strands the planner.
+        if not kept:
+            kept = list(self.evidence_cards.requirements)
+
+        symptom_json = self.evidence_cards.symptom.model_dump_json(indent=2)
+        reqs_json = "[\n" + ",\n".join(
+            r.model_dump_json(indent=2) for r in kept
+        ) + "\n]"
+        return (
+            "## Evidence Cards (SLICED to files implicated this repatch round)\n"
+            "Only the requirements whose evidence touches the files that "
+            "failed to build are shown, each with its per-requirement scoped "
+            "evidence. The aggregate localization/structural/constraint cards "
+            "are omitted this round — work from the scoped evidence below and "
+            "the build errors above.\n"
+            f"### symptom\n```json\n{symptom_json}\n```\n"
+            f"### requirements (sliced)\n```json\n{reqs_json}\n```\n\n"
+        )
+

@@ -54,6 +54,52 @@ class FileEditPlan(BaseModel):
             "StructuralCard.must_co_edit_relations)."
         ),
     )
+    reference_only: bool = Field(
+        default=False,
+        description=(
+            "True when this edit was auto-added by planner backfill from a "
+            "co-edit relation rather than chosen by the planner as a "
+            "definite change target.  Such files are frequently referenced "
+            "in evidence only as read-for-pattern context (e.g. 'read "
+            "user.js to learn the privilege-check pattern'), not as files "
+            "that must change.  The patch-generator treats a no-op outcome "
+            "on a reference_only edit as acceptable (NO_OP_OK) instead of "
+            "FAILED, so a backfilled false-positive does not sink an "
+            "otherwise-complete patch."
+        ),
+    )
+    expected_diff_required: bool = Field(
+        default=True,
+        description=(
+            "True when this planned edit is expected to produce a concrete "
+            "change in patch.diff. reference_only edits may set this false; "
+            "all other edits default to true so the artifact verifier can "
+            "catch plan/diff drift before evaluation."
+        ),
+    )
+    creates_new_file: bool = Field(
+        default=False,
+        description=(
+            "True when this edit intentionally creates filepath. The artifact "
+            "verifier treats the file's existence and diff presence as hard "
+            "requirements."
+        ),
+    )
+    expected_symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Symbols this edit is expected to define in filepath, such as a "
+            "new function, type, class, or exported constant. Used by the "
+            "artifact verifier to catch missing-method/missing-type patches."
+        ),
+    )
+    required_by_requirement_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Requirement ids that make this edit mandatory. Empty means the "
+            "planner did not provide requirement-level provenance."
+        ),
+    )
 
 
 class PatchPlan(BaseModel):

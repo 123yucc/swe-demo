@@ -17,14 +17,11 @@ from src.models.evidence import ActiveVerdict
 class DeepSearchReport(BaseModel):
     """Structured report returned by the deep-search subagent.
 
-    Each field maps directly to an update_localization argument key,
-    so the orchestrator can persist findings without any parsing.
-
     Starting in phase 16, a single deep-search invocation is scoped to a
     single RequirementItem (target_requirement_id). The requirement_*
-    fields capture the verdict for that item, while the legacy
-    localization/structural fields carry AS-IS code observations that
-    are independent of any one requirement.
+    fields capture the verdict for that item. The remaining fields are
+    persisted AS-IS code observations; each maps directly to an
+    update_localization argument key.
     """
 
     target_requirement_id: str = Field(
@@ -51,23 +48,13 @@ class DeepSearchReport(BaseModel):
             "Do NOT include hypothetical boundary speculation or 'OPEN ISSUE' notes here."
         ),
     )
-    boundary_analysis: str = Field(
-        default="",
-        description=(
-            "Edge case enumeration for prescriptive fixes (phase 18.E reflection). "
-            "If requirement_findings contains a prescriptive fix, enumerate ≥2 boundary "
-            "cases here (null/undefined, empty set, max value, etc.) and verify each "
-            "against actual code behavior. This field is informational only and NOT "
-            "used for closure-checker validation. Keep hypothetical risks and 'OPEN ISSUE' "
-            "notes here, not in requirement_findings."
-        ),
-    )
     requirement_evidence_locations: list[str] = Field(
         default_factory=list,
         description=(
             "Code locations ('file.py:LINE' or 'file.py:LINE-LINE') that "
-            "substantiate the requirement_verdict. Required non-empty unless "
-            "requirement_verdict == 'AS_IS_COMPLIANT'."
+            "substantiate the requirement_verdict. Required for "
+            "AS_IS_COMPLIANT, AS_IS_VIOLATED, and TO_BE_PARTIAL; "
+            "TO_BE_MISSING may be empty when no definition exists."
         ),
     )
     exact_code_regions: list[str] = Field(
@@ -110,12 +97,22 @@ class DeepSearchReport(BaseModel):
             "Cross-cutting dependency paths (interface/package/config)."
         ),
     )
-    missing_elements_to_implement: list[str] = Field(
+    consistency_anchors: list[str] = Field(
         default_factory=list,
         description=(
-            "TO-BE elements confirmed absent from the codebase. Only list "
-            "items whose DEFINITION is entirely absent (no matching "
-            "'def method_name' or 'class ClassName' found)."
+            "Pairs of code points that MUST stay jointly consistent, in the "
+            "form '<path_a>:<locator_a> <-> <path_b>:<locator_b>'. Each locator "
+            "is a line ('LINE'), a line range ('LINE-LINE'), a prefixed symbol "
+            "('class:NAME', 'func:NAME', 'method:NAME', 'type:NAME', "
+            "'enum:NAME', 'field:NAME', 'name:NAME', ...), or a bare identifier. "
+            "Populate ONLY when the requirement matches one of: (A) a config/"
+            "data file references an identifier the code side must define, "
+            "(B) a symbol is renamed / changes visibility and its old-vs-new "
+            "references across the repo (including same-package _test.* files "
+            "at base_commit) must stay aligned, (C) a new file must be "
+            "registered/imported/mounted elsewhere. Leave empty otherwise — do "
+            "NOT pad with anchors that are not load-bearing. A code gate "
+            "machine-verifies that both endpoints resolve."
         ),
     )
     similar_implementation_patterns: list[str] = Field(
@@ -124,23 +121,28 @@ class DeepSearchReport(BaseModel):
             "Existing similar APIs found as reference for the fix."
         ),
     )
-    confirmed_defect_locations: list[str] = Field(
+    semantic_boundaries: list[str] = Field(
         default_factory=list,
         description=(
-            "Confirmed defect locations in 'file.py:LINE -- explanation' format."
+            "AS-IS semantic boundaries: what the existing code handles vs "
+            "does not handle (input ranges, preconditions, invariants). "
+            "Only populate when investigating existing code with AS_IS_VIOLATED verdict."
         ),
     )
-    new_suspects: list[str] = Field(
+    behavioral_constraints: list[str] = Field(
         default_factory=list,
-        description="New suspects discovered during investigation."
+        description=(
+            "AS-IS behavioral constraints observed in existing code: "
+            "ordering requirements, thread-safety assumptions, side-effect "
+            "rules, or implicit contracts callers depend on."
+        ),
     )
-    ruled_out_suspects: list[str] = Field(
+    backward_compatibility: list[str] = Field(
         default_factory=list,
-        description="Leads that turned out to be dead ends."
-    )
-    open_questions: list[str] = Field(
-        default_factory=list,
-        description="Remaining open questions."
+        description=(
+            "Backward compatibility requirements inferred from existing callers: "
+            "APIs, signatures, or behaviors that must not change when fixing the bug."
+        ),
     )
 
     @field_validator("requirement_evidence_locations")
@@ -164,3 +166,78 @@ class DeepSearchReport(BaseModel):
             )
 
         return v
+
+
+    @field_validator("similar_implementation_patterns", mode="before")
+    @classmethod
+    def normalize_similar_implementation_patterns(cls, value):
+        """Accept common structured variants emitted by the model.
+
+        GPT-5.2 sometimes returns object-shaped entries here even though the
+        schema asks for plain strings. Coerce those objects into concise,
+        readable strings instead of failing the whole structured decode.
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+
+        normalized: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    normalized.append(text)
+                continue
+            if isinstance(item, dict):
+                parts: list[str] = []
+                for key in (
+                    "pattern",
+                    "description",
+                    "location",
+                    "locations",
+                    "evidence",
+                    "notes",
+                ):
+                    raw = item.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        parts.append(raw.strip())
+                    elif isinstance(raw, list):
+                        joined = ", ".join(str(x).strip() for x in raw if str(x).strip())
+                        if joined:
+                            parts.append(joined)
+                text = " | ".join(dict.fromkeys(parts))
+                if text:
+                    normalized.append(text)
+                continue
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized
+
+
+class RequirementInvestigationResult(BaseModel):
+    """Independent result for one member of an adaptive work package."""
+
+    requirement_id: str
+    scoped_report: DeepSearchReport
+
+    @property
+    def verdict(self) -> ActiveVerdict:
+        return self.scoped_report.requirement_verdict
+
+    @property
+    def findings(self) -> str:
+        return self.scoped_report.requirement_findings
+
+    @property
+    def evidence_locations(self) -> list[str]:
+        return self.scoped_report.requirement_evidence_locations
+
+
+class AdaptiveDeepSearchReport(BaseModel):
+    """Partial-success-safe output for multi-requirement investigation."""
+
+    requirement_results: list[RequirementInvestigationResult] = Field(default_factory=list)
+    unresolved_requirement_ids: list[str] = Field(default_factory=list)
+    shared_evidence: list[str] = Field(default_factory=list)

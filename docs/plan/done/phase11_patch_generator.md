@@ -15,7 +15,7 @@ Implement the `PatchGeneratorAgent` as an orchestrator subagent and an associate
 
 ### Task 1: Create the Apply Patch MCP Tool
 
-**File:** `src/tools/patch_tools.py` (add to the same file as `submit_patch_plan`)
+**File:** `src/tools/patch_tools.py`
 
 Implement a tool named `apply_search_replace`.
 
@@ -60,7 +60,7 @@ Export `PATCH_GENERATOR_SYSTEM_PROMPT` (English) and the `AgentDefinition` confi
 **File:** `src/orchestrator/engine.py`
 
 - Register `patch-generator` in the orchestrator's `agents` dict.
-- Add `apply_search_replace` to the `patch` MCP server (same server as `submit_patch_plan`).
+- Add `apply_search_replace` to the `patch` MCP server.
 - Add `mcp__patch__apply_search_replace` to `allowed_tools`.
 - Extend orchestrator system prompt for the `PatchGenerator` phase:
   - After `PatchPlanning` succeeds (patch plan is submitted) -> transition to `PatchGenerator`.

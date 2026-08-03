@@ -1,17 +1,18 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.models.evidence import (
     ConstraintCard,
     LocalizationCard,
     RequirementItem,
+    RequirementStatus,
     StructuralCard,
     SymptomCard,
 )
 
 
-SchemaVersion = Literal["v2"]
+SchemaVersion = Literal["v2", "v3"]
 
 
 class EvidenceCards(BaseModel):
@@ -38,18 +39,41 @@ class EvidenceCards(BaseModel):
     requirements: list[RequirementItem] = Field(
         default_factory=list,
         description=(
-            "Task-driving list of behavioral requirements. Parser initializes "
-            "with verdict=UNCHECKED; deep-search updates verdict / "
-            "evidence_locations / findings per requirement."
+            "Active repair queue. Parser initializes all extracted "
+            "requirements here with verdict=UNCHECKED; deep-search keeps "
+            "violated/missing/partial items here and moves verified "
+            "AS_IS_COMPLIANT items to requirement_status."
+        ),
+    )
+    requirement_status: list[RequirementStatus] = Field(
+        default_factory=list,
+        description=(
+            "Lightweight coverage records for requirements verified as "
+            "AS_IS_COMPLIANT. These records intentionally avoid long findings "
+            "and are not default patch-planning material."
         ),
     )
     schema_version: SchemaVersion = Field(
-        default="v2",
+        default="v3",
         description=(
-            "Evidence-cards schema version. v2 introduced RequirementItem[] "
-            "and removed the AS-IS/TO-BE prefix convention."
+            "Evidence-cards schema version. v3 adds lossless contract metadata."
         ),
     )
+
+    @model_validator(mode="after")
+    def migrate_v2_in_memory(self) -> "EvidenceCards":
+        """Accept legacy checkpoints while exposing a v3 object to new code.
+
+        Existing ids, verdicts, evidence and action history are untouched. Old
+        items simply lack source spans because a checkpoint does not contain
+        enough information to reconstruct offsets safely.
+        """
+        if self.schema_version == "v2":
+            for item in [*self.requirements, *self.requirement_status]:
+                if not item.parent_contract_id:
+                    item.parent_contract_id = f"contract-{item.id.removeprefix('req-')}"
+            self.schema_version = "v3"
+        return self
 
 
 class SessionContext(BaseModel):

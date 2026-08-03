@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 
 from src.models.context import EvidenceCards
+from src.models.patch import PatchPlan
 
 
 # evidence_location legal form: ``path:LINE`` or ``path:LINE-LINE``.
@@ -114,6 +115,87 @@ def check_consistency_anchors_format(
 # ── Iteration budget ──────────────────────────────────────────────────────
 
 
+def check_plan_covers_violations(
+    evidence: EvidenceCards | None,
+    plan: PatchPlan | None,
+) -> list[str]:
+    """Return AS_IS_VIOLATED requirement ids whose cited files no edit touches.
+
+    Spec-priority firewall (issue 011, req-005): a requirement whose text
+    prescribes a change and whose verdict is AS_IS_VIOLATED owns a concrete
+    change point at the location it cites. If the patch plan touches none of
+    the files in that requirement's ``evidence_locations``, the prescribed fix
+    is silently being skipped — usually because the deep-search findings
+    rationalised the violation away as "a side-effect of another requirement"
+    or "the cited code must remain unchanged". The plan must include the cited
+    file so the change actually lands; otherwise the requirement is unaddressed
+    no matter what the findings argue.
+
+    Returns the list of uncovered requirement ids (empty = all covered). Only
+    AS_IS_VIOLATED is checked: TO_BE_MISSING/PARTIAL may legitimately land in a
+    new or different file, and AS_IS_COMPLIANT needs no change.
+    """
+    if evidence is None or plan is None:
+        return []
+    plan_paths = {
+        e.filepath.replace("\\", "/").strip() for e in plan.edits if e.filepath
+    }
+    if not plan_paths:
+        # No edits planned at all — every violated req is uncovered, but that
+        # is a different failure (empty plan); don't double-report here.
+        return []
+
+    uncovered: list[str] = []
+    for req in evidence.requirements:
+        if req.verdict != "AS_IS_VIOLATED":
+            continue
+        cited_paths = {
+            loc.split(":", 1)[0].replace("\\", "/").strip()
+            for loc in req.evidence_locations
+            if loc.strip()
+        }
+        if not cited_paths:
+            continue  # attribution gate handles missing citations
+        # Covered when any cited path is a planned edit (suffix-tolerant: the
+        # plan may use a repo-relative path while the citation is identical).
+        covered = any(
+            cp == pp or cp.endswith("/" + pp) or pp.endswith("/" + cp)
+            for cp in cited_paths
+            for pp in plan_paths
+        )
+        if not covered:
+            uncovered.append(req.id)
+    return uncovered
+
+
+def render_plan_coverage_feedback(
+    evidence: EvidenceCards,
+    uncovered_ids: list[str],
+) -> str:
+    """Render a planner-facing message naming the uncovered violated reqs."""
+    if not uncovered_ids:
+        return ""
+    by_id = {r.id: r for r in evidence.requirements}
+    lines = [
+        "PLAN COVERAGE GAP — the following AS_IS_VIOLATED requirements cite a "
+        "code location that NO planned edit touches. Each violated requirement "
+        "owns a concrete change at its cited location; a fix that depends on "
+        "another requirement's edit, or that argues the cited code should stay "
+        "unchanged, does not satisfy it. Add an edit for the cited file(s):",
+    ]
+    for rid in uncovered_ids:
+        req = by_id.get(rid)
+        if req is None:
+            continue
+        locs = ", ".join(req.evidence_locations) or "(none)"
+        lines.append(f"- {rid}: {req.text.strip()[:160]}")
+        lines.append(f"    cited locations: {locs}")
+    return "\n".join(lines)
+
+
+# ── Iteration budget ──────────────────────────────────────────────────────
+
+
 class DeepSearchBudget:
     """Track deep-search iteration count and enforce a maximum.
 
@@ -137,10 +219,21 @@ class DeepSearchBudget:
 
     def is_exhausted(self) -> bool:
         """Return True if the iteration budget has been reached."""
-        return self.iteration >= self.max_iterations
+        return self._budget_exhausted or self.iteration >= self.max_iterations
 
     def mark_budget_exhausted(self) -> None:
         """Mark that the budget was exhausted (for logging/outcome tracking)."""
+        self._budget_exhausted = True
+
+    def force_exhausted(self) -> None:
+        """Exhaust the budget immediately and mark the forced-closure path.
+
+        This is used when the state machine cannot select any requirement even
+        though unchecked evidence remains (for example, the only unchecked
+        requirements are frozen after repeated stalls).  Keep ``iteration`` at
+        its real value so checkpoint metrics do not report searches that never
+        ran; ``is_exhausted`` also honors this explicit marker.
+        """
         self._budget_exhausted = True
 
     @property
